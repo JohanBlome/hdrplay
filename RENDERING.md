@@ -431,6 +431,23 @@ For HDR-source content the flag is a no-op (libplacebo still tone-
 maps down to fit the SDR ceiling). Override the brightness via
 `--sdr-peak`:
 
+### Why does QuickTime's SDR look more saturated than ours?
+
+libplacebo's tone-mapping pipeline applies **perceptual saturation
+adjustments** to keep hue stable across brightness changes
+(Helson-Judd / Stevens effects: a same-chromaticity color *looks*
+more saturated when brighter, so libplacebo desaturates during
+inverse tone-mapping to keep apparent color steady). This is more
+"correct" per perception research but visually less punchy than
+QuickTime's near-raw matrix-+-gamma SDR composition.
+
+We counter this with `pl_render_params.color_adjustment.saturation`
+applied to the SDR pass only. Default `1.2` (≈ +20% saturation gain)
+matches QuickTime's apparent vividness on typical content. Adjust
+via `--sdr-saturation N` (1.0 = no boost / libplacebo default, 1.5 =
+strong, 0.8 = desaturated). The boost is applied **only on the SDR
+pass** — HDR mode is unaffected.
+
 | Value | What you're asking for |
 |---|---|
 | `--sdr-peak 100` | Strict BT.2100 spec. Dim — useful for "this is what reference SDR really is" |

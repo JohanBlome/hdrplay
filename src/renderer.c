@@ -437,6 +437,15 @@ static bool render_sdr_to_intermediate(
     sdr_color_map.inverse_tone_mapping = true;
     rp_sdr.color_map_params = &sdr_color_map;
 
+    /* Saturation boost. libplacebo's tone-map pipeline desaturates
+     * perceptually (preserves hue stability across brightness changes),
+     * which makes our SDR look flatter than macOS's SDR layer. Counter
+     * that with a render-params color_adjustment.saturation > 1. */
+    static struct pl_color_adjustment sdr_adj;
+    sdr_adj = pl_color_adjustment_neutral;
+    sdr_adj.saturation = r->sdr_saturation > 0.0f ? r->sdr_saturation : 1.0f;
+    rp_sdr.color_adjustment = &sdr_adj;
+
     LOGV("REND", "SDR→intermediate %dx%d (mask=%d): src.max=%.0fn  tgt.max=%.0fn  inverse=on",
          tw, th, mask_mode,
          src_image->color.hdr.max_luma, sdr_target.color.hdr.max_luma);

@@ -78,6 +78,14 @@ typedef struct Renderer {
     float  sdr_peak_override;
     float  sdr_peak_effective;   /* what we actually used last frame */
 
+    /* SDR-pass saturation gain. 1.0 = libplacebo default (which applies
+     * perceptual desaturation during tone-mapping to keep hue stable
+     * across brightness changes — looks more natural per spec, but
+     * less vivid than macOS's SDR layer composition / QuickTime). 1.2
+     * default roughly matches QuickTime saturation; 1.0 is "let
+     * libplacebo do its thing", >1.5 is over-saturated. */
+    float  sdr_saturation;
+
     /* Luminance probe — main loop pokes mouse coords (window-relative,
      * in window pixels), HUD draws a crosshair and tells `decoder`-land
      * to sample the source pixel and report nominal nits. -1 = disabled. */

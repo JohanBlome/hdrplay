@@ -99,6 +99,10 @@ static void usage(void)
         "                          100 = strict BT.2100 spec (dim)\n"
         "                          203 = BT.2408 HDR Video reference\n"
         "                          800 = Apple Display preset (bright)\n"
+        "  --sdr-saturation N    SDR-pass saturation gain. 1.0 = libplacebo\n"
+        "                        default (perceptually-tuned, less vivid).\n"
+        "                        Default 1.2 to better match QuickTime /\n"
+        "                        macOS SDR composition.\n"
         "  keys at runtime:      F=fullscreen  H=HDR  S=SDR  P=split\n"
         "                        O=toggle split orientation  SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
@@ -126,6 +130,7 @@ int main(int argc, char **argv)
     int  start_orient = HDRPLAY_SPLIT_LR;
     bool loop_at_eof = false;
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
+    float sdr_saturation    = 1.2f;   /* >1 to counter libplacebo's perceptual desaturation */
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-v")) g_verbose = 1;
@@ -140,6 +145,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--loop"))     loop_at_eof = true;
         else if (!strcmp(argv[i], "--sdr-peak") && i+1 < argc)
             sdr_peak_override = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--sdr-saturation") && i+1 < argc)
+            sdr_saturation = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--set-brightness") && i+1 < argc) {
             has_brightness = true; brightness_val = (float)atof(argv[++i]);
         }
@@ -190,6 +197,7 @@ int main(int argc, char **argv)
     rend.split_orient = start_orient;
     rend.loop_enabled = loop_at_eof;
     rend.sdr_peak_override = sdr_peak_override;
+    rend.sdr_saturation    = sdr_saturation;
     const char *orient_name =
         start_orient == HDRPLAY_SPLIT_TB   ? " (top/bottom)" :
         start_orient == HDRPLAY_SPLIT_DIAG ? " (diagonal)"   :
