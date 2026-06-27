@@ -24,8 +24,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <SDL3/SDL.h>
+#include <libavutil/rational.h>
+
+/* Monotonic wall clock in seconds, for pacing playback. */
+static double now_seconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 int g_verbose = 0;
 
@@ -188,15 +198,27 @@ int main(int argc, char **argv)
         start_mode == HDRPLAY_MODE_SDR   ? "SDR" : "SPLIT",
         start_mode == HDRPLAY_MODE_SPLIT ? orient_name : "");
 
-    /* Main loop: blocking decode/render. No A/V sync — this is an
-     * insight tool, not a media player. Frames render as fast as we
-     * can pull them; FIFO swapchain caps to display refresh rate.
+    /* Main loop: blocking decode/render. No audio, no A/V sync, but we
+     * DO pace presentation against the file's PTS so playback runs at
+     * native speed instead of as-fast-as-the-GPU-can-go.
+     *
+     * Pacing baseline: on the first frame after start / seek / resume,
+     * we record (wall_clock_now, frame_pts) as a baseline. For every
+     * subsequent frame we compute target_wall = baseline_wall +
+     * (frame_pts - baseline_pts) * stream_time_base, then sleep until
+     * target_wall before submitting. If we're already late (decoder or
+     * GPU couldn't keep up — common for 4K HDR on integrated GPUs), we
+     * skip the sleep and log a [DEC] behind=Nms line so it's visible.
      *
      * Pause keeps rendering the last decoded frame so HDR/SDR/split
-     * toggles remain interactive even while frozen. */
+     * toggles remain interactive even while frozen. Resume re-baselines
+     * the clock so the pause itself doesn't show up as "behind". */
     bool quit   = false;
     bool paused = false;
     bool have_frame = false;
+    AVRational stream_tb = dec.fmt->streams[dec.stream_idx]->time_base;
+    double  base_wall   = 0.0;
+    int64_t base_pts    = AV_NOPTS_VALUE;   /* AV_NOPTS_VALUE = rebase next frame */
     while (!quit) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -225,6 +247,9 @@ int main(int argc, char **argv)
                 if (e.key.key == SDLK_SPACE) {
                     paused = !paused;
                     rend.paused = paused;
+                    /* Resume → rebase clock so the pause duration
+                     * doesn't register as decoder-behind. */
+                    if (!paused) base_pts = AV_NOPTS_VALUE;
                     LOG("DEC", "%s", paused ? "paused" : "resumed");
                 }
                 if (e.key.key == SDLK_L) {
@@ -233,7 +258,10 @@ int main(int argc, char **argv)
                     LOG("DEC", "loop %s", loop_at_eof ? "ON" : "OFF");
                 }
                 if (e.key.key == SDLK_R) {
-                    if (decoder_seek_start(&dec)) LOG("DEC", "restarted from beginning");
+                    if (decoder_seek_start(&dec)) {
+                        base_pts = AV_NOPTS_VALUE;   /* rebase clock */
+                        LOG("DEC", "restarted from beginning");
+                    }
                 }
                 if (e.key.key == SDLK_M) {
                     rend.probe_active = !rend.probe_active;
@@ -262,11 +290,47 @@ int main(int argc, char **argv)
             int r = decoder_next_frame(&dec);
             if (r == 0) {
                 LOG("DEC", "EOF");
-                if (loop_at_eof && decoder_seek_start(&dec)) continue;
+                if (loop_at_eof && decoder_seek_start(&dec)) {
+                    base_pts = AV_NOPTS_VALUE;   /* rebase clock on loop */
+                    continue;
+                }
                 quit = true; break;
             }
             if (r < 0)  { LOG("DEC", "decode error, exiting"); break; }
             have_frame = true;
+
+            /* Pace presentation against the file's PTS so playback runs
+             * at native speed. Frames without PTS (rare) just render
+             * immediately; the FIFO swapchain still caps to refresh
+             * rate as a fallback. */
+            int64_t pts = dec.frame->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE) pts = dec.frame->pts;
+            if (pts != AV_NOPTS_VALUE) {
+                double tb = av_q2d(stream_tb);
+                if (base_pts == AV_NOPTS_VALUE) {
+                    base_pts  = pts;
+                    base_wall = now_seconds();
+                } else {
+                    double frame_t   = (double)(pts - base_pts) * tb;
+                    double target    = base_wall + frame_t;
+                    double delay     = target - now_seconds();
+                    if (delay > 0.0) {
+                        /* Sleep up to ~1 second; never longer (guards
+                         * against PTS discontinuities). */
+                        if (delay > 1.0) delay = 1.0;
+                        struct timespec ts = {
+                            .tv_sec  = (time_t)delay,
+                            .tv_nsec = (long)((delay - (double)(time_t)delay) * 1e9),
+                        };
+                        nanosleep(&ts, NULL);
+                    } else if (delay < -0.050) {
+                        /* More than 50ms behind. Don't drop (insight
+                         * tool) but make it visible. */
+                        LOGV("DEC", "behind=%.0fms (pts=%.3fs)",
+                             -delay * 1000.0, frame_t);
+                    }
+                }
+            }
         }
 
         if (have_frame) {
