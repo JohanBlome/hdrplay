@@ -485,14 +485,23 @@ static void apply_sdr_target(struct pl_frame *t, float peak_nits)
 static float compute_sdr_peak(const Renderer *r)
 {
     if (r->sdr_peak_override > 0.0f) return r->sdr_peak_override;
-    /* OS-tracked: SDL3's SDR_WHITE_LEVEL is a normalized multiplier
-     * around 1.0 = "reference SDR white". We multiply by 203 (Apple's
-     * HDR Video preset reference) — when the user is in HDR Video,
-     * SDR white is reported as 1.0 and we hit 203 nits, matching
-     * macOS's own SDR layer compositing. When in Apple Display preset,
-     * SDL reports a higher value and we scale up proportionally. */
+    /* OS-tracked default: 500 nits × SDL3's SDR_WHITE_LEVEL multiplier.
+     *
+     * We default to ~500 nits — NOT the BT.2408 spec of 203 — because
+     * macOS's own SDR layer composition (QuickTime, Safari, Finder)
+     * applies an EDR brightness boost so SDR content sits at the
+     * panel's "SDR reference white", which is typically 400–600 nits
+     * on HDR-enabled Macs. Rendering spec-SDR (100 or 203 nits) on the
+     * same panel looks distinctly dimmer than what users see in any
+     * native app, which makes the HDR-vs-SDR comparison misleading.
+     *
+     * 500 nits matches macOS perceptual SDR roughly; override with
+     *   --sdr-peak 100   strict BT.2100 spec
+     *   --sdr-peak 203   BT.2408 HDR Video diffuse-white reference
+     *   --sdr-peak 800   Apple Display preset / bright SDR
+     */
     float white = r->display_sdr_white > 0.01f ? r->display_sdr_white : 1.0f;
-    return 203.0f * white;
+    return 500.0f * white;
 }
 
 /* Narrow the target's destination rect to a sub-band along one axis.

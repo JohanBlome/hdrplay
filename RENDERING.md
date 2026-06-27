@@ -400,15 +400,33 @@ to pick a specific monitor for the playback window.
 
 ## 9. Known limitations and "but-what-about" answers
 
-### Why doesn't SDR brightness match ffplay?
+### Why doesn't SDR brightness match ffplay / QuickTime?
 
-ffplay's SDR output goes to a regular SDR swapchain, where macOS does
-its own SDR layer composition with a wide brightness range (200–500
-nits on most setups). Our SDR overlay lands at the **BT.2100 spec
-SDR-white** (configurable via `--sdr-peak`, default tracks the OS via
-`SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT × 203`). They differ by design
-— ffplay is "SDR perceptually", we are "SDR per spec". `--sdr-peak 500`
-will roughly match ffplay's perceptual brightness.
+It does now, by default. But the underlying reason is interesting and
+worth understanding for anyone tweaking the SDR peak.
+
+**Native macOS apps (QuickTime, Safari, Finder, ffplay)** write SDR
+content into an SDR-tagged surface. macOS's SDR layer compositor then
+applies an EDR brightness boost so SDR sits at the panel's "SDR
+reference white", which on HDR-enabled Macs is typically **400–600
+nits** depending on display preset and brightness slider. Apple's
+stated design goal: "SDR shouldn't look dim on HDR displays."
+
+**hdrplay** writes everything into an HDR-tagged surface (we have to —
+that's how we get HDR output for HDR mode). For SDR content, we tone-
+map to an absolute nit ceiling and PQ-encode at that ceiling. There is
+no implicit EDR boost; what we ask for is what the panel shows.
+
+We default the OS-tracked SDR peak to `SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT
+× 500` ≈ 500 nits in typical setups. This roughly matches what native
+apps perceptually deliver. Override with `--sdr-peak`:
+
+| Value | What you're asking for |
+|---|---|
+| `--sdr-peak 100` | Strict BT.2100 spec. Dim — useful for "this is what reference SDR really is" |
+| `--sdr-peak 203` | BT.2408 HDR Video diffuse-white reference. Moderate. |
+| `--sdr-peak 500` (default) | Perceptually matches QuickTime / Safari / typical macOS SDR composition |
+| `--sdr-peak 800` | Apple Display preset / bright SDR look |
 
 ### Why is dark content invisible in HDR mode on bright rooms?
 
