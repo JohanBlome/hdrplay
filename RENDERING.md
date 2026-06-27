@@ -418,8 +418,18 @@ map to an absolute nit ceiling and PQ-encode at that ceiling. There is
 no implicit EDR boost; what we ask for is what the panel shows.
 
 We default the OS-tracked SDR peak to `SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT
-× 500` ≈ 500 nits in typical setups. This roughly matches what native
-apps perceptually deliver. Override with `--sdr-peak`:
+× 500` ≈ 500 nits in typical setups. We also enable libplacebo's
+**`inverse_tone_mapping`** flag in the SDR pass. This second piece is
+critical for **SDR-source content**: by default libplacebo preserves
+absolute brightness when source max ≤ target max, so a 100-nit SDR
+file rendered into a 500-nit SDR target stays at 100 nits — and looks
+much dimmer than macOS's own SDR composition of the same file.
+`inverse_tone_mapping` tells libplacebo to expand the source's
+dynamic range up to the target ceiling, mimicking macOS's EDR boost.
+
+For HDR-source content the flag is a no-op (libplacebo still tone-
+maps down to fit the SDR ceiling). Override the brightness via
+`--sdr-peak`:
 
 | Value | What you're asking for |
 |---|---|

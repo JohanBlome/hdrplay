@@ -424,7 +424,20 @@ static bool render_sdr_to_intermediate(
     };
     rp_sdr.blend_params = &keep_alpha;
 
-    LOGV("REND", "SDR→intermediate %dx%d (mask=%d): src.max=%.0fn  tgt.max=%.0fn",
+    /* Enable inverse tone mapping so SDR-source content (peak ~100
+     * nits) is expanded UP to our SDR target peak (~500 nits) instead
+     * of being preserved at 100 nits. Without this, an SDR file in
+     * SDR mode displays at ~100 absolute nits while QuickTime's same
+     * file displays at ~500 nits (macOS SDR layer compositing applies
+     * EDR boost). Inverse tone-mapping replicates that boost. For HDR
+     * source content (peak 10000), this flag is a no-op — libplacebo
+     * still tone-maps down to the target ceiling. */
+    static struct pl_color_map_params sdr_color_map;
+    sdr_color_map = pl_color_map_default_params;
+    sdr_color_map.inverse_tone_mapping = true;
+    rp_sdr.color_map_params = &sdr_color_map;
+
+    LOGV("REND", "SDR→intermediate %dx%d (mask=%d): src.max=%.0fn  tgt.max=%.0fn  inverse=on",
          tw, th, mask_mode,
          src_image->color.hdr.max_luma, sdr_target.color.hdr.max_luma);
     return pl_render_image(r->renderer_sdr, src_image, &sdr_target, &rp_sdr);
