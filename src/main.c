@@ -91,7 +91,14 @@ static void ensure_moltenvk_icd(void)
         c_build,    /* exe at hdrplay/build/hdrplay, ICD at hdrplay/third_party/... */
         c_repo,     /* exe + third_party as siblings (alternate layouts) */
         c_sibling,  /* manifest shipped alongside the binary */
-        /* LunarG Vulkan SDK installs. */
+        /* Homebrew install: `brew install molten-vk` lays the ICD
+         * down at <prefix>/share/vulkan/icd.d. /opt/homebrew is
+         * Apple Silicon; /usr/local is Intel. The keg-rooted path
+         * is the canonical install location; the share-rooted path
+         * is Homebrew's symlinked one. */
+        "/opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json",
+        "/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json",
+        "/usr/local/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json",
         "/usr/local/share/vulkan/icd.d/MoltenVK_icd.json",
         NULL,
     };
