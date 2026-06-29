@@ -459,7 +459,8 @@ static void make_sdr_overlay(
     struct pl_overlay *out_overlay,
     struct pl_overlay_part *out_part,
     int tw, int th,
-    struct pl_rect2df dst_rect)
+    struct pl_rect2df dst_rect,
+    float sdr_peak)
 {
     *out_part = (struct pl_overlay_part){
         .src = { 0, 0, (float)tw, (float)th },
@@ -473,6 +474,16 @@ static void make_sdr_overlay(
         .repr  = pl_color_repr_rgb,
         .color = pl_color_space_hdr10,
     };
+    /* CRITICAL: pl_color_space_hdr10 leaves max_luma=0, which kicks
+     * libplacebo's overlay compositor into a heuristic that renormalizes
+     * our intermediate's PQ codes against an assumed max (usually the
+     * HDR10 spec 10000 nits). That decouples sdr_peak from displayed
+     * brightness — --sdr-peak 500/800/1500 all land at the same panel
+     * output. Tell the compositor exactly what range our intermediate's
+     * pixels are encoded against so the codes pass through 1:1.
+     * See RENDERING.md §6.6. */
+    out_overlay->color.hdr.max_luma = sdr_peak;
+    out_overlay->color.hdr.min_luma = 0.005f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -507,23 +518,23 @@ static void apply_sdr_target(struct pl_frame *t, float peak_nits)
 static float compute_sdr_peak(const Renderer *r)
 {
     if (r->sdr_peak_override > 0.0f) return r->sdr_peak_override;
-    /* OS-tracked default: 500 nits × SDL3's SDR_WHITE_LEVEL multiplier.
+    /* Default: 500 nits — matches what users actually experience when
+     * they open an SDR file in QuickTime / Safari / Finder on a modern
+     * HDR-capable Mac. macOS's SDR layer compositor applies an EDR boost
+     * so SDR content sits at the panel's "SDR reference white" (typically
+     * 400-600 nits on HDR-enabled Macs). Modern HDR TVs do equivalent
+     * boosts. Spec-true 100/200-nit SDR is a thing that exists only on
+     * legacy SDR-only displays nobody owns; demoing against it is showing
+     * a comparison nobody can verify against their lived experience.
      *
-     * We default to ~500 nits — NOT the BT.2408 spec of 203 — because
-     * macOS's own SDR layer composition (QuickTime, Safari, Finder)
-     * applies an EDR brightness boost so SDR content sits at the
-     * panel's "SDR reference white", which is typically 400–600 nits
-     * on HDR-enabled Macs. Rendering spec-SDR (100 or 203 nits) on the
-     * same panel looks distinctly dimmer than what users see in any
-     * native app, which makes the HDR-vs-SDR comparison misleading.
-     *
-     * 500 nits matches macOS perceptual SDR roughly; override with
-     *   --sdr-peak 100   strict BT.2100 spec
-     *   --sdr-peak 203   BT.2408 HDR Video diffuse-white reference
+     * Override:
+     *   --sdr-peak 100   strict BT.2100 spec — only honest comparison if
+     *                    you're explicitly demonstrating "what SDR really
+     *                    is on a non-HDR display"
+     *   --sdr-peak 200   BT.2408 diffuse-white reference
      *   --sdr-peak 800   Apple Display preset / bright SDR
      */
-    float white = r->display_sdr_white > 0.01f ? r->display_sdr_white : 1.0f;
-    return 500.0f * white;
+    return 500.0f;
 }
 
 /* Narrow the target's destination rect to a sub-band along one axis.
@@ -675,7 +686,7 @@ bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
         struct pl_overlay  sdr_ov;
         struct pl_overlay_part sdr_part;
         if (r->diag_tex)
-            make_sdr_overlay(r, &sdr_ov, &sdr_part, sw, sh_, base_target.crop);
+            make_sdr_overlay(r, &sdr_ov, &sdr_part, sw, sh_, base_target.crop, sdr_peak);
 
         /* 3. Render HDR full-frame to swapchain with the SDR overlay
          *    riding on top. Status + HDR + SDR badges all attach to
@@ -683,14 +694,20 @@ bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
         target = base_target;
         apply_hdr_target(&target, r->display_hdr_headroom);
 
+        /* Order matters: libplacebo composites overlays in array order,
+         * later ones on top. The SDR intermediate overlay has alpha=1 in
+         * its visible region, which fully replaces the underlying pixels —
+         * so any HUD text drawn before it gets covered (status panel in
+         * full-SDR mode, SDR-side labels in split modes). Draw the SDR
+         * overlay first, then HUD text on top. */
         struct pl_overlay ov_arr[4];
         int n = 0;
+        if (r->diag_tex) ov_arr[n++] = sdr_ov;
         ov_arr[n++] = hud_ov.status;
         if (r->mode == HDRPLAY_MODE_SPLIT) {
             ov_arr[n++] = hud_ov.hdr_label;
             ov_arr[n++] = hud_ov.sdr_label;
         }
-        if (r->diag_tex) ov_arr[n++] = sdr_ov;
 
         target.overlays     = ov_arr;
         target.num_overlays = n;

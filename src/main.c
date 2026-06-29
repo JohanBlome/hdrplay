@@ -130,7 +130,7 @@ int main(int argc, char **argv)
     int  start_orient = HDRPLAY_SPLIT_LR;
     bool loop_at_eof = false;
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
-    float sdr_saturation    = 1.2f;   /* >1 to counter libplacebo's perceptual desaturation */
+    float sdr_saturation    = 1.0f;   /* 1.0 = libplacebo native; >1 shifts saturated reds toward orange */
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-v")) g_verbose = 1;
