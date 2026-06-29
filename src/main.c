@@ -26,6 +26,11 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
+#include <stdint.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include <SDL3/SDL.h>
 #include <libavutil/rational.h>
 
@@ -42,7 +47,15 @@ int g_verbose = 0;
 /* macOS has no built-in Vulkan driver; we need MoltenVK and an ICD
  * manifest pointing the loader at it. If the user already exported
  * VK_ICD_FILENAMES we respect it; otherwise probe a few well-known
- * spots — including the bundled copy we shipped in third_party/. */
+ * spots — including the bundled copy we shipped in third_party/.
+ *
+ * Bundled-copy candidates are resolved relative to the executable's
+ * own directory (via _NSGetExecutablePath), NOT the CWD. Earlier
+ * versions used CWD-relative paths, which silently broke when the
+ * user ran hdrplay from anywhere outside hdrplay/ or hdrplay/build/
+ * — SDL would then fall back to whatever Vulkan loader macOS finds
+ * by default, which typically doesn't expose VK_KHR_surface, and
+ * window creation would fail with a cryptic extension error. */
 static void ensure_moltenvk_icd(void)
 {
 #ifdef __APPLE__
@@ -50,10 +63,34 @@ static void ensure_moltenvk_icd(void)
         LOG("GPU", "VK_ICD_FILENAMES already set: %s", getenv("VK_ICD_FILENAMES"));
         return;
     }
+
+    /* Resolve exe dir for bundled-MoltenVK lookups. */
+    char exe_path[PATH_MAX] = {0};
+    char exe_real[PATH_MAX] = {0};
+    char exe_dir[PATH_MAX]  = {0};
+    uint32_t sz = sizeof(exe_path);
+    if (_NSGetExecutablePath(exe_path, &sz) == 0 &&
+        realpath(exe_path, exe_real))
+    {
+        strncpy(exe_dir, exe_real, sizeof(exe_dir) - 1);
+        char *slash = strrchr(exe_dir, '/');
+        if (slash) *slash = '\0';
+    }
+
+    char c_build[PATH_MAX], c_repo[PATH_MAX], c_sibling[PATH_MAX];
+    snprintf(c_build,   sizeof(c_build),
+             "%s/../third_party/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json",
+             exe_dir);
+    snprintf(c_repo,    sizeof(c_repo),
+             "%s/third_party/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json",
+             exe_dir);
+    snprintf(c_sibling, sizeof(c_sibling),
+             "%s/MoltenVK_icd.json", exe_dir);
+
     const char *candidates[] = {
-        /* Bundled in this repo (run from project root or via cmake build dir). */
-        "./third_party/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json",
-        "../third_party/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json",
+        c_build,    /* exe at hdrplay/build/hdrplay, ICD at hdrplay/third_party/... */
+        c_repo,     /* exe + third_party as siblings (alternate layouts) */
+        c_sibling,  /* manifest shipped alongside the binary */
         /* LunarG Vulkan SDK installs. */
         "/usr/local/share/vulkan/icd.d/MoltenVK_icd.json",
         NULL,
