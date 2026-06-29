@@ -577,6 +577,12 @@ bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
              image.color.primaries, image.color.transfer,
              image.color.hdr.max_luma);
 
+    /* Per-frame brightness statistics. Stride 8 = ~130k samples on 4K,
+     * sub-ms on modern CPUs. Done off the AVFrame directly (no GPU
+     * round-trip) so the HUD can show "is this frame HDR-worthy?" in
+     * real time without affecting render performance. */
+    r->frame_stats_valid = probe_frame_stats(avframe, 8, &r->frame_stats);
+
     /* Luminance probe — sample source pixel if the user has the probe
      * active. Done before render so HUD has fresh values to display. */
     if (r->probe_active && r->probe_x >= 0 && r->probe_y >= 0 &&

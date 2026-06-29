@@ -148,3 +148,96 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
 
     return true;
 }
+
+/* ------------------------------------------------------------------ */
+/* Per-frame brightness statistics.                                   */
+/*                                                                    */
+/* Walks the luma plane with a stride, applies the source transfer    */
+/* function to each sample, and accumulates peak/floor/percentile     */
+/* counters. We use Y' (the gamma-corrected luma component) directly  */
+/* rather than reconstructing per-channel RGB and computing luma from */
+/* that — for the "how bright is this frame" question, Y' is accurate */
+/* enough and ~3× cheaper. For PQ content specifically, pq_eotf(Y')   */
+/* gives the absolute luma in nits because Y' encodes the luma signal */
+/* through the same transfer that pq_eotf inverts.                    */
+/* ------------------------------------------------------------------ */
+bool probe_frame_stats(const AVFrame *frame, int sample_stride, FrameStats *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!frame || !frame->data[0]) return false;
+    if (sample_stride < 1) sample_stride = 1;
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    if (!desc || desc->nb_components < 1) return false;
+    int depth = desc->comp[0].depth;
+    if (depth != 8 && depth != 10 && depth != 12) return false;
+
+    int   max_raw    = (1 << depth) - 1;
+    int   y_lo       = 16  << (depth - 8);
+    int   y_hi       = 235 << (depth - 8);
+    bool  full_range = (frame->color_range == AVCOL_RANGE_JPEG);
+
+    double (*eotf)(double);
+    switch (frame->color_trc) {
+    case AVCOL_TRC_SMPTE2084:    eotf = pq_eotf;          break;
+    case AVCOL_TRC_ARIB_STD_B67: eotf = hlg_inverse_oetf; break;
+    default:                     eotf = sdr_eotf;         break;
+    }
+
+    int w = frame->width, h = frame->height;
+    int stride_pix = (depth == 8) ? frame->linesize[0] : (frame->linesize[0] / 2);
+
+    double peak  = 0.0;
+    double floor_min = 1e9;
+    double sum   = 0.0;
+    int    n     = 0;
+    int    a100 = 0, a500 = 0, a1000 = 0;
+
+    /* Floor threshold: ignore samples below ~0.05 nits when computing
+     * the dynamic-range floor — letterbox/pillarbox black bars (literal
+     * zero) would otherwise pin the floor at zero and make dr_stops
+     * blow up to infinity on every frame. */
+    const double floor_cutoff_nits = 0.05;
+
+    for (int y = 0; y < h; y += sample_stride) {
+        for (int x = 0; x < w; x += sample_stride) {
+            int yraw;
+            if (depth == 8)
+                yraw = frame->data[0][y * frame->linesize[0] + x];
+            else
+                yraw = ((uint16_t *)frame->data[0])[y * stride_pix + x];
+
+            double Y;
+            if (full_range) {
+                Y = (double)yraw / max_raw;
+            } else {
+                Y = (double)(yraw - y_lo) / (double)(y_hi - y_lo);
+            }
+            if (Y < 0) Y = 0;
+            if (Y > 1) Y = 1;
+
+            double nits = eotf(Y);
+
+            if (nits > peak) peak = nits;
+            if (nits > floor_cutoff_nits && nits < floor_min) floor_min = nits;
+            sum += nits;
+            n++;
+            if (nits > 100.0)  a100++;
+            if (nits > 500.0)  a500++;
+            if (nits > 1000.0) a1000++;
+        }
+    }
+
+    if (n == 0) return false;
+
+    out->peak_nits      = peak;
+    out->avg_nits       = sum / n;
+    out->floor_nits     = (floor_min < 1e9) ? floor_min : 0.0;
+    out->dr_stops       = (peak > 0.0 && out->floor_nits > 0.0)
+                          ? log2(peak / out->floor_nits) : 0.0;
+    out->pct_above_100  = 100.0f * a100  / n;
+    out->pct_above_500  = 100.0f * a500  / n;
+    out->pct_above_1000 = 100.0f * a1000 / n;
+    out->samples        = n;
+    return true;
+}

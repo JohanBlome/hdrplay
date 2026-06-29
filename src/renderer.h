@@ -5,6 +5,7 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/vulkan.h>
+#include "probe.h"
 
 struct SDL_Window;
 
@@ -101,6 +102,13 @@ typedef struct Renderer {
     char   last_output_csp[128];
     char   last_source_csp[128];   /* primaries/transfer/peak from AVFrame */
     int    last_num_passes;
+
+    /* Per-frame source brightness statistics. Updated each frame by
+     * probe_frame_stats(). Lets the HUD show peak/dr/% above SDR so
+     * the user can see at a glance whether the current frame actually
+     * has HDR-worthy content (highlights above the SDR ceiling). */
+    FrameStats frame_stats;
+    bool       frame_stats_valid;
 } Renderer;
 
 /* display_index: 0-based index into the list SDL exposes, or -1 to use

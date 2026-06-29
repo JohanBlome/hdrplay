@@ -246,6 +246,32 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
              r->loop_enabled ? " LOOP"   : "");
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 2;
 
+    /* Per-frame source brightness stats — answers "does this frame
+     * actually have HDR content to show?". Peak/avg/DR are always
+     * shown; the "ABOVE SDR" line is green when > 0% (HDR-worthy
+     * highlights present in this frame) and dim white when 0%
+     * (this frame has nothing exceeding the SDR ceiling, so the
+     * HDR-vs-SDR comparison will look identical on it). */
+    if (r->frame_stats_valid) {
+        snprintf(line, sizeof(line), "SRC PEAK %.0fN AVG %.0fN",
+                 r->frame_stats.peak_nits, r->frame_stats.avg_nits);
+        draw_text(buf, W, H, 6, y, hud_scale, line);
+        y += FONT_H * hud_scale + 2;
+
+        snprintf(line, sizeof(line), "DR %.1f STOPS",
+                 r->frame_stats.dr_stops);
+        draw_text(buf, W, H, 6, y, hud_scale, line);
+        y += FONT_H * hud_scale + 2;
+
+        snprintf(line, sizeof(line), "ABOVE 500N %.1fPCT",
+                 r->frame_stats.pct_above_500);
+        if (r->frame_stats.pct_above_500 > 0.01f)
+            draw_text_color(buf, W, H, 6, y, hud_scale, line, 120, 255, 120);
+        else
+            draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
+        y += FONT_H * hud_scale + 2;
+    }
+
     /* Luminance probe — reports nominal nits of the source pixel under
      * the cursor. Greenish so it stands out from the rest of the panel. */
     if (r->probe_active) {
