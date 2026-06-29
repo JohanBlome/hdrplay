@@ -5,6 +5,7 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/vulkan.h>
+#include <libplacebo/gamut_mapping.h>
 #include "probe.h"
 
 struct SDL_Window;
@@ -86,6 +87,16 @@ typedef struct Renderer {
      * default roughly matches QuickTime saturation; 1.0 is "let
      * libplacebo do its thing", >1.5 is over-saturated. */
     float  sdr_saturation;
+
+    /* SDR-pass gamut-mapping function. Defaults to pl_gamut_map_perceptual
+     * (BT.2407 perceptual rolloff — matches what HDR-capable displays do
+     * internally when handed BT.2020 content for a BT.709 panel, so it
+     * approximates "what an SDR display would show"). NULL = no gamut
+     * mapping (BT.2020 colors clip however libplacebo defaults). Other
+     * useful values: &pl_gamut_map_clip (hard clip, oversaturated edges),
+     * &pl_gamut_map_relative (relative colorimetric — closest to OS color
+     * management's BT.2020→BT.709 conversion). */
+    const struct pl_gamut_map_function *sdr_gamut_map;
 
     /* Luminance probe — main loop pokes mouse coords (window-relative,
      * in window pixels), HUD draws a crosshair and tells `decoder`-land

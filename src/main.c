@@ -101,8 +101,20 @@ static void usage(void)
         "                          800 = Apple Display preset (bright)\n"
         "  --sdr-saturation N    SDR-pass saturation gain. 1.0 = libplacebo\n"
         "                        default (perceptually-tuned, less vivid).\n"
-        "                        Default 1.2 to better match QuickTime /\n"
-        "                        macOS SDR composition.\n"
+        "                        Default 1.0 (hue-faithful); >1 shifts\n"
+        "                        saturated reds toward orange.\n"
+        "  --sdr-gamut-map MODE  How SDR pass handles BT.2020 colors that\n"
+        "                        don't fit in BT.709 (a real second axis of\n"
+        "                        HDR/SDR difference, alongside peak nits):\n"
+        "                          perceptual (default) = BT.2407 rolloff,\n"
+        "                            matches HDR-display internal mapping\n"
+        "                          relative = relative colorimetric, matches\n"
+        "                            OS color-management BT.2020→BT.709\n"
+        "                          clip = hard clip (oversaturated edges)\n"
+        "                          off = no mapping (libplacebo's default;\n"
+        "                            may pass wide-gamut colors through and\n"
+        "                            mask the gamut-narrowing advantage HDR\n"
+        "                            has over SDR)\n"
         "  keys at runtime:      F=fullscreen  H=HDR  S=SDR  P=split\n"
         "                        O=toggle split orientation  SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
@@ -131,6 +143,7 @@ int main(int argc, char **argv)
     bool loop_at_eof = false;
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
     float sdr_saturation    = 1.0f;   /* 1.0 = libplacebo native; >1 shifts saturated reds toward orange */
+    const struct pl_gamut_map_function *sdr_gamut_map = &pl_gamut_map_perceptual;
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-v")) g_verbose = 1;
@@ -147,6 +160,14 @@ int main(int argc, char **argv)
             sdr_peak_override = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--sdr-saturation") && i+1 < argc)
             sdr_saturation = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--sdr-gamut-map") && i+1 < argc) {
+            const char *m = argv[++i];
+            if      (!strcmp(m, "perceptual")) sdr_gamut_map = &pl_gamut_map_perceptual;
+            else if (!strcmp(m, "relative"))   sdr_gamut_map = &pl_gamut_map_relative;
+            else if (!strcmp(m, "clip"))       sdr_gamut_map = &pl_gamut_map_clip;
+            else if (!strcmp(m, "off"))        sdr_gamut_map = NULL;
+            else { fprintf(stderr, "unknown --sdr-gamut-map mode: %s\n", m); usage(); return 2; }
+        }
         else if (!strcmp(argv[i], "--set-brightness") && i+1 < argc) {
             has_brightness = true; brightness_val = (float)atof(argv[++i]);
         }
@@ -198,6 +219,7 @@ int main(int argc, char **argv)
     rend.loop_enabled = loop_at_eof;
     rend.sdr_peak_override = sdr_peak_override;
     rend.sdr_saturation    = sdr_saturation;
+    rend.sdr_gamut_map     = sdr_gamut_map;
     const char *orient_name =
         start_orient == HDRPLAY_SPLIT_TB   ? " (top/bottom)" :
         start_orient == HDRPLAY_SPLIT_DIAG ? " (diagonal)"   :

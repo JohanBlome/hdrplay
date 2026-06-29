@@ -412,6 +412,14 @@ static bool render_sdr_to_intermediate(
         .repr  = pl_color_repr_rgb,
         .color = pl_color_space_hdr10,
     };
+    /* Target primaries = BT.709 so libplacebo gamut-maps wide-gamut
+     * BT.2020 source colors into the BT.709 volume during render. The
+     * SDR intermediate is still PQ-encoded with max_luma = sdr_peak
+     * so the overlay path can carry it through to the HDR swapchain
+     * — only the gamut volume changes. The overlay descriptor below
+     * tells the compositor the intermediate is BT.709 so it reprojects
+     * to BT.2020 swapchain primaries cleanly. */
+    sdr_target.color.primaries    = PL_COLOR_PRIM_BT_709;
     sdr_target.color.hdr.max_luma = sdr_peak;
     sdr_target.color.hdr.min_luma = 0.005f;
 
@@ -435,6 +443,12 @@ static bool render_sdr_to_intermediate(
     static struct pl_color_map_params sdr_color_map;
     sdr_color_map = pl_color_map_default_params;
     sdr_color_map.inverse_tone_mapping = true;
+    /* Wide-gamut → BT.709 gamut mapping. Default perceptual (BT.2407
+     * rolloff) approximates what an SDR display would actually show
+     * for BT.2020 source. NULL leaves libplacebo's default behavior
+     * for gamut handling. See --sdr-gamut-map. */
+    if (r->sdr_gamut_map)
+        sdr_color_map.gamut_mapping = r->sdr_gamut_map;
     rp_sdr.color_map_params = &sdr_color_map;
 
     /* Saturation boost. libplacebo's tone-map pipeline desaturates
@@ -484,6 +498,13 @@ static void make_sdr_overlay(
      * See RENDERING.md §6.6. */
     out_overlay->color.hdr.max_luma = sdr_peak;
     out_overlay->color.hdr.min_luma = 0.005f;
+    /* Must match render_sdr_to_intermediate's target.primaries — the
+     * intermediate is rendered in BT.709 (gamut-mapped from BT.2020 source).
+     * Telling the compositor BT.709 here lets it reproject to the BT.2020
+     * swapchain primaries correctly; otherwise libplacebo would treat the
+     * BT.709 codes as if they were already BT.2020 and the colors would
+     * shift. */
+    out_overlay->color.primaries = PL_COLOR_PRIM_BT_709;
 }
 
 /* ------------------------------------------------------------------ */
