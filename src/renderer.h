@@ -98,6 +98,15 @@ typedef struct Renderer {
      * management's BT.2020→BT.709 conversion). */
     const struct pl_gamut_map_function *sdr_gamut_map;
 
+    /* SDR-pass dynamic-range cap in stops. SDR's effective contrast
+     * ratio is ~1000:1 (BT.1886 spec, ≈ 10 stops); higher values let
+     * the SDR pane keep shadow detail no real SDR display can show.
+     * Used to compute target.min_luma = sdr_peak / 2^cap, which makes
+     * libplacebo compress sub-floor source detail up to the SDR black
+     * floor (the third axis of HDR-advantage demo, after peak and
+     * gamut). Default 10.0; override with --sdr-dr-stops. */
+    float sdr_dr_stops_cap;
+
     /* Luminance probe — main loop pokes mouse coords (window-relative,
      * in window pixels), HUD draws a crosshair and tells `decoder`-land
      * to sample the source pixel and report nominal nits. -1 = disabled. */

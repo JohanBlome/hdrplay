@@ -103,6 +103,13 @@ static void usage(void)
         "                        default (perceptually-tuned, less vivid).\n"
         "                        Default 1.0 (hue-faithful); >1 shifts\n"
         "                        saturated reds toward orange.\n"
+        "  --sdr-dr-stops N      SDR-pane dynamic-range cap in stops.\n"
+        "                        Sets sdr_min = sdr_peak / 2^N so the\n"
+        "                        SDR pane shows only what an SDR display\n"
+        "                        could actually deliver. Default 10.0\n"
+        "                        (BT.1886 ~1000:1 contrast). Larger\n"
+        "                        values reveal more shadow detail than\n"
+        "                        SDR can really show.\n"
         "  --sdr-gamut-map MODE  How SDR pass handles BT.2020 colors that\n"
         "                        don't fit in BT.709 (a real second axis of\n"
         "                        HDR/SDR difference, alongside peak nits):\n"
@@ -144,6 +151,7 @@ int main(int argc, char **argv)
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
     float sdr_saturation    = 1.0f;   /* 1.0 = libplacebo native; >1 shifts saturated reds toward orange */
     const struct pl_gamut_map_function *sdr_gamut_map = &pl_gamut_map_perceptual;
+    float sdr_dr_stops_cap = 10.0f;   /* BT.1886 ~1000:1 contrast */
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-v")) g_verbose = 1;
@@ -160,6 +168,8 @@ int main(int argc, char **argv)
             sdr_peak_override = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--sdr-saturation") && i+1 < argc)
             sdr_saturation = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--sdr-dr-stops") && i+1 < argc)
+            sdr_dr_stops_cap = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--sdr-gamut-map") && i+1 < argc) {
             const char *m = argv[++i];
             if      (!strcmp(m, "perceptual")) sdr_gamut_map = &pl_gamut_map_perceptual;
@@ -220,6 +230,7 @@ int main(int argc, char **argv)
     rend.sdr_peak_override = sdr_peak_override;
     rend.sdr_saturation    = sdr_saturation;
     rend.sdr_gamut_map     = sdr_gamut_map;
+    rend.sdr_dr_stops_cap  = sdr_dr_stops_cap;
     const char *orient_name =
         start_orient == HDRPLAY_SPLIT_TB   ? " (top/bottom)" :
         start_orient == HDRPLAY_SPLIT_DIAG ? " (diagonal)"   :

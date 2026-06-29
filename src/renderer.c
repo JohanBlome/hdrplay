@@ -421,7 +421,16 @@ static bool render_sdr_to_intermediate(
      * to BT.2020 swapchain primaries cleanly. */
     sdr_target.color.primaries    = PL_COLOR_PRIM_BT_709;
     sdr_target.color.hdr.max_luma = sdr_peak;
-    sdr_target.color.hdr.min_luma = 0.005f;
+    /* SDR's contrast ceiling. min_luma = sdr_peak / 2^cap forces the
+     * SDR target to a fixed dynamic range (default 10 stops, BT.1886
+     * ~1000:1). libplacebo compresses sub-floor source detail up to
+     * this floor on tone-map, so the SDR pane crushes shadows the way
+     * a real SDR display has to. Without this the SDR pane keeps HDR-
+     * grade blacks (we were setting 0.005 nits flat) and ends up with
+     * 13–16 stops of pretend-SDR DR — a third dishonest axis alongside
+     * peak and gamut. See --sdr-dr-stops. */
+    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 10.0f;
+    sdr_target.color.hdr.min_luma = sdr_peak / powf(2.0f, cap);
 
     struct pl_render_params rp_sdr = *rp_base;
     static const struct pl_blend_params keep_alpha = {
@@ -497,7 +506,12 @@ static void make_sdr_overlay(
      * pixels are encoded against so the codes pass through 1:1.
      * See RENDERING.md §6.6. */
     out_overlay->color.hdr.max_luma = sdr_peak;
-    out_overlay->color.hdr.min_luma = 0.005f;
+    /* Must match the floor render_sdr_to_intermediate baked into the
+     * intermediate. Anything else and libplacebo's overlay compositor
+     * would re-interpret PQ codes against the wrong range, undoing the
+     * SDR-pane DR cap. */
+    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 10.0f;
+    out_overlay->color.hdr.min_luma = sdr_peak / powf(2.0f, cap);
     /* Must match render_sdr_to_intermediate's target.primaries — the
      * intermediate is rendered in BT.709 (gamut-mapped from BT.2020 source).
      * Telling the compositor BT.709 here lets it reproject to the BT.2020
