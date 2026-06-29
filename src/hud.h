@@ -22,4 +22,9 @@ typedef struct {
  * that was the bug that hid the original HUD. */
 void hud_prepare(Renderer *r, int win_w, int win_h, HudOverlays *out);
 
+/* Release HUD slot textures. Must be called before pl_vulkan_destroy
+ * — otherwise the slot textures survive into vulkan teardown and
+ * libplacebo's allocator reports them as leaked. */
+void hud_close(pl_gpu gpu);
+
 #endif

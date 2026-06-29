@@ -785,6 +785,7 @@ void renderer_close(Renderer *r)
         for (int i = 0; i < 4; i++)
             if (r->plane_tex[i]) pl_tex_destroy(r->vulkan->gpu, &r->plane_tex[i]);
         if (r->diag_tex) pl_tex_destroy(r->vulkan->gpu, &r->diag_tex);
+        hud_close(r->vulkan->gpu);
     }
     if (r->renderer)     pl_renderer_destroy(&r->renderer);
     if (r->renderer_sdr) pl_renderer_destroy(&r->renderer_sdr);

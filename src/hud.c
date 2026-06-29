@@ -137,6 +137,14 @@ static int          hud_scale = 2;
 static struct pl_overlay      overlay_arr[SLOT_COUNT];
 static struct pl_overlay_part overlay_parts[SLOT_COUNT];
 
+void hud_close(pl_gpu gpu)
+{
+    for (int s = 0; s < SLOT_COUNT; s++) {
+        if (slots[s].tex) pl_tex_destroy(gpu, &slots[s].tex);
+        slots[s].W = slots[s].H = 0;
+    }
+}
+
 static void ensure_slot(int s, pl_gpu gpu, int W, int H)
 {
     if (slots[s].tex && slots[s].W == W && slots[s].H == H) return;
