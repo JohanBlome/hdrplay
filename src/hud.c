@@ -212,7 +212,7 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
                                                        "SPLIT LR")
             : "?";
     snprintf(line, sizeof(line), "MODE %s", mode_str);
-    draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 4;
+    draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
 
     /* Headroom line — turns red when so high that dark content disappears.
      * Threshold 8x roughly equals SDR-white ≈ 25 nits, below which
@@ -224,29 +224,29 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 80, 80);
     else
         draw_text(buf, W, H, 6, y, hud_scale, line);
-    y += FONT_H * hud_scale + 4;
+    y += FONT_H * hud_scale + 8;
 
     if (excessive_headroom) {
         draw_text_color(buf, W, H, 6, y, hud_scale,
                         "DARK CONTENT MAY BE INVISIBLE", 255, 80, 80);
-        y += FONT_H * hud_scale + 4;
+        y += FONT_H * hud_scale + 8;
     }
 
     /* Source colorspace, compact form. */
     if (r->last_source_csp[0])
         draw_text(buf, W, H, 6, y, hud_scale, r->last_source_csp);
-    y += FONT_H * hud_scale + 4;
+    y += FONT_H * hud_scale + 8;
 
     /* Output target, compact form. */
     if (r->last_output_csp[0])
         draw_text(buf, W, H, 6, y, hud_scale, r->last_output_csp);
-    y += FONT_H * hud_scale + 4;
+    y += FONT_H * hud_scale + 8;
 
     snprintf(line, sizeof(line), "FRAME %llu%s%s",
              (unsigned long long)frame_count,
              r->paused       ? " PAUSED" : "",
              r->loop_enabled ? " LOOP"   : "");
-    draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 4;
+    draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
 
     /* Per-frame source brightness stats — answers "does this frame
      * actually have HDR content to show?". Peak/avg/DR are always
@@ -258,12 +258,12 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         snprintf(line, sizeof(line), "SRC PEAK %.0fN AVG %.0fN",
                  r->frame_stats.peak_nits, r->frame_stats.avg_nits);
         draw_text(buf, W, H, 6, y, hud_scale, line);
-        y += FONT_H * hud_scale + 4;
+        y += FONT_H * hud_scale + 8;
 
         snprintf(line, sizeof(line), "DR %.1f STOPS",
                  r->frame_stats.dr_stops);
         draw_text(buf, W, H, 6, y, hud_scale, line);
-        y += FONT_H * hud_scale + 4;
+        y += FONT_H * hud_scale + 8;
 
         /* SDR-pane DR cap — only meaningful when there's an SDR pane
          * on screen. Suppress in pure HDR mode (would just be a
@@ -279,7 +279,7 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
                 draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 200, 80);
             else
                 draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
-            y += FONT_H * hud_scale + 4;
+            y += FONT_H * hud_scale + 8;
         }
 
         snprintf(line, sizeof(line), "ABOVE 500N %.1fPCT",
@@ -288,7 +288,7 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
             draw_text_color(buf, W, H, 6, y, hud_scale, line, 120, 255, 120);
         else
             draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
-        y += FONT_H * hud_scale + 4;
+        y += FONT_H * hud_scale + 8;
 
         /* SDR BOOST — symmetric counterpart to ABOVE 500N. Fires when
          * source peak < SDR target peak: libplacebo's inverse_tone_mapping
@@ -311,7 +311,7 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
                 draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 200, 80);
             else
                 draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
-            y += FONT_H * hud_scale + 4;
+            y += FONT_H * hud_scale + 8;
         }
     }
 
@@ -321,11 +321,11 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         snprintf(line, sizeof(line), "PROBE (%d,%d) %.1f NITS",
                  r->probe_x, r->probe_y, r->probe_nits);
         draw_text_color(buf, W, H, 6, y, hud_scale, line, 120, 255, 120);
-        y += FONT_H * hud_scale + 4;
+        y += FONT_H * hud_scale + 8;
         snprintf(line, sizeof(line), "R %.1f G %.1f B %.1f",
                  r->probe_r_nits, r->probe_g_nits, r->probe_b_nits);
         draw_text_color(buf, W, H, 6, y, hud_scale, line, 120, 255, 120);
-        y += FONT_H * hud_scale + 4;
+        y += FONT_H * hud_scale + 8;
     }
 
     commit_slot(SLOT_STATUS, gpu, buf, 16, 16);
