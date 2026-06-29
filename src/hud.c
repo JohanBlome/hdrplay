@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include <libplacebo/gpu.h>
 #include <libplacebo/renderer.h>
@@ -287,6 +288,30 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         else
             draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
         y += FONT_H * hud_scale + 2;
+
+        /* SDR BOOST — symmetric counterpart to ABOVE 500N. Fires when
+         * source peak < SDR target peak: libplacebo's inverse_tone_mapping
+         * EXPANDS the source up to fill the SDR target, so the SDR pane
+         * renders this frame brighter than HDR does (which keeps source
+         * at its true authored brightness). This is where HDR's most
+         * honest perceptual win lives: mid-tone / low-DR scenes the SDR
+         * pane has to inflate to look "normal", while HDR shows them at
+         * their true nits. Only shown when an SDR pane is on screen. */
+        if (r->mode != HDRPLAY_MODE_HDR &&
+            r->sdr_peak_effective > 0.0f &&
+            r->frame_stats.peak_nits > 0.0)
+        {
+            double boost_stops = log2(r->sdr_peak_effective /
+                                      r->frame_stats.peak_nits);
+            if (boost_stops < 0.0) boost_stops = 0.0;
+            snprintf(line, sizeof(line), "SDR BOOST +%.1f STOPS",
+                     boost_stops);
+            if (boost_stops > 0.3)
+                draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 200, 80);
+            else
+                draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
+            y += FONT_H * hud_scale + 2;
+        }
     }
 
     /* Luminance probe — reports nominal nits of the source pixel under
