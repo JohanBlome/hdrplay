@@ -38,6 +38,8 @@ typedef struct {
 bool  decoder_open(Decoder *d, const char *path);
 int   decoder_next_frame(Decoder *d);   /* >0 got frame, 0 EOF, <0 error */
 bool  decoder_seek_start(Decoder *d);   /* rewind for --loop; false on err */
+bool  decoder_seek_to(Decoder *d, double seconds);   /* seek to absolute time; clamps to >= 0 */
+double decoder_frame_seconds(const Decoder *d);      /* current frame's PTS in seconds (NaN if none) */
 void  decoder_close(Decoder *d);
 
 #endif

@@ -27,6 +27,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -172,6 +173,7 @@ static void usage(void)
         "                        O=toggle split orientation  SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
         "                        M=toggle luminance probe (mouse → nits)\n"
+        "                        ←/→=seek -10s/+10s\n"
         "\n"
         "control / inspection:\n"
         "  --list-displays       enumerate displays + HDR status, then exit\n"
@@ -349,6 +351,21 @@ int main(int argc, char **argv)
                     if (decoder_seek_start(&dec)) {
                         base_pts = AV_NOPTS_VALUE;   /* rebase clock */
                         LOG("DEC", "restarted from beginning");
+                    }
+                }
+                /* ±10s seek. Lands on a keyframe at or before the
+                 * target, so the actual next-frame timestamp may be
+                 * slightly earlier than requested — that's fine here.
+                 * Clock is rebased so the seek doesn't register as
+                 * decoder-behind on the very next frame. */
+                if (e.key.key == SDLK_RIGHT || e.key.key == SDLK_LEFT) {
+                    double cur = decoder_frame_seconds(&dec);
+                    if (isnan(cur)) cur = 0.0;
+                    double delta = (e.key.key == SDLK_RIGHT) ? 10.0 : -10.0;
+                    double target = cur + delta;
+                    if (decoder_seek_to(&dec, target)) {
+                        base_pts = AV_NOPTS_VALUE;
+                        LOG("DEC", "seek %+.0fs (%.2f → %.2f)", delta, cur, target);
                     }
                 }
                 if (e.key.key == SDLK_M) {

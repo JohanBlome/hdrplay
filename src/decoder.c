@@ -1,6 +1,7 @@
 #include "decoder.h"
 #include "log.h"
 
+#include <math.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/mastering_display_metadata.h>
 
@@ -166,6 +167,31 @@ bool decoder_seek_start(Decoder *d)
     if (r < 0) { LOG("DEC", "seek to start failed: %d", r); return false; }
     avcodec_flush_buffers(d->cc);
     return true;
+}
+
+bool decoder_seek_to(Decoder *d, double seconds)
+{
+    /* Seek to an absolute timestamp. AVSEEK_FLAG_BACKWARD lands on a
+     * keyframe at or before the target — required to start decoding
+     * from a clean reference. The next decoded frame may therefore
+     * come from slightly before `seconds`; that's fine for ±10s
+     * stepping where the user doesn't expect frame-precise landing. */
+    if (seconds < 0.0) seconds = 0.0;
+    AVRational tb = d->fmt->streams[d->stream_idx]->time_base;
+    int64_t target = (int64_t)(seconds * tb.den / tb.num);
+    int r = av_seek_frame(d->fmt, d->stream_idx, target, AVSEEK_FLAG_BACKWARD);
+    if (r < 0) { LOG("DEC", "seek to %.2fs failed: %d", seconds, r); return false; }
+    avcodec_flush_buffers(d->cc);
+    return true;
+}
+
+double decoder_frame_seconds(const Decoder *d)
+{
+    if (!d->frame) return NAN;
+    int64_t pts = d->frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) return NAN;
+    AVRational tb = d->fmt->streams[d->stream_idx]->time_base;
+    return (double)pts * tb.num / tb.den;
 }
 
 void decoder_close(Decoder *d)
