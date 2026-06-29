@@ -271,7 +271,7 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
          * the cap (SDR can carry the full source DR; no shadow-side
          * advantage). */
         if (r->mode != HDRPLAY_MODE_HDR) {
-            float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 10.0f;
+            float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 12.0f;
             snprintf(line, sizeof(line), "SDR CAP %.1f STOPS", cap);
             if (r->frame_stats.dr_stops > cap + 0.05)
                 draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 200, 80);

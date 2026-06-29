@@ -429,7 +429,7 @@ static bool render_sdr_to_intermediate(
      * grade blacks (we were setting 0.005 nits flat) and ends up with
      * 13–16 stops of pretend-SDR DR — a third dishonest axis alongside
      * peak and gamut. See --sdr-dr-stops. */
-    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 10.0f;
+    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 12.0f;
     sdr_target.color.hdr.min_luma = sdr_peak / powf(2.0f, cap);
 
     struct pl_render_params rp_sdr = *rp_base;
@@ -510,7 +510,7 @@ static void make_sdr_overlay(
      * intermediate. Anything else and libplacebo's overlay compositor
      * would re-interpret PQ codes against the wrong range, undoing the
      * SDR-pane DR cap. */
-    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 10.0f;
+    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 12.0f;
     out_overlay->color.hdr.min_luma = sdr_peak / powf(2.0f, cap);
     /* Must match render_sdr_to_intermediate's target.primaries — the
      * intermediate is rendered in BT.709 (gamut-mapped from BT.2020 source).

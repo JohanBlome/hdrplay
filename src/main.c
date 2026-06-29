@@ -106,10 +106,12 @@ static void usage(void)
         "  --sdr-dr-stops N      SDR-pane dynamic-range cap in stops.\n"
         "                        Sets sdr_min = sdr_peak / 2^N so the\n"
         "                        SDR pane shows only what an SDR display\n"
-        "                        could actually deliver. Default 10.0\n"
-        "                        (BT.1886 ~1000:1 contrast). Larger\n"
-        "                        values reveal more shadow detail than\n"
-        "                        SDR can really show.\n"
+        "                        could actually deliver. Default 12.0\n"
+        "                        (matches 0.1-nit BT.1886 reference\n"
+        "                        black at the 500-nit modern SDR peak;\n"
+        "                        use 10.0 for strict 100-nit BT.1886).\n"
+        "                        Larger values reveal more shadow detail\n"
+        "                        than SDR can really show.\n"
         "  --sdr-gamut-map MODE  How SDR pass handles BT.2020 colors that\n"
         "                        don't fit in BT.709 (a real second axis of\n"
         "                        HDR/SDR difference, alongside peak nits):\n"
@@ -151,7 +153,7 @@ int main(int argc, char **argv)
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
     float sdr_saturation    = 1.0f;   /* 1.0 = libplacebo native; >1 shifts saturated reds toward orange */
     const struct pl_gamut_map_function *sdr_gamut_map = &pl_gamut_map_perceptual;
-    float sdr_dr_stops_cap = 10.0f;   /* BT.1886 ~1000:1 contrast */
+    float sdr_dr_stops_cap = 12.0f;   /* matches 0.1-nit BT.1886 black at 500-nit modern SDR peak */
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-v")) g_verbose = 1;
