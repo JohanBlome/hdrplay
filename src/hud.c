@@ -131,7 +131,6 @@ typedef struct { pl_tex tex; int W, H; } HudSlot;
 
 static HudSlot      slots[SLOT_COUNT];
 static int          hud_scale = 2;
-static uint64_t     frame_count = 0;
 
 /* Storage for overlay descriptors passed to libplacebo each frame.
  * Sized once, mutated per-frame. */
@@ -242,8 +241,8 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         draw_text(buf, W, H, 6, y, hud_scale, r->last_output_csp);
     y += FONT_H * hud_scale + 8;
 
-    snprintf(line, sizeof(line), "FRAME %llu%s%s",
-             (unsigned long long)frame_count,
+    snprintf(line, sizeof(line), "FRAME %d%s%s",
+             r->current_frame_no >= 0 ? r->current_frame_no : 0,
              r->paused       ? " PAUSED" : "",
              r->loop_enabled ? " LOOP"   : "");
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
@@ -367,7 +366,6 @@ static int build_label_badge(int slot, pl_gpu gpu, const char *big,
  *                     render. */
 void hud_prepare(Renderer *r, int win_w, int win_h, HudOverlays *out)
 {
-    frame_count++;
     pl_gpu gpu = r->vulkan->gpu;
 
     memset(out, 0, sizeof(*out));

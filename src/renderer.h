@@ -112,6 +112,13 @@ typedef struct Renderer {
      * Override with --sdr-dr-stops. */
     float sdr_dr_stops_cap;
 
+    /* Source-video frame number we're currently displaying. Computed
+     * from PTS × fps in main.c after each successful decode, so it
+     * stays correct across seeks/restarts (unlike a render-side
+     * counter, which would just count refreshes). -1 = no frame
+     * decoded yet. */
+    int current_frame_no;
+
     /* Luminance probe — main loop pokes mouse coords (window-relative,
      * in window pixels), HUD draws a crosshair and tells `decoder`-land
      * to sample the source pixel and report nominal nits. -1 = disabled. */

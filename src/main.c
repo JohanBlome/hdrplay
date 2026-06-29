@@ -307,8 +307,11 @@ int main(int argc, char **argv)
     bool paused = false;
     bool have_frame = false;
     AVRational stream_tb = dec.fmt->streams[dec.stream_idx]->time_base;
+    AVRational stream_fr = dec.fmt->streams[dec.stream_idx]->avg_frame_rate;
+    double  stream_fps   = (stream_fr.den > 0) ? av_q2d(stream_fr) : 0.0;
     double  base_wall   = 0.0;
     int64_t base_pts    = AV_NOPTS_VALUE;   /* AV_NOPTS_VALUE = rebase next frame */
+    rend.current_frame_no = -1;
     while (!quit) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -410,6 +413,17 @@ int main(int argc, char **argv)
              * rate as a fallback. */
             int64_t pts = dec.frame->best_effort_timestamp;
             if (pts == AV_NOPTS_VALUE) pts = dec.frame->pts;
+            /* Source-video frame number from PTS × fps. Stays correct
+             * across seeks because it's derived from the timestamp,
+             * not a counter. Falls back to incrementing if fps or
+             * PTS isn't available. */
+            if (stream_fps > 0.0 && pts != AV_NOPTS_VALUE) {
+                double sec = (double)pts * av_q2d(stream_tb);
+                rend.current_frame_no = (int)(sec * stream_fps + 0.5);
+            } else {
+                rend.current_frame_no =
+                    (rend.current_frame_no < 0 ? 0 : rend.current_frame_no + 1);
+            }
             if (pts != AV_NOPTS_VALUE) {
                 double tb = av_q2d(stream_tb);
                 if (base_pts == AV_NOPTS_VALUE) {
