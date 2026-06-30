@@ -675,8 +675,8 @@ bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
     case HDRPLAY_MODE_HDR:
         mode_name = "HDR";
         apply_hdr_target(&target, r->display_hdr_headroom);
-        target.overlays     = &hud_ov.status;
-        target.num_overlays = 1;
+        target.overlays     = r->hud_hidden ? NULL : &hud_ov.status;
+        target.num_overlays = r->hud_hidden ? 0 : 1;
         if (!pl_render_image(r->renderer, &image, &target, &rp))
             LOG("REND", "pl_render_image (HDR) failed");
         break;
@@ -738,7 +738,7 @@ bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
         struct pl_overlay ov_arr[4];
         int n = 0;
         if (r->diag_tex) ov_arr[n++] = sdr_ov;
-        ov_arr[n++] = hud_ov.status;
+        if (!r->hud_hidden) ov_arr[n++] = hud_ov.status;
         if (r->mode == HDRPLAY_MODE_SPLIT) {
             ov_arr[n++] = hud_ov.hdr_label;
             ov_arr[n++] = hud_ov.sdr_label;

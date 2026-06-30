@@ -173,6 +173,7 @@ static void usage(void)
         "                        O=toggle split orientation  SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
         "                        M=toggle luminance probe (mouse → nits)\n"
+        "                        I=show/hide top-left status HUD\n"
         "                        ←/→=seek -10s/+10s\n"
         "\n"
         "control / inspection:\n"
@@ -374,6 +375,10 @@ int main(int argc, char **argv)
                 if (e.key.key == SDLK_M) {
                     rend.probe_active = !rend.probe_active;
                     LOG("REND", "luminance probe %s", rend.probe_active ? "ON" : "OFF");
+                }
+                if (e.key.key == SDLK_I) {
+                    rend.hud_hidden = !rend.hud_hidden;
+                    LOG("REND", "status HUD %s", rend.hud_hidden ? "HIDDEN" : "SHOWN");
                 }
             }
             /* Continuously update probe coords as the mouse moves. We

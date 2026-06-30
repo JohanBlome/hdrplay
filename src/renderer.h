@@ -119,6 +119,12 @@ typedef struct Renderer {
      * decoded yet. */
     int current_frame_no;
 
+    /* HUD visibility toggle. The status panel (top-left, multi-line)
+     * can occlude image content in some clips — let the user hide it
+     * with 'I'. The HDR/SDR split-mode badges are NOT gated by this
+     * because they're load-bearing for telling the panes apart. */
+    bool hud_hidden;
+
     /* Luminance probe — main loop pokes mouse coords (window-relative,
      * in window pixels), HUD draws a crosshair and tells `decoder`-land
      * to sample the source pixel and report nominal nits. -1 = disabled. */
