@@ -1,10 +1,12 @@
 #include "diagnose.h"
+#include "checks.h"
 #include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <unistd.h>
 #include <SDL3/SDL.h>
 
 #ifdef __APPLE__
@@ -13,23 +15,9 @@
 #include <IOKit/ps/IOPSKeys.h>
 #endif
 
-/* Result severity, kept as enum so accounting stays straightforward. */
-enum { R_PASS, R_WARN, R_FAIL };
-
-static int fail_count = 0;
-static int warn_count = 0;
-
-static void check(int level, const char *name, const char *detail)
-{
-    static const char *tag[] = {
-        "\x1b[32mPASS\x1b[0m",
-        "\x1b[33mWARN\x1b[0m",
-        "\x1b[31mFAIL\x1b[0m",
-    };
-    fprintf(stderr, "  %s  %-32s  %s\n", tag[level], name, detail);
-    if (level == R_FAIL) fail_count++;
-    if (level == R_WARN) warn_count++;
-}
+/* PASS/WARN/FAIL rendering and counting now live in checks.c, shared
+ * with --analyze so both reports read identically and both use the
+ * "exit code is the fail count" convention. */
 
 /* ------------------------------------------------------------------ */
 /* Read window-level HDR state by spawning a tiny hidden window on    */
@@ -203,7 +191,7 @@ static void diagnose_one(int index, SDL_DisplayID id)
 
 int diagnose_run(int display_index)
 {
-    fail_count = warn_count = 0;
+    check_reset();
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -233,6 +221,6 @@ int diagnose_run(int display_index)
     }
     SDL_free(ids);
 
-    fprintf(stderr, "\nsummary: %d FAIL, %d WARN\n", fail_count, warn_count);
-    return fail_count;
+    check_summary();
+    return check_fail_count();
 }

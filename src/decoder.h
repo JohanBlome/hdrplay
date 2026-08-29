@@ -37,6 +37,10 @@ typedef struct {
 
 bool  decoder_open(Decoder *d, const char *path);
 int   decoder_next_frame(Decoder *d);   /* >0 got frame, 0 EOF, <0 error */
+/* Fold any per-frame HDR10 side data into the cached stream metadata.
+ * Encoders that stamp MaxCLL/MaxFALL per frame rather than per stream
+ * would otherwise look like they declare nothing. */
+void  decoder_absorb_frame_side_data(Decoder *d);
 bool  decoder_seek_start(Decoder *d);   /* rewind for --loop; false on err */
 bool  decoder_seek_to(Decoder *d, double seconds);   /* seek to absolute time; clamps to >= 0 */
 double decoder_frame_seconds(const Decoder *d);      /* current frame's PTS in seconds (NaN if none) */

@@ -2,6 +2,8 @@
 #include "hud.h"
 #include "log.h"
 #include "probe.h"
+#include "stats.h"
+#include "source.h"
 
 #include <math.h>
 #include <SDL3/SDL.h>
@@ -167,6 +169,37 @@ bool renderer_init(Renderer *r, int width, int height, const char *title, int di
     /* SDL3 window creation goes through a properties bag when we want to
      * set position. SDL_WINDOWPOS_CENTERED_DISPLAY(id) puts the window
      * in the middle of the target display. */
+    /* Clamp the initial window to fit the display, preserving aspect.
+     *
+     * Sizing the window to the source is fine for 1080p landscape, but a
+     * 1728x2304 portrait clip produces a window taller than the screen —
+     * and with HIGH_PIXEL_DENSITY that becomes a ~16 megapixel backing
+     * surface. Every render pass, and every border clear, then covers 16
+     * MP; with two panes that is enough to drop a fast GPU to single-
+     * digit frame rates. Resizing afterwards is still free. */
+    {
+        SDL_DisplayID d = target_display ? target_display : SDL_GetPrimaryDisplay();
+        SDL_Rect usable = {0};
+        if (d && SDL_GetDisplayUsableBounds(d, &usable) &&
+            usable.w > 0 && usable.h > 0 && width > 0 && height > 0)
+        {
+            /* Leave a little room so the window is not flush to the edges. */
+            int max_w = (int)(usable.w * 0.9f);
+            int max_h = (int)(usable.h * 0.9f);
+            if (width > max_w || height > max_h) {
+                float sx = (float)max_w / width;
+                float sy = (float)max_h / height;
+                float sc = sx < sy ? sx : sy;
+                int nw = (int)(width * sc), nh = (int)(height * sc);
+                if (nw < 320) nw = 320;
+                if (nh < 240) nh = 240;
+                LOG("GPU", "window %dx%d exceeds usable %dx%d — opening at %dx%d",
+                    width, height, usable.w, usable.h, nw, nh);
+                width = nw; height = nh;
+            }
+        }
+    }
+
     SDL_PropertiesID wp = SDL_CreateProperties();
     SDL_SetStringProperty (wp, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
     SDL_SetNumberProperty (wp, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width);
@@ -311,19 +344,20 @@ static inline float alpha_for_mask(int mask_mode, float nx, float ny, float aa)
     }
 }
 
-static void ensure_diag_tex(Renderer *r, int w, int h, int mask_mode)
+static void ensure_inter_tex(Renderer *r, int si, int w, int h, int mask_mode)
 {
-    bool size_changed = !r->diag_tex || r->diag_tex_w != w || r->diag_tex_h != h;
-    bool mask_changed = r->diag_tex_mask_mode != mask_mode;
+    typeof(r->slot[0]) *sl = &r->slot[si];
+    bool size_changed = !sl->inter_tex || sl->inter_w != w || sl->inter_h != h;
+    bool mask_changed = sl->inter_mask != mask_mode;
     if (!size_changed && !mask_changed) return;
 
     if (size_changed) {
-        if (r->diag_tex) pl_tex_destroy(r->vulkan->gpu, &r->diag_tex);
-        r->diag_tex_w = w;
-        r->diag_tex_h = h;
+        if (sl->inter_tex) pl_tex_destroy(r->vulkan->gpu, &sl->inter_tex);
+        sl->inter_w = w;
+        sl->inter_h = h;
         pl_fmt fmt = pl_find_named_fmt(r->vulkan->gpu, "rgba16hf");
         if (!fmt) fmt = pl_find_named_fmt(r->vulkan->gpu, "rgba8");
-        r->diag_tex = pl_tex_create(r->vulkan->gpu, pl_tex_params(
+        sl->inter_tex = pl_tex_create(r->vulkan->gpu, pl_tex_params(
             .w              = w,
             .h              = h,
             .format         = fmt,
@@ -332,11 +366,11 @@ static void ensure_diag_tex(Renderer *r, int w, int h, int mask_mode)
             .host_writable  = true,
             .blit_dst       = true,
         ));
-        if (!r->diag_tex) { LOG("REND", "ensure_diag_tex: alloc failed"); return; }
+        if (!sl->inter_tex) { LOG("REND", "ensure_inter_tex: alloc failed"); return; }
     }
-    r->diag_tex_mask_mode = mask_mode;
+    sl->inter_mask = mask_mode;
 
-    pl_fmt fmt = r->diag_tex->params.format;
+    pl_fmt fmt = sl->inter_tex->params.format;
     bool is_half = (fmt && strcmp(fmt->name, "rgba16hf") == 0);
     size_t pixel_size = is_half ? 8 : 4;
     uint8_t *buf = calloc((size_t)w * h, pixel_size);
@@ -373,7 +407,7 @@ static void ensure_diag_tex(Renderer *r, int w, int h, int mask_mode)
     }
 
     pl_tex_upload(r->vulkan->gpu, pl_tex_transfer_params(
-        .tex = r->diag_tex,
+        .tex = sl->inter_tex,
         .ptr = buf,
     ));
     free(buf);
@@ -382,150 +416,15 @@ static void ensure_diag_tex(Renderer *r, int w, int h, int mask_mode)
         mask_mode == ALPHA_MASK_LR   ? "LR"   :
         mask_mode == ALPHA_MASK_TB   ? "TB"   :
         mask_mode == ALPHA_MASK_DIAG ? "DIAG" : "?";
-    LOG("REND", "diag_tex (%dx%d, %s) mask=%s uploaded",
-        w, h, fmt ? fmt->name : "?", mname);
+    LOG("REND", "inter_tex[%d] (%dx%d, %s) mask=%s uploaded",
+        si, w, h, fmt ? fmt->name : "?", mname);
 }
 
 /* ------------------------------------------------------------------ */
-/* Render SDR content into diag_tex (which already carries the mask). */
-/* Used by the unified SDR/SPLIT pipeline below.                       */
-/* ------------------------------------------------------------------ */
-static bool render_sdr_to_intermediate(
-    Renderer *r,
-    const struct pl_frame *src_image,
-    int tw, int th,
-    int mask_mode,
-    float sdr_peak,
-    const struct pl_render_params *rp_base)
-{
-    ensure_diag_tex(r, tw, th, mask_mode);
-    if (!r->diag_tex) return false;
-
-    struct pl_frame sdr_target = {
-        .num_planes = 1,
-        .planes = {{
-            .texture           = r->diag_tex,
-            .components        = 4,
-            .component_mapping = { 0, 1, 2, 3 },
-        }},
-        .crop  = { 0, 0, (float)tw, (float)th },
-        .repr  = pl_color_repr_rgb,
-        .color = pl_color_space_hdr10,
-    };
-    /* Target primaries = BT.709 so libplacebo gamut-maps wide-gamut
-     * BT.2020 source colors into the BT.709 volume during render. The
-     * SDR intermediate is still PQ-encoded with max_luma = sdr_peak
-     * so the overlay path can carry it through to the HDR swapchain
-     * — only the gamut volume changes. The overlay descriptor below
-     * tells the compositor the intermediate is BT.709 so it reprojects
-     * to BT.2020 swapchain primaries cleanly. */
-    sdr_target.color.primaries    = PL_COLOR_PRIM_BT_709;
-    sdr_target.color.hdr.max_luma = sdr_peak;
-    /* SDR's contrast ceiling. min_luma = sdr_peak / 2^cap forces the
-     * SDR target to a fixed dynamic range (default 10 stops, BT.1886
-     * ~1000:1). libplacebo compresses sub-floor source detail up to
-     * this floor on tone-map, so the SDR pane crushes shadows the way
-     * a real SDR display has to. Without this the SDR pane keeps HDR-
-     * grade blacks (we were setting 0.005 nits flat) and ends up with
-     * 13–16 stops of pretend-SDR DR — a third dishonest axis alongside
-     * peak and gamut. See --sdr-dr-stops. */
-    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 12.0f;
-    sdr_target.color.hdr.min_luma = sdr_peak / powf(2.0f, cap);
-
-    struct pl_render_params rp_sdr = *rp_base;
-    static const struct pl_blend_params keep_alpha = {
-        .src_rgb   = PL_BLEND_ONE,
-        .dst_rgb   = PL_BLEND_ZERO,
-        .src_alpha = PL_BLEND_ZERO,
-        .dst_alpha = PL_BLEND_ONE,
-    };
-    rp_sdr.blend_params = &keep_alpha;
-
-    /* Enable inverse tone mapping so SDR-source content (peak ~100
-     * nits) is expanded UP to our SDR target peak (~500 nits) instead
-     * of being preserved at 100 nits. Without this, an SDR file in
-     * SDR mode displays at ~100 absolute nits while QuickTime's same
-     * file displays at ~500 nits (macOS SDR layer compositing applies
-     * EDR boost). Inverse tone-mapping replicates that boost. For HDR
-     * source content (peak 10000), this flag is a no-op — libplacebo
-     * still tone-maps down to the target ceiling. */
-    static struct pl_color_map_params sdr_color_map;
-    sdr_color_map = pl_color_map_default_params;
-    sdr_color_map.inverse_tone_mapping = true;
-    /* Wide-gamut → BT.709 gamut mapping. Default perceptual (BT.2407
-     * rolloff) approximates what an SDR display would actually show
-     * for BT.2020 source. NULL leaves libplacebo's default behavior
-     * for gamut handling. See --sdr-gamut-map. */
-    if (r->sdr_gamut_map)
-        sdr_color_map.gamut_mapping = r->sdr_gamut_map;
-    rp_sdr.color_map_params = &sdr_color_map;
-
-    /* Saturation boost. libplacebo's tone-map pipeline desaturates
-     * perceptually (preserves hue stability across brightness changes),
-     * which makes our SDR look flatter than macOS's SDR layer. Counter
-     * that with a render-params color_adjustment.saturation > 1. */
-    static struct pl_color_adjustment sdr_adj;
-    sdr_adj = pl_color_adjustment_neutral;
-    sdr_adj.saturation = r->sdr_saturation > 0.0f ? r->sdr_saturation : 1.0f;
-    rp_sdr.color_adjustment = &sdr_adj;
-
-    LOGV("REND", "SDR→intermediate %dx%d (mask=%d): src.max=%.0fn  tgt.max=%.0fn  inverse=on",
-         tw, th, mask_mode,
-         src_image->color.hdr.max_luma, sdr_target.color.hdr.max_luma);
-    return pl_render_image(r->renderer_sdr, src_image, &sdr_target, &rp_sdr);
-}
-
-/* Build an overlay pointing at diag_tex, sized to `dst_rect`. Caller
- * owns the storage for the returned overlay + part. */
-static void make_sdr_overlay(
-    Renderer *r,
-    struct pl_overlay *out_overlay,
-    struct pl_overlay_part *out_part,
-    int tw, int th,
-    struct pl_rect2df dst_rect,
-    float sdr_peak)
-{
-    *out_part = (struct pl_overlay_part){
-        .src = { 0, 0, (float)tw, (float)th },
-        .dst = dst_rect,
-    };
-    *out_overlay = (struct pl_overlay){
-        .tex   = r->diag_tex,
-        .mode  = PL_OVERLAY_NORMAL,
-        .parts = out_part,
-        .num_parts = 1,
-        .repr  = pl_color_repr_rgb,
-        .color = pl_color_space_hdr10,
-    };
-    /* CRITICAL: pl_color_space_hdr10 leaves max_luma=0, which kicks
-     * libplacebo's overlay compositor into a heuristic that renormalizes
-     * our intermediate's PQ codes against an assumed max (usually the
-     * HDR10 spec 10000 nits). That decouples sdr_peak from displayed
-     * brightness — --sdr-peak 500/800/1500 all land at the same panel
-     * output. Tell the compositor exactly what range our intermediate's
-     * pixels are encoded against so the codes pass through 1:1.
-     * See RENDERING.md §6.6. */
-    out_overlay->color.hdr.max_luma = sdr_peak;
-    /* Must match the floor render_sdr_to_intermediate baked into the
-     * intermediate. Anything else and libplacebo's overlay compositor
-     * would re-interpret PQ codes against the wrong range, undoing the
-     * SDR-pane DR cap. */
-    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 12.0f;
-    out_overlay->color.hdr.min_luma = sdr_peak / powf(2.0f, cap);
-    /* Must match render_sdr_to_intermediate's target.primaries — the
-     * intermediate is rendered in BT.709 (gamut-mapped from BT.2020 source).
-     * Telling the compositor BT.709 here lets it reproject to the BT.2020
-     * swapchain primaries correctly; otherwise libplacebo would treat the
-     * BT.709 codes as if they were already BT.2020 and the colors would
-     * shift. */
-    out_overlay->color.primaries = PL_COLOR_PRIM_BT_709;
-}
-
-/* ------------------------------------------------------------------ */
-/* Helpers to apply a colorspace + crop to the target frame.          */
+/* Helpers to apply a colorspace to the target frame.                 */
 /* The swapchain is always HDR-capable; we synthesize SDR by clamping */
-/* the target's peak luminance and switching the transfer/primaries,  */
-/* so libplacebo's tone-mapper does the heavy lifting for us.         */
+/* the target's peak luminance, so libplacebo's tone-mapper does the  */
+/* heavy lifting.                                                     */
 /* ------------------------------------------------------------------ */
 static void apply_hdr_target(struct pl_frame *t, float headroom)
 {
@@ -535,67 +434,190 @@ static void apply_hdr_target(struct pl_frame *t, float headroom)
     t->color.hdr.min_luma = 0.005f;
 }
 
-static void apply_sdr_target(struct pl_frame *t, float peak_nits)
-{
-    /* CRUCIAL: do NOT override primaries OR transfer. Both must match
-     * the swapchain's actual colorspace, otherwise libplacebo's encoded
-     * pixels get misinterpreted by the OS compositor.
-     *
-     * peak_nits is the SDR ceiling in absolute nits. 100 = strict
-     * BT.2100 spec (very dim on most setups), 203 = Apple HDR Video
-     * reference, 500 = Apple Display preset, etc. See renderer.h. */
-    t->color.hdr.max_luma = peak_nits;
-    t->color.hdr.min_luma = 0.005f;
-}
-
-/* Compute the SDR peak we'll use this frame. Caller responsibility
- * to record it in r->sdr_peak_effective for the HUD. */
 static float compute_sdr_peak(const Renderer *r)
 {
     if (r->sdr_peak_override > 0.0f) return r->sdr_peak_override;
-    /* Default: 500 nits — matches what users actually experience when
-     * they open an SDR file in QuickTime / Safari / Finder on a modern
-     * HDR-capable Mac. macOS's SDR layer compositor applies an EDR boost
-     * so SDR content sits at the panel's "SDR reference white" (typically
-     * 400-600 nits on HDR-enabled Macs). Modern HDR TVs do equivalent
-     * boosts. Spec-true 100/200-nit SDR is a thing that exists only on
-     * legacy SDR-only displays nobody owns; demoing against it is showing
-     * a comparison nobody can verify against their lived experience.
-     *
-     * Override:
-     *   --sdr-peak 100   strict BT.2100 spec — only honest comparison if
-     *                    you're explicitly demonstrating "what SDR really
-     *                    is on a non-HDR display"
-     *   --sdr-peak 200   BT.2408 diffuse-white reference
-     *   --sdr-peak 800   Apple Display preset / bright SDR
-     */
-    return 500.0f;
+    /* Track the OS SDR-white reference. SDL reports it normalized
+     * (1.0 = SDR baseline), so scale by the BT.2100 100-nit reference
+     * and by the headroom the compositor is currently granting. */
+    float white = r->display_sdr_white > 0.0f ? r->display_sdr_white : 1.0f;
+    float peak  = white * 100.0f * (r->display_hdr_headroom > 0.0f
+                                    ? r->display_hdr_headroom : 1.0f);
+    if (peak < 100.0f)  peak = 100.0f;
+    if (peak > 1000.0f) peak = 1000.0f;
+    return peak;
 }
 
-/* Narrow the target's destination rect to a sub-band along one axis.
- * (a0..a1) are normalized fractions [0,1] of the full extent on the
- * chosen axis. Used to put HDR and SDR renders into adjacent halves
- * of the same swapchain image. */
-static void set_crop_axis(struct pl_frame *t, int axis_is_y, float a0, float a1)
+static float inter_min_luma(const Renderer *r, float peak)
 {
-    if (axis_is_y) {
-        float h = t->crop.y1 - t->crop.y0;
-        float base_y0 = t->crop.y0;
-        t->crop.y0 = base_y0 + h * a0;
-        t->crop.y1 = base_y0 + h * a1;
+    float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 12.0f;
+    return peak / powf(2.0f, cap);
+}
+
+/* ------------------------------------------------------------------ */
+/* Render a source into its intermediate (which already carries the   */
+/* alpha mask).                                                        */
+/*                                                                     */
+/* `sdr` selects the treatment. SDR is the original use — gamut-map to */
+/* BT.709 and clamp the peak — and is why the intermediate exists at   */
+/* all: overlay composition bypasses tone-mapping, so absolute         */
+/* PQ-encoded brightness survives to the panel instead of being        */
+/* renormalized to swapchain peak (RENDERING.md §6.6).                 */
+/*                                                                     */
+/* The HDR variant is new, and only used for the second source in a    */
+/* two-file DIAG wipe, where the pane boundary is not a rectangle and  */
+/* therefore cannot be a target crop.                                  */
+/* ------------------------------------------------------------------ */
+static bool render_to_intermediate(
+    Renderer *r,
+    int si,
+    const struct pl_frame *src_image,
+    int tw, int th,
+    int mask_mode,
+    bool sdr,
+    float sdr_peak,
+    const struct pl_render_params *rp_base)
+{
+    ensure_inter_tex(r, si, tw, th, mask_mode);
+    pl_tex tex = r->slot[si].inter_tex;
+    if (!tex) return false;
+
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes = {{
+            .texture           = tex,
+            .components        = 4,
+            .component_mapping = { 0, 1, 2, 3 },
+        }},
+        .crop  = { 0, 0, (float)tw, (float)th },
+        .repr  = pl_color_repr_rgb,
+        .color = pl_color_space_hdr10,
+    };
+
+    if (sdr) {
+        /* Target primaries = BT.709 so libplacebo gamut-maps wide-gamut
+         * BT.2020 source colors into the BT.709 volume during render.
+         * Still PQ-encoded with max_luma = sdr_peak so the overlay path
+         * carries it to the HDR swapchain; only the gamut changes. */
+        target.color.primaries    = PL_COLOR_PRIM_BT_709;
+        target.color.hdr.max_luma = sdr_peak;
+        /* SDR's contrast ceiling. libplacebo compresses sub-floor source
+         * detail up to this floor, so the pane crushes shadows the way a
+         * real SDR display has to. See --sdr-dr-stops. */
+        target.color.hdr.min_luma = inter_min_luma(r, sdr_peak);
     } else {
-        float w = t->crop.x1 - t->crop.x0;
-        float base_x0 = t->crop.x0;
-        t->crop.x0 = base_x0 + w * a0;
-        t->crop.x1 = base_x0 + w * a1;
+        apply_hdr_target(&target, r->display_hdr_headroom);
+    }
+
+    struct pl_render_params rp = *rp_base;
+    static const struct pl_blend_params keep_alpha = {
+        .src_rgb   = PL_BLEND_ONE,
+        .dst_rgb   = PL_BLEND_ZERO,
+        .src_alpha = PL_BLEND_ZERO,
+        .dst_alpha = PL_BLEND_ONE,
+    };
+    rp.blend_params = &keep_alpha;
+
+    static struct pl_color_map_params sdr_color_map;
+    static struct pl_color_adjustment  sdr_adj;
+    if (sdr) {
+        sdr_color_map = pl_color_map_default_params;
+        /* Inverse tone-mapping expands an SDR source (peak ~100 nits)
+         * UP to the SDR target peak, replicating the EDR boost macOS
+         * applies when compositing an SDR layer. Without it an SDR file
+         * shows at ~100 absolute nits while QuickTime shows the same
+         * file at ~500. For HDR source content this is a no-op. It is
+         * also what the HUD's SDR BOOST line reports on. */
+        sdr_color_map.inverse_tone_mapping = true;
+        /* Wide-gamut -> BT.709. Perceptual (BT.2407 rolloff) by default,
+         * approximating what an SDR display would actually show for
+         * BT.2020 source. See --sdr-gamut-map. */
+        if (r->sdr_gamut_map)
+            sdr_color_map.gamut_mapping = r->sdr_gamut_map;
+        rp.color_map_params = &sdr_color_map;
+
+        /* libplacebo's tone-map desaturates perceptually to keep hue
+         * stable across brightness changes, which reads flatter than
+         * macOS's SDR layer. Counter with a saturation adjustment. */
+        sdr_adj = pl_color_adjustment_neutral;
+        sdr_adj.saturation = r->sdr_saturation > 0.0f ? r->sdr_saturation : 1.0f;
+        rp.color_adjustment = &sdr_adj;
+    }
+
+    LOGV("REND", "%s->intermediate[%d] %dx%d (mask=%d): src.max=%.0fn tgt.max=%.0fn",
+         sdr ? "SDR" : "HDR", si, tw, th, mask_mode,
+         src_image->color.hdr.max_luma, target.color.hdr.max_luma);
+    return pl_render_image(sdr ? r->renderer_sdr : r->renderer,
+                           src_image, &target, &rp);
+}
+
+/* Build an overlay pointing at a source's intermediate. */
+static void make_inter_overlay(
+    Renderer *r,
+    int si,
+    struct pl_overlay *out_overlay,
+    struct pl_overlay_part *out_part,
+    int tw, int th,
+    struct pl_rect2df dst_rect,
+    bool sdr,
+    float sdr_peak)
+{
+    *out_part = (struct pl_overlay_part){
+        .src = { 0, 0, (float)tw, (float)th },
+        .dst = dst_rect,
+    };
+    *out_overlay = (struct pl_overlay){
+        .tex   = r->slot[si].inter_tex,
+        .mode  = PL_OVERLAY_NORMAL,
+        .parts = out_part,
+        .num_parts = 1,
+        .repr  = pl_color_repr_rgb,
+        .color = pl_color_space_hdr10,
+    };
+    /* CRITICAL: pl_color_space_hdr10 leaves max_luma=0, which kicks
+     * libplacebo's overlay compositor into a heuristic that renormalizes
+     * our intermediate's PQ codes against an assumed max (usually the
+     * HDR10 spec 10000 nits). That decouples the encoded brightness from
+     * what lands on the panel — --sdr-peak 500/800/1500 would all look
+     * the same. Declare exactly the range the intermediate was rendered
+     * against so the codes pass through 1:1. These MUST mirror
+     * render_to_intermediate's target. See RENDERING.md §6.6. */
+    if (sdr) {
+        out_overlay->color.hdr.max_luma = sdr_peak;
+        out_overlay->color.hdr.min_luma = inter_min_luma(r, sdr_peak);
+        out_overlay->color.primaries    = PL_COLOR_PRIM_BT_709;
+    } else {
+        out_overlay->color.hdr.max_luma = 203.0f * r->display_hdr_headroom;
+        out_overlay->color.hdr.min_luma = 0.005f;
+        out_overlay->color.primaries    = PL_COLOR_PRIM_BT_2020;
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Per-frame render                                                    */
-/* ------------------------------------------------------------------ */
-bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
+static struct pl_rect2df to_pl_rect(LayoutRect r)
 {
+    return (struct pl_rect2df){ r.x0, r.y0, r.x1, r.y1 };
+}
+
+static bool rect_is_zero(LayoutRect r)
+{
+    return r.x0 == 0 && r.y0 == 0 && r.x1 == 0 && r.y1 == 0;
+}
+
+/* Which source the HUD, probe and statistics should describe. In a
+ * two-file comparison that is the left/top pane; when soloed it is
+ * whichever file is on screen. */
+int renderer_focus_source(const Renderer *r)
+{
+    if (r->n_sources < 2) return 0;
+    if (r->solo >= 0) return r->solo;
+    return r->swapped ? 1 : 0;
+}
+
+bool renderer_render(Renderer *r, Source *sources, int n)
+{
+    if (n < 1) return false;
+    if (n > 2) n = 2;
     renderer_update_display_state(r);
 
     struct pl_swapchain_frame sf;
@@ -604,40 +626,114 @@ bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
         return true; /* not fatal — try next frame */
     }
 
-    struct pl_frame image = {0};
-    if (!pl_map_avframe_ex(r->vulkan->gpu, &image, pl_avframe_params(
-            .frame = avframe,
-            .tex   = r->plane_tex,
-    ))) {
-        LOG("REND", "pl_map_avframe_ex failed");
+    /* Map every source once up front. A pass and an intermediate can
+     * both reference the same source, and DIAG maps both sources in one
+     * swapchain frame, so per-pass mapping would either double-map or
+     * unmap something still queued. */
+    for (int i = 0; i < n; i++) {
+        r->slot[i].mapped = false;
+        if (!sources[i].shown) continue;
+        if (!pl_map_avframe_ex(r->vulkan->gpu, &r->slot[i].image,
+                pl_avframe_params(.frame = sources[i].shown,
+                                  .tex   = r->slot[i].plane_tex))) {
+            LOG("REND", "pl_map_avframe_ex failed for source %d", i);
+            continue;
+        }
+        r->slot[i].mapped = true;
+    }
+
+    int focus = renderer_focus_source(r);
+    if (!r->slot[focus].mapped) {
+        /* Nothing to draw from the focused source; still present so the
+         * window does not freeze. */
+        for (int i = 0; i < n; i++)
+            if (r->slot[i].mapped)
+                pl_unmap_avframe(r->vulkan->gpu, &r->slot[i].image);
         pl_swapchain_submit_frame(r->swapchain);
-        return false;
+        return true;
     }
 
     /* Reset per-frame info before render. */
     r->last_num_passes = 0;
     r->last_tonemap[0] = 0;
-    /* Source colorspace summary, for the on-screen HUD. */
     snprintf(r->last_source_csp, sizeof(r->last_source_csp),
              "src: prim=%d trc=%d peak=%.0fn",
-             image.color.primaries, image.color.transfer,
-             image.color.hdr.max_luma);
+             r->slot[focus].image.color.primaries,
+             r->slot[focus].image.color.transfer,
+             r->slot[focus].image.color.hdr.max_luma);
 
-    /* Per-frame brightness statistics. Stride 8 = ~130k samples on 4K,
-     * sub-ms on modern CPUs. Done off the AVFrame directly (no GPU
-     * round-trip) so the HUD can show "is this frame HDR-worthy?" in
-     * real time without affecting render performance. */
-    r->frame_stats_valid = probe_frame_stats(avframe, 8, &r->frame_stats);
+    /* Frame statistics and the session accumulator are updated by
+     * source_advance_to / source_step_*, which own the decode. Mirror
+     * the focused source's into the renderer for the HUD. */
+    r->frame_stats       = sources[focus].frame_stats;
+    r->frame_stats_valid = sources[focus].frame_stats_valid;
+    r->session           = &sources[focus].session;
+    r->current_frame_no  = sources[focus].frame_no;
 
-    /* Luminance probe — sample source pixel if the user has the probe
-     * active. Done before render so HUD has fresh values to display. */
+    struct pl_render_params rp = pl_render_default_params;
+    rp.info_callback = pl_info_cb;
+    rp.info_priv     = r;
+
+    struct pl_frame base_target;
+    pl_frame_from_swapchain(&base_target, &sf);
+    int win_w = (int)(base_target.crop.x1 - base_target.crop.x0);
+    int win_h = (int)(base_target.crop.y1 - base_target.crop.y0);
+
+    r->sdr_peak_effective = compute_sdr_peak(r);
+    const float sdr_peak = r->sdr_peak_effective;
+
+    /* Every compositing decision comes from here — see layout.c. */
+    LayoutInput li = {
+        .mode = r->mode, .orient = r->split_orient,
+        .n_sources = n, .solo = r->solo, .swapped = r->swapped,
+        .win_w = win_w, .win_h = win_h,
+        .src_w = { sources[0].shown ? sources[0].shown->width  : 0,
+                   n > 1 && sources[1].shown ? sources[1].shown->width  : 0 },
+        .src_h = { sources[0].shown ? sources[0].shown->height : 0,
+                   n > 1 && sources[1].shown ? sources[1].shown->height : 0 },
+        .zoom = r->zoom, .pan_x = r->pan_x, .pan_y = r->pan_y,
+        .hud_hidden = r->hud_hidden,
+        .session_panel = r->session_panel,
+    };
+    LayoutPlan plan;
+    layout_plan(&li, &plan);
+
+    /* Log the plan whenever it changes. A mis-planned layout otherwise
+     * presents as a blank pane with no clue why. */
+    static char last_plan[192];
+    char plan_desc[192];
+    int  pd = snprintf(plan_desc, sizeof(plan_desc), "%s: %d pass, %d inter",
+                       plan.name, plan.n_pass, plan.n_inter);
+    for (int i = 0; i < plan.n_pass && pd < (int)sizeof(plan_desc); i++)
+        pd += snprintf(plan_desc + pd, sizeof(plan_desc) - pd,
+                       " | src%d->[%.0f,%.0f %.0fx%.0f]", plan.pass[i].src,
+                       plan.pass[i].target_crop.x0, plan.pass[i].target_crop.y0,
+                       plan.pass[i].target_crop.x1 - plan.pass[i].target_crop.x0,
+                       plan.pass[i].target_crop.y1 - plan.pass[i].target_crop.y0);
+    if (strcmp(plan_desc, last_plan) != 0) {
+        LOG("REND", "layout %s", plan_desc);
+        snprintf(last_plan, sizeof(last_plan), "%s", plan_desc);
+    }
+
+    /* The probe maps a window coordinate back to a source pixel, so it
+     * has to account for zoom/pan the same way the render does. */
     if (r->probe_active && r->probe_x >= 0 && r->probe_y >= 0 &&
-        r->probe_win_w > 0 && r->probe_win_h > 0 && avframe)
+        r->probe_win_w > 0 && r->probe_win_h > 0)
     {
-        int sx = (int)((double)r->probe_x / r->probe_win_w  * avframe->width);
-        int sy = (int)((double)r->probe_y / r->probe_win_h * avframe->height);
+        AVFrame *pf = sources[focus].shown;
+        LayoutRect ic = plan.pass[0].image_crop;
+        double fx = (double)r->probe_x / r->probe_win_w;
+        double fy = (double)r->probe_y / r->probe_win_h;
+        int sx, sy;
+        if (rect_is_zero(ic)) {
+            sx = (int)(fx * pf->width);
+            sy = (int)(fy * pf->height);
+        } else {
+            sx = (int)(ic.x0 + fx * (ic.x1 - ic.x0));
+            sy = (int)(ic.y0 + fy * (ic.y1 - ic.y0));
+        }
         ProbeResult pr;
-        if (probe_sample(avframe, sx, sy, &pr)) {
+        if (probe_sample(pf, sx, sy, &pr)) {
             r->probe_nits   = pr.luma_nits;
             r->probe_y_norm = pr.y_norm;
             r->probe_r_nits = pr.r_nits;
@@ -648,143 +744,118 @@ bool renderer_render_avframe(Renderer *r, AVFrame *avframe)
         }
     }
 
-    struct pl_render_params rp = pl_render_default_params;
-    rp.info_callback = pl_info_cb;
-    rp.info_priv     = r;
-
-    /* Build the target frame(s) based on current mode. SPLIT mode does
-     * two pl_render_image calls into halves of the same swapchain image. */
-    struct pl_frame target;
-    pl_frame_from_swapchain(&target, &sf);
-    struct pl_frame base_target = target;  /* save original crop */
-
-    /* Prepare HUD overlays for THIS frame. Critical: overlays must be
-     * attached to `target` BEFORE pl_render_image is called — libplacebo
-     * composites them during the render pass. Attaching after = invisible. */
-    int win_w = (int)(base_target.crop.x1 - base_target.crop.x0);
-    int win_h = (int)(base_target.crop.y1 - base_target.crop.y0);
     HudOverlays hud_ov;
-    hud_prepare(r, win_w, win_h, &hud_ov);
+    hud_prepare(r, sources, n, &plan, win_w, win_h, &hud_ov);
 
-    /* Resolve effective SDR peak once per frame for HUD readback. */
-    r->sdr_peak_effective = compute_sdr_peak(r);
-    const float sdr_peak = r->sdr_peak_effective;
+    /* 1. Intermediates first — they are inputs to the passes below. */
+    for (int i = 0; i < plan.n_inter; i++) {
+        int si = plan.inter[i].src;
+        if (si < 0 || si >= n || !r->slot[si].mapped) continue;
+        if (!render_to_intermediate(r, si, &r->slot[si].image, win_w, win_h,
+                                    plan.inter[i].mask, plan.inter[i].sdr,
+                                    sdr_peak, &rp))
+            LOG("REND", "render_to_intermediate(%d) failed", si);
+    }
 
-    const char *mode_name = "?";
-    switch (r->mode) {
-    case HDRPLAY_MODE_HDR:
-        mode_name = "HDR";
-        apply_hdr_target(&target, r->display_hdr_headroom);
-        target.overlays     = r->hud_hidden ? NULL : &hud_ov.status;
-        target.num_overlays = r->hud_hidden ? 0 : 1;
-        if (!pl_render_image(r->renderer, &image, &target, &rp))
-            LOG("REND", "pl_render_image (HDR) failed");
-        break;
+    /* 2. Swapchain passes.
+     *
+     * With more than one pass the border handling has to change. By
+     * default libplacebo fills everything in the target OUTSIDE the
+     * image with `border` (PL_CLEAR_COLOR), which for a half-window
+     * target.crop means the second pass wipes the first one's half —
+     * pane A renders, then pane B blanks it. Clear the frame once
+     * ourselves and tell every pass to skip its own border fill.
+     *
+     * Single-pass rendering deliberately keeps the default, so
+     * single-file playback still letterboxes exactly as before. */
+    if (plan.n_pass > 1) {
+        static const float black[3] = { 0.0f, 0.0f, 0.0f };
+        pl_frame_clear(r->vulkan->gpu, &base_target, black);
+        rp.border = PL_CLEAR_SKIP;
+    }
 
-    case HDRPLAY_MODE_SDR:
-    case HDRPLAY_MODE_SPLIT: {
-        /* Unified path: render HDR full-frame to swapchain with the
-         * SDR-intermediate attached as an overlay. The overlay's alpha
-         * mask is selected per mode (FULL = solid SDR, LR/TB = hard
-         * half-split, DIAG = smooth diagonal).
-         *
-         * WHY this is the same path for all SDR-related modes: libplacebo's
-         * overlay compositor blends overlay pixels in the overlay's
-         * declared color space WITHOUT going through the tone-mapping
-         * pipeline. That preserves the absolute PQ-encoded brightness
-         * (203 nits encoded as PQ ≈ 0.578) that we wrote into the
-         * intermediate. Rendering the intermediate as a *source* via
-         * pl_render_image, by contrast, runs the full tone-map pipeline
-         * which renormalizes brightness back to panel peak — and that
-         * was the reason SDR mode and LR/TB split looked identical to
-         * HDR mode. Diagonal worked from day one only because it was
-         * the first thing that happened to use the overlay path. */
-        int sw = (int)(base_target.crop.x1 - base_target.crop.x0);
-        int sh_ = (int)(base_target.crop.y1 - base_target.crop.y0);
+    struct pl_overlay      ov_store[LAYOUT_MAX_OVERLAYS];
+    struct pl_overlay_part ov_parts[LAYOUT_MAX_OVERLAYS];
 
-        int mask_mode;
-        if (r->mode == HDRPLAY_MODE_SDR) {
-            mode_name = "SDR";   mask_mode = ALPHA_MASK_FULL;
-        } else if (r->split_orient == HDRPLAY_SPLIT_LR) {
-            mode_name = "SPLIT-LR";   mask_mode = ALPHA_MASK_LR;
-        } else if (r->split_orient == HDRPLAY_SPLIT_TB) {
-            mode_name = "SPLIT-TB";   mask_mode = ALPHA_MASK_TB;
-        } else {
-            mode_name = "SPLIT-DIAG"; mask_mode = ALPHA_MASK_DIAG;
-        }
+    for (int pi = 0; pi < plan.n_pass; pi++) {
+        const LayoutPass *lp = &plan.pass[pi];
+        if (lp->src < 0 || lp->src >= n || !r->slot[lp->src].mapped) continue;
 
-        /* 1. Render SDR into the intermediate (carries mode's alpha mask). */
-        if (!render_sdr_to_intermediate(r, &image, sw, sh_, mask_mode, sdr_peak, &rp))
-            LOG("REND", "render_sdr_to_intermediate failed");
-
-        /* 2. Build the SDR overlay descriptor (covers full swapchain). */
-        struct pl_overlay  sdr_ov;
-        struct pl_overlay_part sdr_part;
-        if (r->diag_tex)
-            make_sdr_overlay(r, &sdr_ov, &sdr_part, sw, sh_, base_target.crop, sdr_peak);
-
-        /* 3. Render HDR full-frame to swapchain with the SDR overlay
-         *    riding on top. Status + HDR + SDR badges all attach to
-         *    this single render too — clipped to the swapchain crop. */
-        target = base_target;
+        struct pl_frame image  = r->slot[lp->src].image;
+        struct pl_frame target = base_target;
+        target.crop = to_pl_rect(lp->target_crop);
         apply_hdr_target(&target, r->display_hdr_headroom);
 
-        /* Order matters: libplacebo composites overlays in array order,
-         * later ones on top. The SDR intermediate overlay has alpha=1 in
-         * its visible region, which fully replaces the underlying pixels —
-         * so any HUD text drawn before it gets covered (status panel in
-         * full-SDR mode, SDR-side labels in split modes). Draw the SDR
-         * overlay first, then HUD text on top. */
-        struct pl_overlay ov_arr[4];
-        int n = 0;
-        if (r->diag_tex) ov_arr[n++] = sdr_ov;
-        if (!r->hud_hidden) ov_arr[n++] = hud_ov.status;
-        if (r->mode == HDRPLAY_MODE_SPLIT) {
-            ov_arr[n++] = hud_ov.hdr_label;
-            ov_arr[n++] = hud_ov.sdr_label;
+        if (!rect_is_zero(lp->image_crop))
+            image.crop = to_pl_rect(lp->image_crop);
+
+        int n_ov = 0;
+        for (int oi = 0; oi < lp->n_ov && n_ov < LAYOUT_MAX_OVERLAYS; oi++) {
+            const LayoutOverlay *ov = &lp->ov[oi];
+            switch (ov->kind) {
+            case LAYOUT_OV_INTERMEDIATE: {
+                int si = ov->src;
+                if (si < 0 || si >= n || !r->slot[si].inter_tex) break;
+                bool sdr = false;
+                for (int k = 0; k < plan.n_inter; k++)
+                    if (plan.inter[k].src == si) sdr = plan.inter[k].sdr;
+                make_inter_overlay(r, si, &ov_store[n_ov], &ov_parts[n_ov],
+                                   win_w, win_h, to_pl_rect(ov->dst),
+                                   sdr, sdr_peak);
+                n_ov++;
+                break;
+            }
+            case LAYOUT_OV_STATUS:
+                if (hud_ov.has_status)  ov_store[n_ov++] = hud_ov.status;
+                break;
+            case LAYOUT_OV_SESSION:
+                if (hud_ov.has_session) ov_store[n_ov++] = hud_ov.session;
+                break;
+            case LAYOUT_OV_LABEL_A:
+                if (hud_ov.has_label_a) ov_store[n_ov++] = hud_ov.label_a;
+                break;
+            case LAYOUT_OV_LABEL_B:
+                if (hud_ov.has_label_b) ov_store[n_ov++] = hud_ov.label_b;
+                break;
+            }
         }
 
-        target.overlays     = ov_arr;
-        target.num_overlays = n;
+        target.overlays     = n_ov ? ov_store : NULL;
+        target.num_overlays = n_ov;
+
         if (!pl_render_image(r->renderer, &image, &target, &rp))
-            LOG("REND", "pl_render_image (composite) failed");
-        break;
-    }
+            LOG("REND", "pl_render_image (%s pass %d) failed", plan.name, pi);
     }
 
-    /* Short form so the HUD doesn't crop. In HDR mode we override the
-     * swapchain target's peak directly; in SDR / SPLIT modes the actual
-     * peak control happens in the intermediate render, so we log the
-     * effective sdr_peak alongside the panel/swapchain peak for clarity. */
-    if (r->mode == HDRPLAY_MODE_HDR) {
-        snprintf(r->last_output_csp, sizeof(r->last_output_csp),
-                 "out: HDR peak=%.0fn", target.color.hdr.max_luma);
-    } else if (r->mode == HDRPLAY_MODE_SDR) {
-        snprintf(r->last_output_csp, sizeof(r->last_output_csp),
-                 "out: SDR peak=%.0fn", r->sdr_peak_effective);
-    } else {
-        snprintf(r->last_output_csp, sizeof(r->last_output_csp),
-                 "out: %s HDR=%.0fn SDR=%.0fn", mode_name,
-                 203.0f * r->display_hdr_headroom, r->sdr_peak_effective);
-    }
+    for (int i = 0; i < n; i++)
+        if (r->slot[i].mapped)
+            pl_unmap_avframe(r->vulkan->gpu, &r->slot[i].image);
 
-    pl_unmap_avframe(r->vulkan->gpu, &image);
-    if (!pl_swapchain_submit_frame(r->swapchain))
+    snprintf(r->last_output_csp, sizeof(r->last_output_csp),
+             "out: %s peak=%.0fn passes=%d",
+             plan.name, r->mode == HDRPLAY_MODE_HDR
+                        ? 203.0f * r->display_hdr_headroom : sdr_peak,
+             r->last_num_passes);
+
+    if (!pl_swapchain_submit_frame(r->swapchain)) {
         LOG("SWAP", "submit_frame failed");
-
+        return false;
+    }
     pl_swapchain_swap_buffers(r->swapchain);
-
-    LOGV("REND", "frame: passes=%d mode=%s tonemap=\"%s\" target=%s",
-         r->last_num_passes, mode_name, r->last_tonemap, r->last_output_csp);
     return true;
 }
 
 void renderer_close(Renderer *r)
 {
     if (r->vulkan) {
-        for (int i = 0; i < 4; i++)
-            if (r->plane_tex[i]) pl_tex_destroy(r->vulkan->gpu, &r->plane_tex[i]);
-        if (r->diag_tex) pl_tex_destroy(r->vulkan->gpu, &r->diag_tex);
+        /* Per-slot: plane uploads and the compositing intermediate. */
+        for (int s = 0; s < 2; s++) {
+            for (int i = 0; i < 4; i++)
+                if (r->slot[s].plane_tex[i])
+                    pl_tex_destroy(r->vulkan->gpu, &r->slot[s].plane_tex[i]);
+            if (r->slot[s].inter_tex)
+                pl_tex_destroy(r->vulkan->gpu, &r->slot[s].inter_tex);
+        }
         hud_close(r->vulkan->gpu);
     }
     if (r->renderer)     pl_renderer_destroy(&r->renderer);

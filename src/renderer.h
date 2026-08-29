@@ -7,8 +7,10 @@
 #include <libplacebo/vulkan.h>
 #include <libplacebo/gamut_mapping.h>
 #include "probe.h"
+#include "layout.h"
 
 struct SDL_Window;
+struct Source;
 
 typedef struct Renderer {
     struct SDL_Window *window;
@@ -20,57 +22,56 @@ typedef struct Renderer {
     pl_renderer         renderer;       /* HDR path / main render        */
     pl_renderer         renderer_sdr;   /* SDR-to-intermediate path      */
 
-    /* Persistent plane textures, recycled across frames. libplacebo
-     * (re)creates them on first use; we just have to keep the array
-     * alive so pl_unmap_avframe doesn't have to destroy them. */
-    pl_tex              plane_tex[4];
+    /* Per-source GPU state. Two sources means two sets of upload
+     * textures and two intermediates: sharing one intermediate across
+     * passes would be a hazard, since both are queued before either
+     * executes.
+     *
+     * Kept here rather than on Source so source.h stays free of
+     * libplacebo — Source is decode state, this is GPU state. */
+    struct {
+        /* Persistent plane textures, recycled across frames. libplacebo
+         * (re)creates them on first use; we just keep the array alive
+         * so pl_unmap_avframe doesn't have to destroy them. */
+        pl_tex plane_tex[4];
 
-    /* SDR-overlay intermediate. We render the SDR pass into this RGBA
-     * texture (with blend_params that preserve dst.alpha). The alpha
-     * channel is pre-filled with a mode-specific mask: FULL (everywhere
-     * opaque = full SDR), LR / TB (hard edge halves), or DIAG (smooth
-     * antialiased diagonal). The texture then composites over the HDR
-     * pass via pl_overlay — and crucially, overlay composition bypasses
-     * libplacebo's tone-mapping pipeline, so absolute PQ-encoded SDR
-     * brightness (≈ 203 nits) actually lands at 203 nits on the panel
-     * instead of being renormalized to swap-chain peak. */
-    pl_tex              diag_tex;
-    int                 diag_tex_w, diag_tex_h;
-    int                 diag_tex_mask_mode;  /* see enum AlphaMaskMode below */
+        /* Overlay intermediate. The pass renders into this RGBA texture
+         * (with blend_params that preserve dst.alpha). The alpha channel
+         * is pre-filled with a mask: FULL (opaque everywhere), LR / TB
+         * (hard edge halves), or DIAG (smooth antialiased diagonal). It
+         * then composites via pl_overlay — and crucially, overlay
+         * composition bypasses libplacebo's tone-mapping pipeline, so
+         * absolute PQ-encoded SDR brightness (~203 nits) actually lands
+         * at 203 nits on the panel instead of being renormalized to
+         * swapchain peak. */
+        pl_tex inter_tex;
+        int    inter_w, inter_h, inter_mask;
+        bool   mapped;
+        struct pl_frame image;
+    } slot[2];
 
     /* State surfaced to main loop and HUD. */
     bool   display_hdr_capable;     /* SDL says display is in HDR mode */
     float  display_sdr_white;       /* current SDR white level, nits   */
     float  display_hdr_headroom;    /* current EDR headroom, ratio     */
 
-    /* Output mode — toggled at runtime via `S`/`P` keys. */
-    enum {
-        HDRPLAY_MODE_HDR     = 0,   /* full BT.2020 + PQ, panel peak   */
-        HDRPLAY_MODE_SDR     = 1,   /* BT.709 + bt1886, 100-nit ceil   */
-        HDRPLAY_MODE_SPLIT   = 2,   /* HDR + SDR side-by-side          */
-    } mode;
+    /* Output mode and split orientation. Defined in layout.h, which
+     * owns every decision that depends on them. */
+    HdrplayMode        mode;
+    HdrplaySplitOrient split_orient;
 
-    /* Orientation of the SPLIT view's divider — toggled via `O` key. */
-    enum {
-        HDRPLAY_SPLIT_LR     = 0,   /* vertical divider: HDR=left, SDR=right */
-        HDRPLAY_SPLIT_TB     = 1,   /* horizontal divider: HDR=top, SDR=bottom */
-        HDRPLAY_SPLIT_DIAG   = 2,   /* diagonal: HDR=upper-left triangle, SDR=lower-right */
-    } split_orient;
+    /* Two-file comparison state. n_sources == 1 keeps every code path
+     * identical to single-file playback; the rest is inert. */
+    int    n_sources;
+    int    solo;            /* -1 = compare both, else source index    */
+    bool   swapped;         /* B on the left                           */
+    float  zoom;            /* <= 0 = fit, 1.0 = 1:1 source pixels     */
+    float  pan_x, pan_y;    /* normalized centre of the visible region */
 
     /* Playback state surfaced to HUD. Main loop owns these flags and
      * pokes them in so the on-screen overlay reflects current state. */
     bool   paused;
     bool   loop_enabled;
-
-    /* Alpha-mask shape pre-filled into diag_tex.alpha. Selected per
-     * frame based on r->mode + r->split_orient. */
-    enum AlphaMaskMode {
-        ALPHA_MASK_NONE  = 0,  /* unused / not yet computed */
-        ALPHA_MASK_FULL  = 1,  /* opaque everywhere (full SDR mode) */
-        ALPHA_MASK_LR    = 2,  /* alpha 0 on left, 1 on right */
-        ALPHA_MASK_TB    = 3,  /* alpha 0 on top, 1 on bottom */
-        ALPHA_MASK_DIAG  = 4,  /* smoothstep diagonal */
-    };
 
     /* SDR-mode tone-map ceiling, in nits. <= 0 means "track the OS
      * current SDR-white reference" (so SDR mode matches the perceptual
@@ -147,13 +148,32 @@ typedef struct Renderer {
      * has HDR-worthy content (highlights above the SDR ceiling). */
     FrameStats frame_stats;
     bool       frame_stats_valid;
+
+    /* Session-wide accumulation of the above. Owned by main.c (it knows
+     * the stream timebase and duration); the renderer only reads it for
+     * the HUD and feeds each frame in. NULL when unavailable. */
+    struct SessionStats *session;
+    bool   session_panel;       /* 'A' toggles the accumulated panel   */
+
+    /* HDR10 static metadata the container DECLARES, copied from the
+     * decoder so the HUD can print measured-vs-declared side by side.
+     * cll_max is MaxCLL, cll_avg is MaxFALL. */
+    bool   has_declared_cll;
+    int    declared_cll_max, declared_cll_avg;
 } Renderer;
 
 /* display_index: 0-based index into the list SDL exposes, or -1 to use
  * the OS default. List can be inspected before init via renderer_list_displays. */
 bool renderer_init(Renderer *r, int width, int height, const char *title, int display_index);
 void renderer_list_displays(void);
-bool renderer_render_avframe(Renderer *r, struct AVFrame *frame);
+/* Render the current state of every source into one window frame.
+ * `n` is 1 or 2; with 1 this reduces to exactly the previous
+ * single-file path (see tests/test_layout.c, which pins that). */
+bool renderer_render(Renderer *r, struct Source *sources, int n);
+
+/* Which source the HUD, probe, statistics and frame stepping describe:
+ * the left/top pane in a comparison, or the soloed file. */
+int  renderer_focus_source(const Renderer *r);
 void renderer_update_display_state(Renderer *r);
 void renderer_close(Renderer *r);
 

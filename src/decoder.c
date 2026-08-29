@@ -91,6 +91,39 @@ static void extract_hdr10_sidedata(Decoder *d, const AVStream *st)
     }
 }
 
+/* Per-frame upgrade of the HDR10 static metadata.
+ *
+ * The comment above promises this, but nothing used to do it: some
+ * encoders (x265 among them) stamp MaxCLL/MaxFALL on each AVFrame
+ * rather than on the stream, so files carrying it that way looked like
+ * they declared nothing at all. Call after every successful decode so
+ * playback and --analyze agree on what the container claims. */
+void decoder_absorb_frame_side_data(Decoder *d)
+{
+    if (!d || !d->frame) return;
+
+    const AVFrameSideData *sd = av_frame_get_side_data(d->frame,
+        AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (sd && sd->size >= sizeof(AVContentLightMetadata)) {
+        const AVContentLightMetadata *c =
+            (const AVContentLightMetadata *)sd->data;
+        if (c->MaxCLL  > 0) { d->cll_max = c->MaxCLL;  d->has_cll = true; }
+        if (c->MaxFALL > 0) { d->cll_avg = c->MaxFALL; d->has_cll = true; }
+    }
+
+    sd = av_frame_get_side_data(d->frame,
+        AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
+        const AVMasteringDisplayMetadata *m =
+            (const AVMasteringDisplayMetadata *)sd->data;
+        if (m->has_luminance && m->max_luminance.den) {
+            d->has_mastering_display = true;
+            d->mdcv_min_luma = av_q2d(m->min_luminance);
+            d->mdcv_max_luma = av_q2d(m->max_luminance);
+        }
+    }
+}
+
 bool decoder_open(Decoder *d, const char *path)
 {
     memset(d, 0, sizeof(*d));

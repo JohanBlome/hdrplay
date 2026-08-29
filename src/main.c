@@ -18,7 +18,12 @@
 #include "decoder.h"
 #include "renderer.h"
 #include "diagnose.h"
+#include "analyze.h"
 #include "brightness.h"
+#include "probe.h"
+#include "stats.h"
+#include "source.h"
+#include "checks.h"
 #include "log.h"
 
 #include <stdio.h>
@@ -45,9 +50,67 @@ static double now_seconds(void)
 
 int g_verbose = 0;
 
+/* Persistent settings live in one place: $XDG_CONFIG_HOME/hdrplay/config,
+ * falling back to ~/.config/hdrplay/config. Not a dotfile in $HOME, not
+ * next to the binary, not CWD-relative. Format is `key = value`, one per
+ * line; blank lines and `#` comments ignored; whitespace around key and
+ * value trimmed.
+ *
+ * Only one key is recognized today (vulkan_icd) — this is deliberately
+ * the seam for playback settings when we grow them.
+ *
+ * Returns 1 and fills `out` if the key is present and non-empty. */
+static int config_get(const char *key, char *out, size_t n)
+{
+    char path[PATH_MAX];
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        snprintf(path, sizeof(path), "%s/hdrplay/config", xdg);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return 0;
+        snprintf(path, sizeof(path), "%s/.config/hdrplay/config", home);
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    int found = 0;
+    char line[PATH_MAX + 128];
+    while (!found && fgets(line, sizeof(line), f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+
+        /* Trim both halves in place. */
+        char *k = line, *v = eq + 1;
+        while (*k == ' ' || *k == '\t') k++;
+        for (char *e = k + strlen(k); e > k && strchr(" \t\r\n", e[-1]); )
+            *--e = '\0';
+        while (*v == ' ' || *v == '\t') v++;
+        for (char *e = v + strlen(v); e > v && strchr(" \t\r\n", e[-1]); )
+            *--e = '\0';
+
+        if (strcmp(k, key) != 0 || *v == '\0') continue;
+
+        /* Allow a leading ~ so the file can stay portable. */
+        const char *home = getenv("HOME");
+        if (v[0] == '~' && v[1] == '/' && home)
+            snprintf(out, n, "%s%s", home, v + 1);
+        else
+            snprintf(out, n, "%s", v);
+        found = 1;
+    }
+    fclose(f);
+    return found;
+}
+
 /* macOS has no built-in Vulkan driver; we need MoltenVK and an ICD
- * manifest pointing the loader at it. If the user already exported
- * VK_ICD_FILENAMES we respect it; otherwise probe a few well-known
+ * manifest pointing the loader at it. If the user already pointed the
+ * loader at a driver we respect that; otherwise probe a few well-known
  * spots — including the bundled copy we shipped in third_party/.
  *
  * Bundled-copy candidates are resolved relative to the executable's
@@ -56,13 +119,38 @@ int g_verbose = 0;
  * user ran hdrplay from anywhere outside hdrplay/ or hdrplay/build/
  * — SDL would then fall back to whatever Vulkan loader macOS finds
  * by default, which typically doesn't expose VK_KHR_surface, and
- * window creation would fail with a cryptic extension error. */
+ * window creation would fail with a cryptic extension error.
+ *
+ * Exe-relative isn't enough either: copying the binary to ~/bin
+ * without third_party/ reproduces exactly that failure. So we also
+ * carry HDRPLAY_SOURCE_ICD, the absolute path to this build's source
+ * tree, baked in by CMake. A binary built from this checkout works
+ * wherever you put it, as long as the checkout is still there.
+ *
+ * Precedence, highest first: VK_DRIVER_FILES / VK_ICD_FILENAMES (a
+ * one-off override), then `vulkan_icd` in ~/.config/hdrplay/config (a
+ * durable one), then the probe list. */
 static void ensure_moltenvk_icd(void)
 {
 #ifdef __APPLE__
-    if (getenv("VK_ICD_FILENAMES")) {
-        LOG("GPU", "VK_ICD_FILENAMES already set: %s", getenv("VK_ICD_FILENAMES"));
+    /* VK_DRIVER_FILES is the loader's current name for this;
+     * VK_ICD_FILENAMES is the deprecated alias it still honors. Either
+     * one being set means the user has an opinion — don't override. */
+    const char *preset = getenv("VK_DRIVER_FILES");
+    if (!preset) preset = getenv("VK_ICD_FILENAMES");
+    if (preset) {
+        LOG("GPU", "Vulkan driver files already set: %s", preset);
         return;
+    }
+
+    /* A durable override, for people who keep MoltenVK somewhere of
+     * their own choosing and don't want to export env vars forever. */
+    char c_config[PATH_MAX] = {0};
+    if (config_get("vulkan_icd", c_config, sizeof(c_config)) &&
+        access(c_config, R_OK) != 0)
+    {
+        LOG("GPU", "WARNING: config vulkan_icd is unreadable: %s", c_config);
+        c_config[0] = '\0';
     }
 
     /* Resolve exe dir for bundled-MoltenVK lookups. */
@@ -88,10 +176,22 @@ static void ensure_moltenvk_icd(void)
     snprintf(c_sibling, sizeof(c_sibling),
              "%s/MoltenVK_icd.json", exe_dir);
 
+    /* LunarG SDK, if the user sourced setup-env.sh. */
+    char c_sdk[PATH_MAX] = {0};
+    const char *sdk = getenv("VULKAN_SDK");
+    if (sdk)
+        snprintf(c_sdk, sizeof(c_sdk),
+                 "%s/share/vulkan/icd.d/MoltenVK_icd.json", sdk);
+
     const char *candidates[] = {
+        c_config,   /* vulkan_icd in ~/.config/hdrplay/config */
+        c_sibling,  /* manifest shipped alongside the binary (cmake --install) */
         c_build,    /* exe at hdrplay/build/hdrplay, ICD at hdrplay/third_party/... */
         c_repo,     /* exe + third_party as siblings (alternate layouts) */
-        c_sibling,  /* manifest shipped alongside the binary */
+#ifdef HDRPLAY_SOURCE_ICD
+        HDRPLAY_SOURCE_ICD,  /* this build's source tree, baked in at compile time */
+#endif
+        c_sdk,      /* empty string if VULKAN_SDK unset; access() just fails */
         /* Homebrew install: `brew install molten-vk` lays the ICD
          * down at <prefix>/share/vulkan/icd.d. /opt/homebrew is
          * Apple Silicon; /usr/local is Intel. The keg-rooted path
@@ -104,16 +204,22 @@ static void ensure_moltenvk_icd(void)
         NULL,
     };
     for (int i = 0; candidates[i]; i++) {
-        if (access(candidates[i], R_OK) == 0) {
-            setenv("VK_ICD_FILENAMES", candidates[i], 0);
-            LOG("GPU", "MoltenVK ICD found: %s", candidates[i]);
-            return;
-        }
+        if (candidates[i][0] == '\0') continue;
+        if (access(candidates[i], R_OK) != 0) continue;
+        /* Set both spellings: older loaders only read VK_ICD_FILENAMES,
+         * newer ones prefer VK_DRIVER_FILES and warn on the alias. */
+        setenv("VK_DRIVER_FILES",   candidates[i], 0);
+        setenv("VK_ICD_FILENAMES",  candidates[i], 0);
+        LOG("GPU", "MoltenVK ICD found: %s", candidates[i]);
+        return;
     }
+
     LOG("GPU", "WARNING: no MoltenVK_icd.json found; Vulkan init will fail.");
-    LOG("GPU", "         Download MoltenVK-macos.tar from KhronosGroup/MoltenVK");
-    LOG("GPU", "         releases and extract to ./third_party/, or set");
-    LOG("GPU", "         VK_ICD_FILENAMES manually.");
+    for (int i = 0; candidates[i]; i++)
+        if (candidates[i][0]) LOG("GPU", "         tried: %s", candidates[i]);
+    LOG("GPU", "         Fix: extract MoltenVK-macos.tar (KhronosGroup/MoltenVK");
+    LOG("GPU", "         releases) into <repo>/third_party/, then reinstall with");
+    LOG("GPU", "         `cmake --install build --prefix ~`. Or set VK_DRIVER_FILES.");
 #endif
 }
 
@@ -121,9 +227,11 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: hdrplay [opts] <input>\n"
+        "       hdrplay [opts] <input-a> <input-b>   # compare\n"
         "       hdrplay --diagnose [-d INDEX]\n"
         "       hdrplay --set-brightness FLOAT [-d INDEX]\n"
         "       hdrplay --list-displays\n"
+        "       hdrplay --analyze [--stride N] [--json] <input>\n"
         "\n"
         "playback options:\n"
         "  -v                    verbose per-frame logging\n"
@@ -174,7 +282,16 @@ static void usage(void)
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
         "                        M=toggle luminance probe (mouse → nits)\n"
         "                        I=show/hide top-left status HUD\n"
+        "                        A=show/hide accumulated stats panel\n"
+        "                        shift-A=reset accumulated stats\n"
         "                        ←/→=seek -10s/+10s\n"
+        "                        . / , =step one frame fwd/back\n"
+        "                          (pauses; uses the frame ring,\n"
+        "                           falls back to seek beyond it)\n"
+        "                        Z=toggle 1:1 zoom   +/-=zoom steps\n"
+        "                        drag or shift-arrows=pan\n"
+        "                        two files: 0=compare  1/2=solo\n"
+        "                                   X=swap sides\n"
         "\n"
         "control / inspection:\n"
         "  --list-displays       enumerate displays + HDR status, then exit\n"
@@ -183,7 +300,48 @@ static void usage(void)
         "  --set-brightness F    set brightness 0.0-1.0 on the chosen\n"
         "                        display (built-in: IOKit / `brightness`;\n"
         "                        external DDC/CI: m1ddc). XDR is not\n"
-        "                        settable programmatically.\n");
+        "                        settable programmatically.\n"
+        "\n"
+        "content analysis:\n"
+        "  --analyze <input>     scan every frame headlessly (no window,\n"
+        "                        no GPU) and report content checks.\n"
+        "                        Exit code = # FAILs, so a batch loop\n"
+        "                        works directly:\n"
+        "                          for f in *.mov; do \\\n"
+        "                            hdrplay --analyze \"$f\" || echo \"$f suspect\"\n"
+        "                          done\n"
+        "                        Exit codes >= 64 are tool errors\n"
+        "                        (unreadable file / format), not verdicts.\n"
+        "  --stride N            sample every Nth pixel in both axes.\n"
+        "                        Default 1 = exact. Only 1 makes the\n"
+        "                        MaxCLL comparison a true maximum.\n"
+        "  --hlg-peak NITS       nominal display peak assumed when\n"
+        "                        converting HLG scene light to display\n"
+        "                        light. Default: the file's mastering\n"
+        "                        display max, else 1000 (BT.2100 ref).\n"
+        "                        HLG carries no absolute luminance, so\n"
+        "                        every HLG nit figure rests on this.\n"
+        "  --json                machine-readable summary on stdout\n"
+        "                        (checks stay on stderr, so | jq works)\n"
+        "  --stats-file PATH     NDJSON per-frame series + session\n"
+        "                        histograms, for plotting in vca.py\n"
+        "\n"
+        "comparing two files:\n"
+        "  hdrplay a.mov b.mov   play both synchronized, side by\n"
+        "                        side in one window. A PTS master\n"
+        "                        clock keeps them on the same\n"
+        "                        INSTANT, so files at different\n"
+        "                        frame rates line up by time rather\n"
+        "                        than by frame index.\n"
+        "                        The split becomes the LAYOUT, so\n"
+        "                        H/S apply to both panes; press\n"
+        "                        1 or 2 to solo a file and get the\n"
+        "                        HDR-vs-SDR split back.\n"
+        "  --step-buffer N       frames retained per file for\n"
+        "                        instant step-back. Default 8.\n"
+        "                        ~25MB/frame at 4K 10-bit, ~6MB at\n"
+        "                        1080p. 0 disables it and always\n"
+        "                        seeks (slower, no memory cost).\n");
 }
 
 int main(int argc, char **argv)
@@ -196,22 +354,40 @@ int main(int argc, char **argv)
     int  display_index = -1;
     int  start_mode = HDRPLAY_MODE_HDR;
     int  start_orient = HDRPLAY_SPLIT_LR;
+    bool split_explicit = false;   /* user picked an orientation */
     bool loop_at_eof = false;
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
     float sdr_saturation    = 1.0f;   /* 1.0 = libplacebo native; >1 shifts saturated reds toward orange */
     const struct pl_gamut_map_function *sdr_gamut_map = &pl_gamut_map_perceptual;
     float sdr_dr_stops_cap = 12.0f;   /* matches 0.1-nit BT.1886 black at 500-nit modern SDR peak */
-    const char *path = NULL;
+    bool  analyze_only = false;
+    bool  analyze_json = false;
+    int   analyze_stride = 1;         /* exact by default; offline, so affordable */
+    double hlg_peak = 0.0;            /* 0 = take mastering display, else 1000 */
+    const char *stats_path = NULL;
+    const char *paths[2] = { NULL, NULL };
+    int   n_paths = 0;
+    int   step_buffer = 8;   /* frames retained for step-back */
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-v")) g_verbose = 1;
         else if (!strcmp(argv[i], "-f")) fullscreen = true;
         else if (!strcmp(argv[i], "--list-displays")) list_displays_only = true;
         else if (!strcmp(argv[i], "--diagnose")) diagnose_only = true;
+        else if (!strcmp(argv[i], "--analyze"))  analyze_only = true;
+        else if (!strcmp(argv[i], "--json"))     analyze_json = true;
+        else if (!strcmp(argv[i], "--stride") && i+1 < argc)
+            analyze_stride = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--hlg-peak") && i+1 < argc)
+            hlg_peak = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--stats-file") && i+1 < argc)
+            stats_path = argv[++i];
+        else if (!strcmp(argv[i], "--step-buffer") && i+1 < argc)
+            step_buffer = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--start-sdr")) start_mode = HDRPLAY_MODE_SDR;
         else if (!strcmp(argv[i], "--split"))     start_mode = HDRPLAY_MODE_SPLIT;
-        else if (!strcmp(argv[i], "--split-tb"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_TB; }
-        else if (!strcmp(argv[i], "--split-lr"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_LR; }
-        else if (!strcmp(argv[i], "--split-diag")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_DIAG; }
+        else if (!strcmp(argv[i], "--split-tb"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_TB; split_explicit = true; }
+        else if (!strcmp(argv[i], "--split-lr"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_LR; split_explicit = true; }
+        else if (!strcmp(argv[i], "--split-diag")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_DIAG; split_explicit = true; }
         else if (!strcmp(argv[i], "--loop"))     loop_at_eof = true;
         else if (!strcmp(argv[i], "--sdr-peak") && i+1 < argc)
             sdr_peak_override = (float)atof(argv[++i]);
@@ -232,9 +408,15 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "-d") && i+1 < argc) display_index = atoi(argv[++i]);
         else if (argv[i][0] == '-')      { usage(); return 2; }
-        else if (!path)                  path = argv[i];
-        else                             { usage(); return 2; }
+        else if (n_paths < 2)            paths[n_paths++] = argv[i];
+        else {
+            /* Two panes, so a third file has nowhere to go. */
+            fprintf(stderr, "at most two inputs (the split is the layout)\n");
+            return 2;
+        }
     }
+
+    if (hlg_peak > 0.0) probe_set_hlg_peak_override(hlg_peak);
 
     ensure_moltenvk_icd();
     /* Silence MoltenVK's 150-line extension dump unless user asks for it.
@@ -254,19 +436,45 @@ int main(int argc, char **argv)
     if (diagnose_only) {
         return diagnose_run(display_index);
     }
-    if (!path) { usage(); return 2; }
+    /* Must return before the display enumeration below, which pulls in
+     * SDL_Init(SDL_INIT_VIDEO). --analyze is a pure decode loop and has
+     * to stay usable headless and over SSH. */
+    if (analyze_only) {
+        if (!n_paths) { usage(); return 2; }
+        if (analyze_stride < 1) analyze_stride = 1;
+        /* Each file in turn; the exit code is the summed FAIL
+         * count so the batch loop keeps working. */
+        int rc = 0;
+        for (int i = 0; i < n_paths; i++) {
+            int one = analyze_run(paths[i], analyze_stride, hlg_peak,
+                                  analyze_json, i == 0 ? stats_path : NULL);
+            if (one >= HDRPLAY_EXIT_TOOL_ERROR) return one;
+            rc += one;
+        }
+        return rc;
+    }
+    if (!n_paths) { usage(); return 2; }
 
     /* Always log displays at startup — picking the right one is a
      * common first source of "why isn't this HDR?" confusion. */
     fprintf(stderr, "[GPU] displays:\n");
     renderer_list_displays();
-
-    Decoder dec;
-    if (!decoder_open(&dec, path)) return 1;
+    /* Open every input. Two is the ceiling: the split is the layout, so
+     * a third pane has nowhere to go. */
+    Source sources[2];
+    int n_sources = 0;
+    for (int i = 0; i < n_paths && i < 2; i++) {
+        if (!source_open(&sources[n_sources], paths[i], step_buffer)) {
+            for (int j = 0; j < n_sources; j++) source_close(&sources[j]);
+            return 1;
+        }
+        n_sources++;
+    }
 
     Renderer rend;
-    if (!renderer_init(&rend, dec.width, dec.height, "hdrplay", display_index)) {
-        decoder_close(&dec);
+    if (!renderer_init(&rend, sources[0].dec.width, sources[0].dec.height,
+                       "hdrplay", display_index)) {
+        for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
         return 1;
     }
 
@@ -280,70 +488,102 @@ int main(int argc, char **argv)
     rend.sdr_saturation    = sdr_saturation;
     rend.sdr_gamut_map     = sdr_gamut_map;
     rend.sdr_dr_stops_cap  = sdr_dr_stops_cap;
+    rend.n_sources         = n_sources;
+    rend.solo              = -1;
+    rend.swapped           = false;
+    rend.zoom              = 0.0f;      /* fit */
+    rend.pan_x = rend.pan_y = 0.5f;
+    rend.current_frame_no  = -1;
+
+    /* Two files means the split is spent on CONTENT, so H/S apply to
+     * both panes and the mode starts as a plain HDR comparison rather
+     * than an HDR-vs-SDR one. Solo (1/2) gets the old behaviour back. */
+    if (n_sources > 1 && start_mode == HDRPLAY_MODE_HDR)
+        rend.mode = HDRPLAY_MODE_HDR;
+    if (n_sources > 1) {
+        /* Portrait content in a left/right split gives each pane half the
+         * width and all the height, so both are letterboxed into slivers.
+         * Top/bottom keeps the aspect usable. Only a DEFAULT — O still
+         * cycles, and an explicit --split-lr is respected. */
+        if (!split_explicit && sources[0].dec.height > sources[0].dec.width) {
+            rend.split_orient = HDRPLAY_SPLIT_TB;
+            LOG("REND", "portrait source — defaulting to top/bottom split");
+        }
+        LOG("REND", "comparing %s | %s", sources[0].label, sources[1].label);
+    }
+
     const char *orient_name =
         start_orient == HDRPLAY_SPLIT_TB   ? " (top/bottom)" :
         start_orient == HDRPLAY_SPLIT_DIAG ? " (diagonal)"   :
                                              " (left/right)";
     LOG("REND", "starting in mode: %s%s",
-        start_mode == HDRPLAY_MODE_HDR   ? "HDR" :
-        start_mode == HDRPLAY_MODE_SDR   ? "SDR" : "SPLIT",
-        start_mode == HDRPLAY_MODE_SPLIT ? orient_name : "");
+        rend.mode == HDRPLAY_MODE_HDR   ? "HDR" :
+        rend.mode == HDRPLAY_MODE_SDR   ? "SDR" : "SPLIT",
+        rend.mode == HDRPLAY_MODE_SPLIT ? orient_name : "");
 
-    /* Main loop: blocking decode/render. No audio, no A/V sync, but we
-     * DO pace presentation against the file's PTS so playback runs at
-     * native speed instead of as-fast-as-the-GPU-can-go.
+    /* ----------------------------------------------------------------
+     * Main loop.
      *
-     * Pacing baseline: on the first frame after start / seek / resume,
-     * we record (wall_clock_now, frame_pts) as a baseline. For every
-     * subsequent frame we compute target_wall = baseline_wall +
-     * (frame_pts - baseline_pts) * stream_time_base, then sleep until
-     * target_wall before submitting. If we're already late (decoder or
-     * GPU couldn't keep up — common for 4K HDR on integrated GPUs), we
-     * skip the sleep and log a [DEC] behind=Nms line so it's visible.
+     * A single master clock in seconds drives everything. Each source
+     * independently advances to the frame in effect at that instant —
+     * the last one whose PTS is <= the clock. Two files at different
+     * frame rates therefore land on different frame INDICES at the same
+     * moment, which is the correct reading of "synchronized" and the
+     * reason this is not frame-index lockstep.
      *
-     * Pause keeps rendering the last decoded frame so HDR/SDR/split
-     * toggles remain interactive even while frozen. Resume re-baselines
-     * the clock so the pause itself doesn't show up as "behind". */
+     * Playback advances the clock from wall time, pacing against the
+     * file's own timestamps so it runs at native speed rather than as
+     * fast as the GPU can go. Pause holds the clock still but keeps
+     * rendering, so HDR/SDR/split toggles stay interactive while
+     * frozen. Resume re-baselines so the pause does not register as
+     * "behind".
+     * ---------------------------------------------------------------- */
     bool quit   = false;
     bool paused = false;
-    bool have_frame = false;
-    AVRational stream_tb = dec.fmt->streams[dec.stream_idx]->time_base;
-    AVRational stream_fr = dec.fmt->streams[dec.stream_idx]->avg_frame_rate;
-    double  stream_fps   = (stream_fr.den > 0) ? av_q2d(stream_fr) : 0.0;
-    double  base_wall   = 0.0;
-    int64_t base_pts    = AV_NOPTS_VALUE;   /* AV_NOPTS_VALUE = rebase next frame */
-    rend.current_frame_no = -1;
+
+    double clock_sec  = 0.0;
+    double base_wall  = 0.0;
+    double base_clock = 0.0;
+    bool   rebase     = true;
+    /* Redraw only when something changed. Set by any input event and by
+     * a source advancing; see the render call at the bottom of the
+     * loop for why an unconditional redraw is expensive here. */
+    bool   dirty      = true;
+
+    /* Reference source for stepping and for the frame counter: the pane
+     * you are looking at. */
+    #define REF (renderer_focus_source(&rend))
+
     while (!quit) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            /* Any event may change what should be on screen — resize,
+             * moving between displays, focus. Cheaper to redraw than to
+             * enumerate which ones matter. */
+            dirty = true;
             if (e.type == SDL_EVENT_QUIT) quit = true;
+
             if (e.type == SDL_EVENT_KEY_DOWN) {
+                bool shift = (e.key.mod & SDL_KMOD_SHIFT) != 0;
+
                 if (e.key.key == SDLK_ESCAPE || e.key.key == SDLK_Q) quit = true;
                 if (e.key.key == SDLK_F) {
-                    bool now_fs = SDL_GetWindowFlags(rend.window) & SDL_WINDOW_FULLSCREEN;
-                    SDL_SetWindowFullscreen(rend.window, !now_fs);
+                    bool fs = (SDL_GetWindowFlags(rend.window) & SDL_WINDOW_FULLSCREEN) != 0;
+                    SDL_SetWindowFullscreen(rend.window, !fs);
                 }
                 if (e.key.key == SDLK_H) { rend.mode = HDRPLAY_MODE_HDR;   LOG("REND", "mode -> HDR"); }
                 if (e.key.key == SDLK_S) { rend.mode = HDRPLAY_MODE_SDR;   LOG("REND", "mode -> SDR"); }
                 if (e.key.key == SDLK_P) { rend.mode = HDRPLAY_MODE_SPLIT; LOG("REND", "mode -> SPLIT"); }
                 if (e.key.key == SDLK_O) {
-                    /* Cycle LR → TB → DIAG → LR. */
-                    rend.split_orient =
-                        rend.split_orient == HDRPLAY_SPLIT_LR  ? HDRPLAY_SPLIT_TB :
-                        rend.split_orient == HDRPLAY_SPLIT_TB  ? HDRPLAY_SPLIT_DIAG :
-                                                                 HDRPLAY_SPLIT_LR;
-                    const char *name =
-                        rend.split_orient == HDRPLAY_SPLIT_TB   ? "top/bottom" :
-                        rend.split_orient == HDRPLAY_SPLIT_DIAG ? "diagonal" :
-                                                                  "left/right";
-                    LOG("REND", "split orientation -> %s", name);
+                    rend.split_orient = (rend.split_orient + 1) % 3;
+                    LOG("REND", "split orientation -> %s",
+                        rend.split_orient == HDRPLAY_SPLIT_LR   ? "left/right" :
+                        rend.split_orient == HDRPLAY_SPLIT_TB   ? "top/bottom" : "diagonal");
                 }
                 if (e.key.key == SDLK_SPACE) {
                     paused = !paused;
                     rend.paused = paused;
-                    /* Resume → rebase clock so the pause duration
-                     * doesn't register as decoder-behind. */
-                    if (!paused) base_pts = AV_NOPTS_VALUE;
+                    if (!paused) rebase = true;
                     LOG("DEC", "%s", paused ? "paused" : "resumed");
                 }
                 if (e.key.key == SDLK_L) {
@@ -352,26 +592,50 @@ int main(int argc, char **argv)
                     LOG("DEC", "loop %s", loop_at_eof ? "ON" : "OFF");
                 }
                 if (e.key.key == SDLK_R) {
-                    if (decoder_seek_start(&dec)) {
-                        base_pts = AV_NOPTS_VALUE;   /* rebase clock */
-                        LOG("DEC", "restarted from beginning");
+                    for (int i = 0; i < n_sources; i++) {
+                        decoder_seek_start(&sources[i].dec);
+                        source_flush(&sources[i]);
                     }
+                    clock_sec = 0.0;
+                    rebase = true;
+                    LOG("DEC", "restarted from beginning");
                 }
-                /* ±10s seek. Lands on a keyframe at or before the
-                 * target, so the actual next-frame timestamp may be
-                 * slightly earlier than requested — that's fine here.
-                 * Clock is rebased so the seek doesn't register as
-                 * decoder-behind on the very next frame. */
-                if (e.key.key == SDLK_RIGHT || e.key.key == SDLK_LEFT) {
-                    double cur = decoder_frame_seconds(&dec);
-                    if (isnan(cur)) cur = 0.0;
+
+                /* Seek. Arrows keep their existing +/-10s meaning, which
+                 * is why panning below is on shift+arrows and drag. */
+                if (!shift && (e.key.key == SDLK_RIGHT || e.key.key == SDLK_LEFT)) {
                     double delta = (e.key.key == SDLK_RIGHT) ? 10.0 : -10.0;
-                    double target = cur + delta;
-                    if (decoder_seek_to(&dec, target)) {
-                        base_pts = AV_NOPTS_VALUE;
-                        LOG("DEC", "seek %+.0fs (%.2f → %.2f)", delta, cur, target);
+                    double target = clock_sec + delta;
+                    if (target < 0.0) target = 0.0;
+                    for (int i = 0; i < n_sources; i++) {
+                        if (decoder_seek_to(&sources[i].dec, target))
+                            source_flush(&sources[i]);
+                    }
+                    clock_sec = target;
+                    rebase = true;
+                    LOG("DEC", "seek %+.0fs -> %.2f", delta, target);
+                }
+
+                /* Frame stepping. Both step keys pause first: stepping
+                 * while the clock is running would immediately be undone
+                 * by the next advance. */
+                if (e.key.key == SDLK_PERIOD || e.key.key == SDLK_COMMA) {
+                    if (!paused) { paused = true; rend.paused = true; }
+                    bool fwd = (e.key.key == SDLK_PERIOD);
+                    double t = fwd ? source_step_forward(&sources[REF])
+                                   : source_step_back(&sources[REF]);
+                    if (!isnan(t)) {
+                        /* The reference moved; pull everyone else to the
+                         * same instant. */
+                        clock_sec = t;
+                        for (int i = 0; i < n_sources; i++)
+                            if (i != REF) source_advance_to(&sources[i], clock_sec);
+                        rebase = true;
+                    } else {
+                        LOG("DEC", "step %s unavailable", fwd ? "forward" : "back");
                     }
                 }
+
                 if (e.key.key == SDLK_M) {
                     rend.probe_active = !rend.probe_active;
                     LOG("REND", "luminance probe %s", rend.probe_active ? "ON" : "OFF");
@@ -380,92 +644,190 @@ int main(int argc, char **argv)
                     rend.hud_hidden = !rend.hud_hidden;
                     LOG("REND", "status HUD %s", rend.hud_hidden ? "HIDDEN" : "SHOWN");
                 }
-            }
-            /* Continuously update probe coords as the mouse moves. We
-             * also re-snapshot the window size so probe maps correctly
-             * after the user resizes. */
-            if (e.type == SDL_EVENT_MOUSE_MOTION) {
-                int w = 0, h = 0;
-                SDL_GetWindowSize(rend.window, &w, &h);
-                rend.probe_x      = (int)e.motion.x;
-                rend.probe_y      = (int)e.motion.y;
-                rend.probe_win_w  = w;
-                rend.probe_win_h  = h;
-            }
-            if (e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED ||
-                e.type == SDL_EVENT_WINDOW_HDR_STATE_CHANGED) {
-                LOG("HDR", "window moved or HDR state changed — re-querying");
-                renderer_update_display_state(&rend);
-            }
-        }
-
-        if (!paused) {
-            int r = decoder_next_frame(&dec);
-            if (r == 0) {
-                LOG("DEC", "EOF");
-                if (loop_at_eof && decoder_seek_start(&dec)) {
-                    base_pts = AV_NOPTS_VALUE;   /* rebase clock on loop */
-                    continue;
-                }
-                quit = true; break;
-            }
-            if (r < 0)  { LOG("DEC", "decode error, exiting"); break; }
-            have_frame = true;
-
-            /* Pace presentation against the file's PTS so playback runs
-             * at native speed. Frames without PTS (rare) just render
-             * immediately; the FIFO swapchain still caps to refresh
-             * rate as a fallback. */
-            int64_t pts = dec.frame->best_effort_timestamp;
-            if (pts == AV_NOPTS_VALUE) pts = dec.frame->pts;
-            /* Source-video frame number from PTS × fps. Stays correct
-             * across seeks because it's derived from the timestamp,
-             * not a counter. Falls back to incrementing if fps or
-             * PTS isn't available. */
-            if (stream_fps > 0.0 && pts != AV_NOPTS_VALUE) {
-                double sec = (double)pts * av_q2d(stream_tb);
-                rend.current_frame_no = (int)(sec * stream_fps + 0.5);
-            } else {
-                rend.current_frame_no =
-                    (rend.current_frame_no < 0 ? 0 : rend.current_frame_no + 1);
-            }
-            if (pts != AV_NOPTS_VALUE) {
-                double tb = av_q2d(stream_tb);
-                if (base_pts == AV_NOPTS_VALUE) {
-                    base_pts  = pts;
-                    base_wall = now_seconds();
-                } else {
-                    double frame_t   = (double)(pts - base_pts) * tb;
-                    double target    = base_wall + frame_t;
-                    double delay     = target - now_seconds();
-                    if (delay > 0.0) {
-                        /* Sleep up to ~1 second; never longer (guards
-                         * against PTS discontinuities). */
-                        if (delay > 1.0) delay = 1.0;
-                        struct timespec ts = {
-                            .tv_sec  = (time_t)delay,
-                            .tv_nsec = (long)((delay - (double)(time_t)delay) * 1e9),
-                        };
-                        nanosleep(&ts, NULL);
-                    } else if (delay < -0.050) {
-                        /* More than 50ms behind. Don't drop (insight
-                         * tool) but make it visible. */
-                        LOGV("DEC", "behind=%.0fms (pts=%.3fs)",
-                             -delay * 1000.0, frame_t);
+                /* A toggles the accumulated panel, shift-A resets it.
+                 * The modifier test is explicit because SDLK_A matches
+                 * regardless of shift — without it, shift-A would toggle
+                 * AND reset. */
+                if (e.key.key == SDLK_A) {
+                    if (shift) {
+                        for (int i = 0; i < n_sources; i++)
+                            session_stats_reset(&sources[i].session);
+                        LOG("STAT", "session statistics reset");
+                    } else {
+                        rend.session_panel = !rend.session_panel;
+                        LOG("STAT", "session panel %s",
+                            rend.session_panel ? "SHOWN" : "HIDDEN");
                     }
                 }
+
+                /* Comparison controls. Inert with one file open. */
+                if (n_sources > 1) {
+                    if (e.key.key == SDLK_0) {
+                        rend.solo = -1; LOG("REND", "compare A|B");
+                    }
+                    if (e.key.key == SDLK_1) {
+                        rend.solo = 0;  LOG("REND", "solo %s", sources[0].label);
+                    }
+                    if (e.key.key == SDLK_2) {
+                        rend.solo = 1;  LOG("REND", "solo %s", sources[1].label);
+                    }
+                    if (e.key.key == SDLK_X) {
+                        rend.swapped = !rend.swapped;
+                        LOG("REND", "swap -> %s | %s",
+                            sources[rend.swapped ? 1 : 0].label,
+                            sources[rend.swapped ? 0 : 1].label);
+                    }
+                }
+
+                /* Zoom. Fit hides exactly the detail a comparison is
+                 * for, so 1:1 is a first-class control rather than a
+                 * convenience. */
+                if (e.key.key == SDLK_Z) {
+                    rend.zoom = (rend.zoom > 0.0f) ? 0.0f : 1.0f;
+                    LOG("REND", "zoom -> %s", rend.zoom > 0.0f ? "1:1" : "fit");
+                }
+                if (e.key.key == SDLK_EQUALS || e.key.key == SDLK_PLUS) {
+                    rend.zoom = (rend.zoom <= 0.0f) ? 1.0f : rend.zoom * 2.0f;
+                    if (rend.zoom > 8.0f) rend.zoom = 8.0f;
+                    LOG("REND", "zoom -> %.1f:1", rend.zoom);
+                }
+                if (e.key.key == SDLK_MINUS) {
+                    rend.zoom = (rend.zoom <= 1.0f) ? 0.0f : rend.zoom * 0.5f;
+                    LOG("REND", "zoom -> %s", rend.zoom > 0.0f ? "in" : "fit");
+                }
+                /* Keyboard pan, since the arrows are taken by seek. */
+                if (shift && rend.zoom > 0.0f) {
+                    float d = 0.05f;
+                    if (e.key.key == SDLK_LEFT)  rend.pan_x -= d;
+                    if (e.key.key == SDLK_RIGHT) rend.pan_x += d;
+                    if (e.key.key == SDLK_UP)    rend.pan_y -= d;
+                    if (e.key.key == SDLK_DOWN)  rend.pan_y += d;
+                    if (rend.pan_x < 0) rend.pan_x = 0; if (rend.pan_x > 1) rend.pan_x = 1;
+                    if (rend.pan_y < 0) rend.pan_y = 0; if (rend.pan_y > 1) rend.pan_y = 1;
+                }
+            }
+
+            /* Drag pans; bare motion feeds the probe. The two coexist
+             * because one needs a held button and the other does not. */
+            if (e.type == SDL_EVENT_MOUSE_MOTION) {
+                int w = 0, h = 0;
+                SDL_GetWindowSizeInPixels(rend.window, &w, &h);
+                float sx = 1.0f, sy = 1.0f;
+                int lw = 0, lh = 0;
+                SDL_GetWindowSize(rend.window, &lw, &lh);
+                if (lw > 0 && lh > 0) { sx = (float)w / lw; sy = (float)h / lh; }
+
+                if ((e.motion.state & SDL_BUTTON_LMASK) && rend.zoom > 0.0f) {
+                    /* Pan is in normalized source units, so the drag has
+                     * to be divided by how much of the source is on
+                     * screen — otherwise it accelerates with zoom. */
+                    rend.pan_x -= (float)e.motion.xrel / (w > 0 ? w : 1) / rend.zoom;
+                    rend.pan_y -= (float)e.motion.yrel / (h > 0 ? h : 1) / rend.zoom;
+                    if (rend.pan_x < 0) rend.pan_x = 0; if (rend.pan_x > 1) rend.pan_x = 1;
+                    if (rend.pan_y < 0) rend.pan_y = 0; if (rend.pan_y > 1) rend.pan_y = 1;
+                } else {
+                    rend.probe_x = (int)(e.motion.x * sx);
+                    rend.probe_y = (int)(e.motion.y * sy);
+                    rend.probe_win_w = w;
+                    rend.probe_win_h = h;
+                }
             }
         }
+        if (quit) break;
 
-        if (have_frame) {
-            renderer_render_avframe(&rend, dec.frame);
+        if (!paused) {
+            /* Advance the master clock from wall time. */
+            double now = now_seconds();
+
+            if (rebase) {
+                base_wall  = now;
+                base_clock = clock_sec;
+                rebase = false;
+            }
+            clock_sec = base_clock + (now - base_wall);
+
+            bool all_eof = true;
+            for (int i = 0; i < n_sources; i++) {
+                if (source_advance_to(&sources[i], clock_sec)) dirty = true;
+                /* A source that has run out holds its last frame rather
+                 * than going black; only quit when EVERY source is done,
+                 * so a short B does not cut a longer A short. */
+                if (!sources[i].eof) all_eof = false;
+            }
+
+            if (all_eof) {
+                LOG("DEC", "EOF");
+                if (loop_at_eof) {
+                    for (int i = 0; i < n_sources; i++) {
+                        decoder_seek_start(&sources[i].dec);
+                        source_flush(&sources[i]);
+                    }
+                    clock_sec = 0.0;
+                    rebase = true;
+                    continue;
+                }
+                quit = true;
+            }
+
+            /* Pace against the NEXT frame, not the one already shown.
+             *
+             * The shown frame is by construction at or before `now`, so
+             * pacing off it yields a non-positive delay and never
+             * sleeps. The loop then free-runs, re-mapping and
+             * re-uploading every source's frame on every iteration —
+             * with two 1728x2304 sources that saturates memory
+             * bandwidth and the visible frame rate collapses to a few
+             * fps. Sleeping until the next frame is due keeps the loop
+             * at roughly one iteration per source frame. */
+            double next = source_peek_next_sec(&sources[REF]);
+            if (!isnan(next)) {
+                double delay = (base_wall + (next - base_clock)) - now_seconds();
+                if (delay > 0.0 && delay < 1.0) {
+                    struct timespec ts = {
+                        .tv_sec  = (time_t)delay,
+                        .tv_nsec = (long)((delay - (double)(time_t)delay) * 1e9),
+                    };
+                    nanosleep(&ts, NULL);
+                } else if (delay < -0.050) {
+                    LOGV("DEC", "behind=%.0fms (next=%.3fs)", -delay * 1000.0, next);
+                }
+            }
         } else {
-            /* Paused before any frame decoded — nothing to draw, idle. */
+            /* Paused: idle rather than spin. Toggles still redraw
+             * because they set `dirty`. */
+            SDL_Delay(16);
+        }
+
+        bool have_any = false;
+        for (int i = 0; i < n_sources; i++) if (sources[i].shown) have_any = true;
+
+        /* Only re-render when something actually changed. Every render
+         * re-uploads each source's frame to the GPU, so redrawing an
+         * unchanged pause screen at 60Hz costs the same bandwidth as
+         * playback for no benefit. */
+        if (have_any && dirty) {
+            renderer_render(&rend, sources, n_sources);
+            dirty = false;
+        } else if (!have_any) {
             SDL_Delay(16);
         }
     }
 
+    /* Dump what accumulated over the session, per file. Printed on exit
+     * because the interesting numbers — peaks that latched somewhere
+     * mid-clip — are exactly the ones you cannot recover once the
+     * window closes. Coverage is stated so a partial watch is never
+     * mistaken for a full scan. */
+    for (int i = 0; i < n_sources; i++) {
+        char title[512];
+        snprintf(title, sizeof(title), "session (playback)  %s", sources[i].label);
+        analyze_print_session(&sources[i].session,
+                              sources[i].dec.has_cll ? sources[i].dec.cll_max : -1,
+                              sources[i].dec.has_cll ? sources[i].dec.cll_avg : -1,
+                              title);
+    }
+
     renderer_close(&rend);
-    decoder_close(&dec);
+    for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
     return 0;
 }

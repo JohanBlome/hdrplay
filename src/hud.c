@@ -1,6 +1,8 @@
 #include "hud.h"
 #include "renderer.h"
 #include "log.h"
+#include "stats.h"
+#include "source.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -125,7 +127,7 @@ static void draw_text(uint8_t *rgba, int W, int H,
  *
  * Each slot owns its own pl_tex so they can be sized independently and
  * positioned anywhere on the swapchain image via the overlay's dst rect. */
-enum { SLOT_STATUS, SLOT_HDR_LABEL, SLOT_SDR_LABEL, SLOT_COUNT };
+enum { SLOT_STATUS, SLOT_HDR_LABEL, SLOT_SDR_LABEL, SLOT_SESSION, SLOT_COUNT };
 
 typedef struct { pl_tex tex; int W, H; } HudSlot;
 
@@ -201,7 +203,15 @@ static void commit_slot(int s, pl_gpu gpu, uint8_t *buf,
 static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
 {
     (void)win_w; (void)win_h;
-    const int W = 460, H = 220;
+    /* H must fit the worst case, which is SPLIT mode with the probe on:
+     * MODE, DISPLAY HDR, src csp, out csp, FRAME, SRC PEAK, DR, SDR CAP,
+     * ABOVE 500N, SDR BOOST, PROBE, RGB = 12 lines, plus the excessive-
+     * headroom warning = 13. Line n starts at 6 + 24(n-1) and is 16px
+     * tall, so 13 lines needs 6 + 24*12 + 16 = 310. At the old H = 220
+     * anything past line 9 was silently dropped by draw_text_color's
+     * bounds check — pressing M in split mode looked like a no-op
+     * because both PROBE lines fell off the bottom. */
+    const int W = 460, H = 340;
     ensure_slot(SLOT_STATUS, gpu, W, H);
     if (!slots[SLOT_STATUS].tex) return -1;
     uint8_t *buf = make_panel(W, H, 170);
@@ -339,79 +349,313 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
     free(buf);
     return 0;
 }
-
-/* Build a single big "HDR" or "SDR" badge with a subtitle. Used per-half
- * in split mode so you can instantly tell which side is which. */
-static int build_label_badge(int slot, pl_gpu gpu, const char *big,
-                              const char *sub, int dst_x, int dst_y)
+/* ------------------------------------------------------------------ */
+/* Accumulated-statistics panel.                                       */
+/*                                                                     */
+/* With one source this is a detail view of that file. With two it     */
+/* becomes a side-by-side table, because in comparison mode the        */
+/* interesting thing is the DIFFERENCE, not either column.             */
+/*                                                                     */
+/* Two presentation rules keep the numbers honest either way:          */
+/*                                                                     */
+/*  - Measured MaxCLL/MaxFALL are one-sided LOWER bounds (strided      */
+/*    sampling, luma rather than maxRGB on this path, and Jensen on a  */
+/*    convex EOTF all push the estimate down). They are prefixed MIN   */
+/*    and only coloured red when they EXCEED the declared value, which */
+/*    is the one direction that constitutes evidence.                  */
+/*  - Absolute figures are suppressed for SDR sources, where a         */
+/*    measured peak cannot exceed 100 nits by construction and so      */
+/*    carries no information.                                          */
+/* ------------------------------------------------------------------ */
+static int build_session_panel_single(Renderer *r, pl_gpu gpu,
+                                      LayoutRect dst, SessionStats *ss)
 {
-    const int W = 200, H = 64;
+    SessionDerived d;
+    session_stats_derive(ss, &d);
+
+    const int W = (int)(dst.x1 - dst.x0), H = (int)(dst.y1 - dst.y0);
+    ensure_slot(SLOT_SESSION, gpu, W, H);
+    if (!slots[SLOT_SESSION].tex) return -1;
+    uint8_t *buf = make_panel(W, H, 170);
+    if (!buf) return -1;
+
+    char line[160];
+    int  y = 6;
+    const int pitch = FONT_H * hud_scale + 8;
+    bool absolute = lum_reference_is_absolute(d.reference);
+
+    if (d.coverage >= 0.0)
+        snprintf(line, sizeof(line), "SESSION %lluF COVER %.0fPCT",
+                 (unsigned long long)d.frames, d.coverage * 100.0);
+    else
+        snprintf(line, sizeof(line), "SESSION %lluF COVER UNKNOWN",
+                 (unsigned long long)d.frames);
+    draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
+
+    if (d.frames == 0) {
+        draw_text_color(buf, W, H, 6, y, hud_scale,
+                        "NO FRAMES MEASURED", 255, 200, 80);
+        commit_slot(SLOT_SESSION, gpu, buf, (int)dst.x0, (int)dst.y0);
+        free(buf);
+        return 0;
+    }
+
+    if (absolute) {
+        struct { const char *tag; double meas; int decl; bool has; } rows[] = {
+            { "MaxCLL ", d.maxcll_nits,  r->declared_cll_max, r->has_declared_cll },
+            { "MaxFALL", d.maxfall_nits, r->declared_cll_avg, r->has_declared_cll },
+        };
+        for (int i = 0; i < 2; i++) {
+            if (rows[i].has)
+                snprintf(line, sizeof(line), "%s MIN %.0fN DECL %dN",
+                         rows[i].tag, rows[i].meas, rows[i].decl);
+            else
+                snprintf(line, sizeof(line), "%s MIN %.0fN DECL NONE",
+                         rows[i].tag, rows[i].meas);
+            if (rows[i].has && rows[i].meas > rows[i].decl)
+                draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 80, 80);
+            else
+                draw_text(buf, W, H, 6, y, hud_scale, line);
+            y += pitch;
+        }
+    } else {
+        draw_text_color(buf, W, H, 6, y, hud_scale,
+                        "SDR SOURCE - NO ABSOLUTE NITS", 140, 140, 140);
+        y += pitch;
+    }
+
+    snprintf(line, sizeof(line), "P50 %.0fN  P1 %.0fN  P99 %.0fN",
+             d.p50, d.p1, d.p99);
+    draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
+
+    snprintf(line, sizeof(line), "DR %.1f STOPS (P99.9/P1)", d.dr_stops);
+    draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
+
+    snprintf(line, sizeof(line), "SPREAD %.1f SPAT / %.1f TEMP",
+             d.spatial_stops, d.temporal_stops);
+    draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
+
+    snprintf(line, sizeof(line), "BLACK %.0fPCT  UNDER %.1fPCT",
+             d.black_pct, d.underflow_pct);
+    draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
+    y += pitch;
+
+    if (d.reference == LUM_HLG_OOTF) {
+        snprintf(line, sizeof(line), "HLG ASSUMES LW %.0fN", d.hlg_lw);
+        draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 200, 80);
+        y += pitch;
+    }
+
+    commit_slot(SLOT_SESSION, gpu, buf, (int)dst.x0, (int)dst.y0);
+    free(buf);
+    return 0;
+}
+
+/* Two-column comparison. Rows where the two files differ meaningfully
+ * are highlighted, because scanning two columns of numbers for a small
+ * delta is exactly the thing a person is bad at. */
+static int build_session_panel_pair(Renderer *r, pl_gpu gpu, LayoutRect dst,
+                                    Source *sa, Source *sb)
+{
+    SessionDerived a, b;
+    session_stats_derive(&sa->session, &a);
+    session_stats_derive(&sb->session, &b);
+
+    const int W = (int)(dst.x1 - dst.x0), H = (int)(dst.y1 - dst.y0);
+    ensure_slot(SLOT_SESSION, gpu, W, H);
+    if (!slots[SLOT_SESSION].tex) return -1;
+    uint8_t *buf = make_panel(W, H, 170);
+    if (!buf) return -1;
+
+    char line[160];
+    int  y = 6;
+    const int pitch = FONT_H * hud_scale + 8;
+
+    double cov = a.coverage >= 0.0 ? a.coverage : b.coverage;
+    if (cov >= 0.0)
+        snprintf(line, sizeof(line), "SESSION %lluF COVER %.0fPCT",
+                 (unsigned long long)a.frames, cov * 100.0);
+    else
+        snprintf(line, sizeof(line), "SESSION %lluF", (unsigned long long)a.frames);
+    draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
+
+    /* Column header uses the first 6 characters of each basename —
+     * enough to tell two encodes apart without wrapping the panel. */
+    snprintf(line, sizeof(line), "         %-8.8s %-8.8s", sa->label, sb->label);
+    draw_text_color(buf, W, H, 6, y, hud_scale, line, 180, 180, 180);
+    y += pitch;
+
+    if (a.frames == 0 || b.frames == 0) {
+        draw_text_color(buf, W, H, 6, y, hud_scale,
+                        "WAITING FOR FRAMES", 255, 200, 80);
+        commit_slot(SLOT_SESSION, gpu, buf, (int)dst.x0, (int)dst.y0);
+        free(buf);
+        return 0;
+    }
+
+    bool absolute = lum_reference_is_absolute(a.reference) &&
+                    lum_reference_is_absolute(b.reference);
+
+    struct { const char *tag; double va, vb; const char *unit; double tol; bool show; } rows[] = {
+        { "MaxCLL", a.maxcll_nits,  b.maxcll_nits,  "N", 0.02, absolute },
+        { "MaxFALL",a.maxfall_nits, b.maxfall_nits, "N", 0.02, absolute },
+        { "P50",    a.p50,          b.p50,          "N", 0.02, true },
+        { "P99",    a.p99,          b.p99,          "N", 0.02, true },
+        { "DR",     a.dr_stops,     b.dr_stops,     "",  0.02, true },
+        { "SPREAD", a.spatial_stops,b.spatial_stops,"",  0.02, true },
+    };
+
+    for (size_t i = 0; i < sizeof(rows)/sizeof(*rows); i++) {
+        if (!rows[i].show) continue;
+        if (rows[i].unit[0])
+            snprintf(line, sizeof(line), "%-8s %7.0f%s %7.0f%s",
+                     rows[i].tag, rows[i].va, rows[i].unit,
+                     rows[i].vb, rows[i].unit);
+        else
+            snprintf(line, sizeof(line), "%-8s %8.1f %8.1f",
+                     rows[i].tag, rows[i].va, rows[i].vb);
+
+        /* Relative difference, so the highlight means the same thing
+         * whether the row is in nits or stops. */
+        double denom = fabs(rows[i].va) > 1e-9 ? fabs(rows[i].va) : 1.0;
+        double rel = fabs(rows[i].va - rows[i].vb) / denom;
+        if (rel > rows[i].tol)
+            draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 200, 80);
+        else
+            draw_text(buf, W, H, 6, y, hud_scale, line);
+        y += pitch;
+    }
+
+    if (!absolute)
+        draw_text_color(buf, W, H, 6, y, hud_scale,
+                        "SDR - NO ABSOLUTE NITS", 140, 140, 140);
+
+    commit_slot(SLOT_SESSION, gpu, buf, (int)dst.x0, (int)dst.y0);
+    free(buf);
+    return 0;
+}
+
+/* Build a badge with a big label and a subtitle, so each pane is
+ * identifiable from across the room. */
+static int build_label_badge(int slot, pl_gpu gpu, const char *big,
+                             const char *sub, LayoutRect dst)
+{
+    const int W = (int)(dst.x1 - dst.x0), H = (int)(dst.y1 - dst.y0);
     ensure_slot(slot, gpu, W, H);
     if (!slots[slot].tex) return -1;
     uint8_t *buf = make_panel(W, H, 200);
     if (!buf) return -1;
 
-    /* Big label at top in 4x scale (so it reads from across the room). */
+    /* Big label at 4x so it reads at a glance; subtitle beneath. */
     draw_text(buf, W, H, 12, 8, 4, big);
-    /* Subtitle in normal scale beneath. */
     if (sub) draw_text(buf, W, H, 12, 8 + FONT_H * 4 + 4, hud_scale, sub);
 
-    commit_slot(slot, gpu, buf, dst_x, dst_y);
+    commit_slot(slot, gpu, buf, (int)dst.x0, (int)dst.y0);
     free(buf);
     return 0;
 }
 
-/* Public entry point. Builds whichever overlay textures the current
- * mode needs and writes them back through `out`. The caller decides
- * which overlays to attach to which pl_render_image pass:
- *
- *   HDR / SDR mode  → attach `out->status` (1 overlay) to the single render.
- *   SPLIT mode      → attach status + hdr_label to the FIRST (HDR-half) render;
- *                     attach sdr_label to the SECOND (SDR-half) render.
- *                     This is required because overlays are clipped to the
- *                     render's target.crop — a status panel in the left half
- *                     would be invisible if attached only to the right-half
- *                     render. */
-void hud_prepare(Renderer *r, int win_w, int win_h, HudOverlays *out)
+/* Uppercase copy for the bitmap font, which has no lowercase glyphs. */
+static void upper6(char *dst, size_t n, const char *src)
+{
+    size_t i = 0;
+    for (; src[i] && i + 1 < n; i++) {
+        char c = src[i];
+        dst[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    }
+    dst[i] = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public entry point.                                                  */
+/*                                                                      */
+/* There is one pl_render_image per PANE, not per mode: single-file      */
+/* renders one pass, a two-file LR/TB comparison renders two. Which     */
+/* pass each overlay belongs to is decided in layout.c, not here — an    */
+/* overlay attached to two passes would composite twice and blend its    */
+/* alpha-170 background to ~0.89 instead of 0.667.                       */
+/*                                                                      */
+/* Overlays must be attached to the target BEFORE pl_render_image;       */
+/* libplacebo composites them during the pass, so attaching afterwards   */
+/* silently does nothing. That was the bug that hid the original HUD.    */
+/* ------------------------------------------------------------------ */
+void hud_prepare(Renderer *r, Source *sources, int n,
+                 const LayoutPlan *plan, int win_w, int win_h,
+                 HudOverlays *out)
 {
     pl_gpu gpu = r->vulkan->gpu;
-
     memset(out, 0, sizeof(*out));
     out->win_w = win_w;
     out->win_h = win_h;
 
-    build_status_panel(r, gpu, win_w, win_h);
-    out->status = overlay_arr[SLOT_STATUS];
+    bool pair = (n > 1 && r->solo < 0);
+    int  ia   = r->swapped ? 1 : 0;
+    int  ib   = r->swapped ? 0 : 1;
 
-    if (r->mode == HDRPLAY_MODE_SPLIT) {
-        const int label_w = 200, label_h = 64;
-        int hdr_x, hdr_y, sdr_x, sdr_y;
-        switch (r->split_orient) {
-        case HDRPLAY_SPLIT_LR:
-            hdr_x = win_w / 2 - label_w - 16;  hdr_y = 16;
-            sdr_x = win_w / 2 + 16;            sdr_y = 16;
-            break;
-        case HDRPLAY_SPLIT_TB:
-            hdr_x = 16;  hdr_y = win_h / 2 - label_h - 16;
-            sdr_x = 16;  sdr_y = win_h / 2 + 16;
-            break;
-        case HDRPLAY_SPLIT_DIAG:
-        default:
-            /* HDR triangle in upper-left → badge near top-left corner.
-             * SDR triangle in lower-right → badge near bottom-right corner.
-             * Y offsets put them away from the diagonal seam. */
-            hdr_x = 16;                      hdr_y = win_h - 16 - label_h * 3;
-            sdr_x = win_w - 16 - label_w;    sdr_y = 16 + label_h * 3;
-            break;
+    /* Walk the plan so a panel is built exactly when the layout says it
+     * exists, and positioned exactly where the layout put it. */
+    for (int pi = 0; pi < plan->n_pass; pi++) {
+        const LayoutPass *lp = &plan->pass[pi];
+        for (int oi = 0; oi < lp->n_ov; oi++) {
+            const LayoutOverlay *ov = &lp->ov[oi];
+            switch (ov->kind) {
+            case LAYOUT_OV_STATUS:
+                if (build_status_panel(r, gpu, win_w, win_h) == 0) {
+                    out->status     = overlay_arr[SLOT_STATUS];
+                    out->has_status = true;
+                }
+                break;
+
+            case LAYOUT_OV_SESSION: {
+                int rc = pair
+                    ? build_session_panel_pair(r, gpu, ov->dst,
+                                               &sources[ia], &sources[ib])
+                    : build_session_panel_single(r, gpu, ov->dst,
+                                                 &sources[renderer_focus_source(r)].session);
+                if (rc == 0) {
+                    out->session     = overlay_arr[SLOT_SESSION];
+                    out->has_session = true;
+                }
+                break;
+            }
+
+            case LAYOUT_OV_LABEL_A:
+            case LAYOUT_OV_LABEL_B: {
+                bool is_a = (ov->kind == LAYOUT_OV_LABEL_A);
+                int  slot = is_a ? SLOT_HDR_LABEL : SLOT_SDR_LABEL;
+                char big[16], sub[64];
+
+                if (pair) {
+                    /* Two files share one treatment, so the badge names
+                     * the FILE. Which is what you need to know when the
+                     * two panes look different. */
+                    upper6(big, sizeof(big), sources[is_a ? ia : ib].label);
+                    snprintf(sub, sizeof(sub), "%s %.0fNITS",
+                             r->mode == HDRPLAY_MODE_SDR ? "SDR" : "HDR",
+                             r->mode == HDRPLAY_MODE_SDR
+                               ? r->sdr_peak_effective
+                               : 203.0f * r->display_hdr_headroom);
+                } else {
+                    /* Single file: the panes differ by TREATMENT. */
+                    snprintf(big, sizeof(big), "%s", is_a ? "HDR" : "SDR");
+                    if (is_a)
+                        snprintf(sub, sizeof(sub), "BT.2020 PQ %.0fNITS",
+                                 203.0f * r->display_hdr_headroom);
+                    else
+                        snprintf(sub, sizeof(sub), "TONEMAP %.0fNITS",
+                                 r->sdr_peak_effective);
+                }
+
+                if (build_label_badge(slot, gpu, big, sub, ov->dst) == 0) {
+                    if (is_a) { out->label_a = overlay_arr[slot]; out->has_label_a = true; }
+                    else      { out->label_b = overlay_arr[slot]; out->has_label_b = true; }
+                }
+                break;
+            }
+
+            case LAYOUT_OV_INTERMEDIATE:
+                break;   /* renderer owns these */
+            }
         }
-        char hdr_sub[64], sdr_sub[64];
-        snprintf(hdr_sub, sizeof(hdr_sub), "BT.2020 PQ %.0fNITS",
-                 203.0f * r->display_hdr_headroom);
-        snprintf(sdr_sub, sizeof(sdr_sub), "TONEMAP %.0fNITS",
-                 r->sdr_peak_effective);
-        build_label_badge(SLOT_HDR_LABEL, gpu, "HDR", hdr_sub, hdr_x, hdr_y);
-        build_label_badge(SLOT_SDR_LABEL, gpu, "SDR", sdr_sub, sdr_x, sdr_y);
-        out->hdr_label = overlay_arr[SLOT_HDR_LABEL];
-        out->sdr_label = overlay_arr[SLOT_SDR_LABEL];
     }
 }

@@ -1,0 +1,66 @@
+Fix HLG scene->display conversion in vca.py (missing BT.2100 OOTF).
+
+analyze_frame_luminance multiplied scene linear by 1000, which is the
+gamma=1 case. The OOTF is a power law; omitting it overstates everything
+below peak, increasingly so toward black:
+
+    Y_S=0.5  -> 500 reported vs 435 correct
+    Y_S=0.1  -> 100 reported vs  63 correct
+    Y_S=0.01 ->  10 reported vs   4 correct
+
+classify_content()'s HLG branch uses code values, not nits, so verdicts
+are unaffected -- this corrects reported and plotted numbers.
+
+_apply_eotf() at line 434 is intentionally left alone: it returns scene
+linear for the gamut path, and the OOTF applies a common scale to R, G
+and B, so chromaticity is unchanged.
+
+Apply from /Users/jblome/code/hdr-analysis with:  git apply <this file>
+
+--- a/vca.py
++++ b/vca.py
+@@ -161,6 +161,32 @@
+ def gamma_eotf(v, gamma=2.4):
+     """Normalized SDR code [0,1] -> relative linear luminance."""
+     return np.power(np.maximum(v, 0.0), gamma)
+
+
++def hlg_system_gamma(lw=1000.0):
++    """BT.2100 HLG system gamma for a nominal display peak L_W in nits.
++    1.2 at the 1000-nit reference."""
++    return 1.2 + 0.42 * np.log10(max(float(lw), 1e-6) / 1000.0)
++
++
++def hlg_ootf(scene_linear, lw=1000.0):
++    """BT.2100 HLG OOTF (luma form): scene linear [0,1] -> display nits.
++
++    HLG's inverse OETF only reaches SCENE light. Reaching display light
++    requires this step, which is a power law, not a scale:
++        Y_D = L_W * Y_S ** gamma
++    Multiplying scene linear by L_W directly is the gamma=1 case. It
++    overstates everything below peak, increasingly so toward black: at
++    Y_S=0.1 it gives 100 nits where the correct value is 63, and at
++    Y_S=0.01, 10 nits against 4.
++
++    The exponent here is ~1.2 over values in [0,1], far from the large
++    exponents behind the np.power precision problem documented in
++    pq_eotf, so the vectorized form is safe.
++    """
++    return float(lw) * np.power(np.maximum(scene_linear, 0.0),
++                                hlg_system_gamma(lw))
++
++
+ def get_video_metadata(filepath):
+     """Extract HDR-relevant metadata using ffprobe."""
+     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+@@ -240,7 +266,10 @@
+     if t in ("smpte2084", "st2084"):
+         nits = pq_eotf(normalized)
+     elif t in ("arib-std-b67", "hlg"):
+-        nits = hlg_oetf_inverse(normalized) * 1000.0
++        # Scene light -> display light needs the OOTF, not a scale.
++        # L_W is an assumption; 1000 is the BT.2100 reference.
++        nits = hlg_ootf(hlg_oetf_inverse(normalized),
++                        metadata.get("hlg_peak_nits", 1000.0))
+     else:
+         nits = gamma_eotf(normalized, 2.4) * 100.0
