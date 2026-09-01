@@ -640,6 +640,12 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             continue;
         }
         r->slot[i].mapped = true;
+        /* Set here, not per-pass: intermediates render straight from the
+         * slot (SDR mode, and source B in a DIAG wipe), so a pass-local
+         * assignment would rotate the direct path and leave those two
+         * upright. */
+        r->slot[i].image.rotation =
+            pl_rotation_normalize(r->rotation[i] / 90);
     }
 
     int focus = renderer_focus_source(r);
@@ -687,14 +693,21 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         .mode = r->mode, .orient = r->split_orient,
         .n_sources = n, .solo = r->solo, .swapped = r->swapped,
         .win_w = win_w, .win_h = win_h,
-        .src_w = { sources[0].shown ? sources[0].shown->width  : 0,
-                   n > 1 && sources[1].shown ? sources[1].shown->width  : 0 },
-        .src_h = { sources[0].shown ? sources[0].shown->height : 0,
-                   n > 1 && sources[1].shown ? sources[1].shown->height : 0 },
+        /* Filled in below: rotation swaps the axes, and layout has to see
+         * the frame as displayed. */
+        .src_w = { 0, 0 },
+        .src_h = { 0, 0 },
         .zoom = r->zoom, .pan_x = r->pan_x, .pan_y = r->pan_y,
         .hud_hidden = r->hud_hidden,
         .session_panel = r->session_panel,
     };
+    for (int i = 0; i < 2; i++) {
+        if (i >= n || !sources[i].shown) continue;
+        layout_rotated_dims(r->rotation[i],
+                            sources[i].shown->width, sources[i].shown->height,
+                            &li.src_w[i], &li.src_h[i]);
+    }
+
     LayoutPlan plan;
     layout_plan(&li, &plan);
 
@@ -724,6 +737,8 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         LayoutRect ic = plan.pass[0].image_crop;
         double fx = (double)r->probe_x / r->probe_win_w;
         double fy = (double)r->probe_y / r->probe_win_h;
+        /* Window space is rotated; the crop below is not. */
+        layout_unrotate_norm(r->rotation[focus], &fx, &fy);
         int sx, sy;
         if (rect_is_zero(ic)) {
             sx = (int)(fx * pf->width);
@@ -786,6 +801,9 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         target.crop = to_pl_rect(lp->target_crop);
         apply_hdr_target(&target, r->display_hdr_headroom);
 
+        /* libplacebo rotates AFTER cropping, so image_crop stays in the
+         * frame's own unrotated pixels and layout needs no rotation
+         * awareness beyond the dimension swap fed into LayoutInput. */
         if (!rect_is_zero(lp->image_crop))
             image.crop = to_pl_rect(lp->image_crop);
 

@@ -68,6 +68,13 @@ typedef struct Renderer {
     float  zoom;            /* <= 0 = fit, 1.0 = 1:1 source pixels     */
     float  pan_x, pan_y;    /* normalized centre of the visible region */
 
+    /* Per-source clockwise rotation in degrees: 0, 90, 180 or 270.
+     * View state rather than decode state — the T key changes it
+     * between frames — so it lives here alongside zoom and solo and
+     * never reaches Source. See --rotate and docs/plans/
+     * 2026-08-31-input-rotation-design.md. */
+    int    rotation[2];
+
     /* Playback state surfaced to HUD. Main loop owns these flags and
      * pokes them in so the on-screen overlay reflects current state. */
     bool   paused;

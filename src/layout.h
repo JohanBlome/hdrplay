@@ -143,4 +143,29 @@ LayoutRect layout_image_crop(int src_w, int src_h, int dst_w, int dst_h,
 /* Index of the larger source by pixel area. */
 int layout_reference_source(const LayoutInput *in);
 
+/* Frame dimensions as DISPLAYED, given a clockwise rotation in degrees.
+ * 90 and 270 swap the axes; 0 and 180 pass through.
+ *
+ * Everything layout decides — which source is the zoom reference, how a
+ * pane letterboxes, whether portrait content should default to a
+ * top/bottom split — has to reason about the frame the way the viewer
+ * sees it, not the way the encoder stored it. Callers therefore run
+ * decoded dimensions through here before filling in src_w/src_h.
+ *
+ * `rot` need not be normalized; anything that is not 90 or 270 mod 360
+ * is treated as no swap. */
+void layout_rotated_dims(int rot, int w, int h, int *out_w, int *out_h);
+
+/* Undo a clockwise rotation on a normalized ([0,1]) coordinate.
+ *
+ * libplacebo's image rotation takes a source point (u,v) to the
+ * displayed point (1-v, u) at 90° CW. The probe needs that run
+ * backwards: it knows where the cursor is on screen and wants the pixel
+ * in the frame's own, unrotated space. Getting it wrong reports a real
+ * pixel from the wrong part of the frame — plausible-looking, and wrong.
+ *
+ * Lives here rather than in renderer.c so it is reachable from the
+ * layout tests; it is the same geometry as the dimension swap above. */
+void layout_unrotate_norm(int rot, double *x, double *y);
+
 #endif

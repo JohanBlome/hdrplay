@@ -41,6 +41,27 @@ int layout_reference_source(const LayoutInput *in)
     return (b > a) ? 1 : 0;
 }
 
+void layout_rotated_dims(int rot, int w, int h, int *out_w, int *out_h)
+{
+    /* Normalize first: the CLI clamps to {0,90,180,270}, but the T key
+     * increments without wrapping until it is read back, and a future
+     * display-matrix seed could arrive negative. */
+    int r = ((rot % 360) + 360) % 360;
+    if (r == 90 || r == 270) { *out_w = h; *out_h = w; }
+    else                     { *out_w = w; *out_h = h; }
+}
+
+void layout_unrotate_norm(int rot, double *x, double *y)
+{
+    double fx = *x, fy = *y;
+    switch (((rot % 360) + 360) % 360) {
+    case 90:  *x = fy;        *y = 1.0 - fx;  break;
+    case 180: *x = 1.0 - fx;  *y = 1.0 - fy;  break;
+    case 270: *x = 1.0 - fy;  *y = fx;        break;
+    default:  break;
+    }
+}
+
 LayoutRect layout_image_crop_ref(int src_w, int src_h,
                                  int ref_w, int ref_h,
                                  int dst_w, int dst_h,

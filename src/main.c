@@ -246,6 +246,16 @@ static void usage(void)
         "  --split-diag          diagonal split: HDR upper-left, SDR lower-right\n"
         "                        — best demo of what 'broken HDR' looks like\n"
         "  --loop                rewind to start on EOF instead of quitting\n"
+        "  --rotate [N:]DEG      rotate an input DEG degrees clockwise\n"
+        "                        before display. DEG is 0, 90, 180 or 270.\n"
+        "                        Bare `--rotate 90` applies to every input;\n"
+        "                        `--rotate 1:90` applies to the second file\n"
+        "                        only. Inputs are numbered from 0, as in\n"
+        "                        ffmpeg and as with -d (note the 1/2 solo\n"
+        "                        KEYS are 1-based). Repeatable. Container\n"
+        "                        rotation metadata is NOT read — this is the\n"
+        "                        only source of rotation. T rotates the\n"
+        "                        focused pane live.\n"
         "  --sdr-peak NITS       SDR tone-map ceiling in nits.\n"
         "                          default = OS-tracked (~500n; matches\n"
         "                            QuickTime / macOS SDR composition)\n"
@@ -290,6 +300,7 @@ static void usage(void)
         "                           falls back to seek beyond it)\n"
         "                        Z=toggle 1:1 zoom   +/-=zoom steps\n"
         "                        drag or shift-arrows=pan\n"
+        "                        T=rotate focused pane 90° clockwise\n"
         "                        two files: 0=compare  1/2=solo\n"
         "                                   X=swap sides\n"
         "\n"
@@ -344,6 +355,48 @@ static void usage(void)
         "                        seeks (slower, no memory cost).\n");
 }
 
+/* Parse a --rotate operand into `out[2]`, degrees clockwise.
+ *
+ *   "90"    -> both inputs
+ *   "1:90"  -> the second input only
+ *
+ * Inputs are numbered from 0, following ffmpeg's stream specifiers and
+ * matching -d, which is already 0-based. Note this does NOT line up with
+ * the 1/2 solo KEYS, which are 1-based; the CLI's own consistency was
+ * judged to matter more than agreement with the keyboard.
+ *
+ * Returns false on a malformed index, a non-multiple of 90, or anything
+ * outside 0-270. Rejecting rather than rounding is deliberate: a silently
+ * ignored "--rotate 45" would look like rotation is broken. */
+static bool parse_rotate(const char *arg, int out[2])
+{
+    int  which = -1;                 /* -1 = every input */
+    const char *deg = arg;
+    const char *colon = strchr(arg, ':');
+
+    if (colon) {
+        if (colon != arg + 1 || (arg[0] != '0' && arg[0] != '1')) {
+            fprintf(stderr, "--rotate: input index must be 0 or 1, got \"%.*s\"\n",
+                    (int)(colon - arg), arg);
+            return false;
+        }
+        which = arg[0] - '0';
+        deg   = colon + 1;
+    }
+
+    char *end = NULL;
+    long d = strtol(deg, &end, 10);
+    if (end == deg || *end != '\0' || d < 0 || d > 270 || d % 90 != 0) {
+        fprintf(stderr, "--rotate: degrees must be 0, 90, 180 or 270, got \"%s\"\n",
+                deg);
+        return false;
+    }
+
+    if (which < 0) out[0] = out[1] = (int)d;
+    else           out[which] = (int)d;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     bool fullscreen = false;
@@ -368,6 +421,7 @@ int main(int argc, char **argv)
     const char *paths[2] = { NULL, NULL };
     int   n_paths = 0;
     int   step_buffer = 8;   /* frames retained for step-back */
+    int   rotation[2] = { 0, 0 };   /* degrees CW, per input */
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-v")) g_verbose = 1;
         else if (!strcmp(argv[i], "-f")) fullscreen = true;
@@ -389,6 +443,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--split-lr"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_LR; split_explicit = true; }
         else if (!strcmp(argv[i], "--split-diag")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_DIAG; split_explicit = true; }
         else if (!strcmp(argv[i], "--loop"))     loop_at_eof = true;
+        else if (!strcmp(argv[i], "--rotate") && i+1 < argc) {
+            if (!parse_rotate(argv[++i], rotation)) return 2;
+        }
         else if (!strcmp(argv[i], "--sdr-peak") && i+1 < argc)
             sdr_peak_override = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--sdr-saturation") && i+1 < argc)
@@ -493,7 +550,13 @@ int main(int argc, char **argv)
     rend.swapped           = false;
     rend.zoom              = 0.0f;      /* fit */
     rend.pan_x = rend.pan_y = 0.5f;
+    rend.rotation[0]       = rotation[0];
+    rend.rotation[1]       = rotation[1];
     rend.current_frame_no  = -1;
+
+    for (int i = 0; i < n_sources; i++)
+        if (rotation[i])
+            LOG("REND", "%s rotated %d° CW", sources[i].label, rotation[i]);
 
     /* Two files means the split is spent on CONTENT, so H/S apply to
      * both panes and the mode starts as a plain HDR comparison rather
@@ -504,8 +567,15 @@ int main(int argc, char **argv)
         /* Portrait content in a left/right split gives each pane half the
          * width and all the height, so both are letterboxed into slivers.
          * Top/bottom keeps the aspect usable. Only a DEFAULT — O still
-         * cycles, and an explicit --split-lr is respected. */
-        if (!split_explicit && sources[0].dec.height > sources[0].dec.width) {
+         * cycles, and an explicit --split-lr is respected.
+         *
+         * Measured AFTER rotation: --rotate turns a landscape-stored file
+         * into portrait on screen, and it is the on-screen shape that
+         * decides which split reads better. */
+        int disp_w, disp_h;
+        layout_rotated_dims(rotation[0], sources[0].dec.width,
+                            sources[0].dec.height, &disp_w, &disp_h);
+        if (!split_explicit && disp_h > disp_w) {
             rend.split_orient = HDRPLAY_SPLIT_TB;
             LOG("REND", "portrait source — defaulting to top/bottom split");
         }
@@ -643,6 +713,14 @@ int main(int argc, char **argv)
                 if (e.key.key == SDLK_I) {
                     rend.hud_hidden = !rend.hud_hidden;
                     LOG("REND", "status HUD %s", rend.hud_hidden ? "HIDDEN" : "SHOWN");
+                }
+                /* T rotates the focused pane. With two files un-soloed
+                 * that is pane A; press 2 first to reach pane B. */
+                if (e.key.key == SDLK_T) {
+                    int f = renderer_focus_source(&rend);
+                    rend.rotation[f] = (rend.rotation[f] + 90) % 360;
+                    LOG("REND", "rotate %s -> %d°",
+                        sources[f].label, rend.rotation[f]);
                 }
                 /* A toggles the accumulated panel, shift-A resets it.
                  * The modifier test is explicit because SDLK_A matches

@@ -347,6 +347,123 @@ static void test_mismatched_geometry(void)
     CHECK(layout_reference_source(&in) == 1, "reference follows the larger file");
 }
 
+/* Rotation reaches layout only as a dimension swap — layout_plan itself
+ * never learns about it. These pin that contract: the swap is correct,
+ * and a rotated portrait source plans exactly like a native landscape
+ * one of the same displayed shape. */
+static void test_rotated_dims(void)
+{
+    puts("layout_rotated_dims");
+    int w, h;
+
+    layout_rotated_dims(0, 1920, 1080, &w, &h);
+    CHECK(w == 1920 && h == 1080, "0° passes through (%dx%d)", w, h);
+    layout_rotated_dims(180, 1920, 1080, &w, &h);
+    CHECK(w == 1920 && h == 1080, "180° passes through (%dx%d)", w, h);
+    layout_rotated_dims(90, 1920, 1080, &w, &h);
+    CHECK(w == 1080 && h == 1920, "90° swaps (%dx%d)", w, h);
+    layout_rotated_dims(270, 1920, 1080, &w, &h);
+    CHECK(w == 1080 && h == 1920, "270° swaps (%dx%d)", w, h);
+
+    /* The T key increments without wrapping until read back, so a
+     * caller can legitimately pass 360 or more. */
+    layout_rotated_dims(450, 1920, 1080, &w, &h);
+    CHECK(w == 1080 && h == 1920, "450° normalizes to 90° (%dx%d)", w, h);
+    layout_rotated_dims(-90, 1920, 1080, &w, &h);
+    CHECK(w == 1080 && h == 1920, "-90° normalizes to 270° (%dx%d)", w, h);
+}
+
+/* Forward map, written out independently of the implementation: where a
+ * source point lands on screen once libplacebo has rotated the image
+ * clockwise. Deriving the test's expectations from the same expression
+ * the code uses would only prove it is self-consistent. */
+static void rotate_norm_ref(int rot, double u, double v, double *fx, double *fy)
+{
+    switch (rot) {
+    case 90:  *fx = 1.0 - v; *fy = u;       break;   /* TL -> TR */
+    case 180: *fx = 1.0 - u; *fy = 1.0 - v; break;   /* TL -> BR */
+    case 270: *fx = v;       *fy = 1.0 - u; break;   /* TL -> BL */
+    default:  *fx = u;       *fy = v;       break;
+    }
+}
+
+static void test_unrotate_norm(void)
+{
+    puts("layout_unrotate_norm");
+
+    /* Round trip: forward then back must land where it started, for
+     * every rotation and a spread of off-centre points that would hide
+     * a transposed axis or a missing 1-x. */
+    static const double pts[][2] = {
+        {0.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}, {1.0, 1.0},
+        {0.5, 0.5}, {0.25, 0.75}, {0.9, 0.1},
+    };
+    const int rots[] = { 0, 90, 180, 270 };
+    int bad = 0;
+    for (int r = 0; r < 4; r++) {
+        for (size_t p = 0; p < sizeof pts / sizeof pts[0]; p++) {
+            double fx, fy;
+            rotate_norm_ref(rots[r], pts[p][0], pts[p][1], &fx, &fy);
+            layout_unrotate_norm(rots[r], &fx, &fy);
+            if (fabs(fx - pts[p][0]) > 1e-9 || fabs(fy - pts[p][1]) > 1e-9)
+                bad++;
+        }
+    }
+    CHECK(bad == 0, "inverts the clockwise map at every rotation (%d bad)", bad);
+
+    /* Direction, spelled out: at 90° CW the top-left of the frame shows
+     * up in the top-RIGHT of the window, so probing the top-right must
+     * report the frame's top-left. A CCW implementation passes the
+     * round trip above but fails this. */
+    double x = 1.0, y = 0.0;
+    layout_unrotate_norm(90, &x, &y);
+    CHECK(fabs(x) < 1e-9 && fabs(y) < 1e-9,
+          "90°: window top-right probes the frame's top-left (%.2f,%.2f)", x, y);
+
+    x = 0.0; y = 0.0;
+    layout_unrotate_norm(90, &x, &y);
+    CHECK(fabs(x) < 1e-9 && fabs(y - 1.0) < 1e-9,
+          "90°: window top-left probes the frame's bottom-left (%.2f,%.2f)", x, y);
+
+    /* 0° must be untouched, so the probe is bit-identical to today's
+     * behaviour for every unrotated file. */
+    x = 0.31; y = 0.87;
+    layout_unrotate_norm(0, &x, &y);
+    CHECK(x == 0.31 && y == 0.87, "0° leaves the coordinate alone");
+}
+
+static void test_rotated_source_plans_as_native(void)
+{
+    puts("a rotated source plans like a native one of the same shape");
+
+    /* 1080x1920 portrait file rotated 90° CW == a native 1920x1080. */
+    int rw, rh;
+    layout_rotated_dims(90, 1080, 1920, &rw, &rh);
+
+    LayoutInput rotated = base_input();
+    rotated.zoom = 1.5f;
+    rotated.src_w[0] = rw; rotated.src_h[0] = rh;
+
+    LayoutInput native = base_input();
+    native.zoom = 1.5f;
+    native.src_w[0] = 1920; native.src_h[0] = 1080;
+
+    LayoutPlan pr, pn;
+    layout_plan(&rotated, &pr);
+    layout_plan(&native,  &pn);
+
+    CHECK(memcmp(&pr, &pn, sizeof pr) == 0,
+          "plans are byte-identical");
+
+    /* And the swap is what makes a rotated landscape file trip the
+     * portrait heuristic that main.c uses to pick a top/bottom split. */
+    int dw, dh;
+    layout_rotated_dims(90, 1920, 1080, &dw, &dh);
+    CHECK(dh > dw, "landscape rotated 90° reads as portrait (%dx%d)", dw, dh);
+    layout_rotated_dims(0, 1920, 1080, &dw, &dh);
+    CHECK(dh < dw, "the same file unrotated reads as landscape (%dx%d)", dw, dh);
+}
+
 int main(void)
 {
     test_single_file_unchanged();
@@ -356,6 +473,9 @@ int main(void)
     test_overlay_routing_is_exclusive();
     test_zoom_pan();
     test_mismatched_geometry();
+    test_rotated_dims();
+    test_unrotate_norm();
+    test_rotated_source_plans_as_native();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

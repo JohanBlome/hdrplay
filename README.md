@@ -98,10 +98,37 @@ hdrplay video.mp4                  # plain run
 hdrplay video.mp4 -v               # verbose per-frame logging
 hdrplay video.mp4 -f               # start fullscreen (recommended for true HDR)
 
+hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
+
 # F toggles fullscreen, Q/Esc quits.
 # I toggles the status HUD, A the accumulated-statistics panel.
 # . and , step one frame forward / back.
+# T rotates the focused pane 90° clockwise.
 ```
+
+### Rotation
+
+`--rotate [N:]DEG` turns an input DEG degrees clockwise before display,
+where DEG is 0, 90, 180 or 270. A bare `--rotate 90` applies to every
+input; `--rotate 1:90` applies to the second file only. The flag is
+repeatable, so `--rotate 0:90 --rotate 1:270` sets each file separately.
+`T` rotates the focused pane live.
+
+Inputs are numbered **from 0**, following ffmpeg's stream specifiers and
+matching `-d`, which is already 0-based. The `1`/`2` solo keys are
+1-based and do not line up — `--rotate 1:90` rotates the file that `2`
+solos.
+
+Rotation is applied by libplacebo during sampling, so there is no
+re-encode and no extra pass. Everything downstream follows: the pane
+aspect, the zoom reference, the portrait→top-bottom split default, and
+the luminance probe all reason about the frame as displayed rather than
+as stored.
+
+**Container rotation metadata is not read.** A file whose display matrix
+says "portrait" still plays as stored — `--rotate` is the only source of
+rotation. This is deliberate: it keeps one visible, explicit answer to
+"why is this sideways", rather than two that have to be composed.
 
 ### Comparing two files
 
@@ -132,6 +159,7 @@ and `0` to return.
 | `+` `-` | zoom steps |
 | drag, `shift`+arrows | pan, locked across panes |
 | `P` `O` | split mode / cycle LR, TB, diagonal wipe |
+| `T` | rotate the focused pane 90° clockwise |
 
 **Stepping backward** is the awkward direction — video decodes one way,
 so frame N−1 normally means seeking to the preceding keyframe and
