@@ -298,9 +298,15 @@ static void usage(void)
         "                        . / , =step one frame fwd/back\n"
         "                          (pauses; uses the frame ring,\n"
         "                           falls back to seek beyond it)\n"
-        "                        Z=toggle 1:1 zoom   +/-=zoom steps\n"
+        "                        Z=toggle fit / 1:1   +/-=zoom steps\n"
+        "                          1:1 = one source pixel per FRAMEBUFFER\n"
+        "                          pixel; the HUD reports the live scale.\n"
+        "                          Aspect is always preserved — panes\n"
+        "                          letterbox rather than stretch.\n"
         "                        drag or shift-arrows=pan\n"
         "                        T=rotate focused pane 90° clockwise\n"
+        "                        W=resize window for exact 1:1 on the\n"
+        "                          focused source (no letterbox, no crop)\n"
         "                        two files: 0=compare  1/2=solo\n"
         "                                   X=swap sides\n"
         "\n"
@@ -713,6 +719,45 @@ int main(int argc, char **argv)
                 if (e.key.key == SDLK_I) {
                     rend.hud_hidden = !rend.hud_hidden;
                     LOG("REND", "status HUD %s", rend.hud_hidden ? "HIDDEN" : "SHOWN");
+                }
+                /* W resizes the window so the focused source lands at
+                 * exactly 1:1 with no letterbox.
+                 *
+                 * Zoom alone cannot get you here: at 1:1 the image is
+                 * whatever size the source is, and the pane is whatever
+                 * size you dragged the window to, so you are always
+                 * either cropped or bordered. Sizing the WINDOW to the
+                 * source is the only way to see all of it at 1:1 —
+                 * which, on an HDR grading check, is the state you
+                 * actually want to be in. */
+                if (e.key.key == SDLK_W) {
+                    int f = renderer_focus_source(&rend);
+                    AVFrame *sf = sources[f].shown;
+                    if (sf) {
+                        int dw, dh;
+                        layout_rotated_dims(rend.rotation[f],
+                                            sf->width, sf->height, &dw, &dh);
+                        /* Two panes side by side need double the width
+                         * (or height) so each half is still 1:1. */
+                        if (n_sources > 1 && rend.solo < 0) {
+                            if (rend.split_orient == HDRPLAY_SPLIT_TB) dh *= 2;
+                            else if (rend.split_orient == HDRPLAY_SPLIT_LR) dw *= 2;
+                        }
+                        /* SDL window size is in POINTS; the framebuffer
+                         * is in pixels. On a 2x display asking for the
+                         * pixel count would give a window twice as big
+                         * as intended and land at 2:1, not 1:1. */
+                        float dpi = SDL_GetWindowPixelDensity(rend.window);
+                        if (!(dpi > 0.0f)) dpi = 1.0f;
+                        SDL_SetWindowFullscreen(rend.window, false);
+                        SDL_SetWindowSize(rend.window,
+                                          (int)(dw / dpi + 0.5f),
+                                          (int)(dh / dpi + 0.5f));
+                        rend.zoom = 1.0f;
+                        rend.pan_x = rend.pan_y = 0.5f;
+                        LOG("REND", "window -> %dx%d px for 1:1 on %s",
+                            dw, dh, sources[f].label);
+                    }
                 }
                 /* T rotates the focused pane. With two files un-soloed
                  * that is pane A; press 2 first to reach pane B. */

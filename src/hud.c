@@ -211,7 +211,10 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
      * anything past line 9 was silently dropped by draw_text_color's
      * bounds check — pressing M in split mode looked like a no-op
      * because both PROBE lines fell off the bottom. */
-    const int W = 460, H = 340;
+    /* Must match STATUS_W / STATUS_H in layout.c, which needs the rect
+     * to decide which pass owns the panel. draw_text clips silently, so
+     * a panel too short by one line loses that line with no warning. */
+    const int W = 460, H = 364;
     ensure_slot(SLOT_STATUS, gpu, W, H);
     if (!slots[SLOT_STATUS].tex) return -1;
     uint8_t *buf = make_panel(W, H, 170);
@@ -264,6 +267,20 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
              r->paused       ? " PAUSED" : "",
              r->loop_enabled ? " LOOP"   : "");
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
+
+    /* Displayed scale. Below 1:1 a resampler sits between you and the
+     * pixels, so any artifact judgement is really a judgement about the
+     * downscale; 1:1 is called out explicitly because that is the state
+     * worth getting to and it is not distinguishable by eye. */
+    if (r->last_scale > 0.0f) {
+        if (fabsf(r->last_scale - 1.0f) < 0.001f)
+            snprintf(line, sizeof(line), "SCALE 1:1 EXACT");
+        else if (r->zoom > 0.0f)
+            snprintf(line, sizeof(line), "SCALE %.3gX ZOOM", r->last_scale);
+        else
+            snprintf(line, sizeof(line), "SCALE %.3gX FIT", r->last_scale);
+        draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
+    }
 
     /* Per-frame source brightness stats — answers "does this frame
      * actually have HDR content to show?". Peak/avg/DR are always

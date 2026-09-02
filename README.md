@@ -155,11 +155,12 @@ and `0` to return.
 | `.` `,` | step one frame forward / back (pauses) |
 | `0` `1` `2` | compare A\|B / solo A / solo B |
 | `X` | swap sides |
-| `Z` | toggle 1:1 zoom |
+| `Z` | toggle fit / 1:1 |
 | `+` `-` | zoom steps |
 | drag, `shift`+arrows | pan, locked across panes |
 | `P` `O` | split mode / cycle LR, TB, diagonal wipe |
 | `T` | rotate the focused pane 90° clockwise |
+| `W` | resize the window for exact 1:1, no letterbox |
 
 **Stepping backward** is the awkward direction — video decodes one way,
 so frame N−1 normally means seeking to the preceding keyframe and
@@ -174,6 +175,38 @@ differences — grade, banding, blown highlights. `Z` gives 1:1 source
 pixels, which is where compression artifacts actually become visible.
 Pan is locked across panes, so you are always looking at the same region
 of both.
+
+### Aspect ratio and 1:1
+
+The drawn image always has the source's aspect ratio. Not "usually", and
+not "if the window is the right shape" — the target rect and the visible
+source region are the same rectangle scaled by one number, so a
+distorted frame is not a state the layout can express. Whatever is left
+over in the pane is black.
+
+In a two-pane split each image is justified **toward the seam**: under
+left/right the left pane sits hard right and the right pane hard left,
+so the pair meets in the middle and all the slack goes to the outside
+edges. Centring each image in its own half instead puts the sum of both
+inner margins between them — a wide black gutter running exactly between
+the two things you are trying to compare. Top/bottom does the same
+vertically. A single pane stays centred; there is no seam to meet.
+
+`Z` toggles fit and 1:1; `+`/`-` step through 2x zoom levels. **1:1 means
+one source pixel per framebuffer pixel**, which on a HiDPI display is
+half the physical size you might expect. That is the only definition
+worth having here: at any other scale a resampler sits between you and
+the file, and you end up judging the resampler.
+
+The status HUD reports the scale in force (`SCALE 1:1 EXACT`,
+`SCALE 0.25X FIT`), because whether you are actually at 1:1 is not
+something you can tell by looking.
+
+`W` resizes the window so the focused source lands at exactly 1:1 with
+no letterbox and nothing cropped — doubling the width or height first if
+two panes are showing. Zoom alone cannot get you there: at 1:1 the image
+is whatever size the source is and the pane is whatever size you dragged
+the window to, so you are always either cropped or bordered.
 
 Files of different resolutions are fine. Zoom is expressed against the
 larger of the two, so both panes always cover the same region of the

@@ -37,6 +37,12 @@ static LayoutInput base_input(void)
     };
 }
 
+/* The all-zero rect is layout's "whole frame" sentinel. */
+static bool rect_is_zero_t(LayoutRect r)
+{
+    return r.x0 == 0 && r.y0 == 0 && r.x1 == 0 && r.y1 == 0;
+}
+
 static bool rect_eq(LayoutRect r, float x0, float y0, float x1, float y1)
 {
     return fabsf(r.x0 - x0) < 0.01f && fabsf(r.y0 - y0) < 0.01f &&
@@ -178,10 +184,14 @@ static void test_pair_lr_tb(void)
     CHECK(pl.n_pass == 2, "LR: two passes");
     CHECK(pl.n_inter == 0, "LR HDR: no intermediates — direct render");
     CHECK(pl.pass[0].src == 0 && pl.pass[1].src == 1, "LR: A then B");
-    CHECK(rect_eq(pl.pass[0].target_crop, 0, 0, WIN_W / 2, WIN_H),
-          "LR: pane A is the left half");
-    CHECK(rect_eq(pl.pass[1].target_crop, WIN_W / 2, 0, WIN_W, WIN_H),
-          "LR: pane B is the right half");
+    /* A 16:9 source in a half-width pane letterboxes vertically: the
+     * pane is 960x1080 but the image can only be 960x540. Filling the
+     * pane, which is what this used to do, squeezed every frame 2:1
+     * horizontally — the whole reason for the fit rework. */
+    CHECK(rect_eq(pl.pass[0].target_crop, 0, 270, WIN_W / 2, 810),
+          "LR: pane A is letterboxed inside the left half");
+    CHECK(rect_eq(pl.pass[1].target_crop, WIN_W / 2, 270, WIN_W, 810),
+          "LR: pane B is letterboxed inside the right half");
 
     in.swapped = true;
     layout_plan(&in, &pl);
@@ -192,10 +202,12 @@ static void test_pair_lr_tb(void)
     in.n_sources = 2;
     in.orient = HDRPLAY_SPLIT_TB;
     layout_plan(&in, &pl);
-    CHECK(rect_eq(pl.pass[0].target_crop, 0, 0, WIN_W, WIN_H / 2),
-          "TB: pane A is the top half");
-    CHECK(rect_eq(pl.pass[1].target_crop, 0, WIN_H / 2, WIN_W, WIN_H),
-          "TB: pane B is the bottom half");
+    /* Half-height pane, 1920x540: a 16:9 image fits as 960x540, so this
+     * one letterboxes horizontally instead. */
+    CHECK(rect_eq(pl.pass[0].target_crop, 480, 0, 1440, WIN_H / 2),
+          "TB: pane A is letterboxed inside the top half");
+    CHECK(rect_eq(pl.pass[1].target_crop, 480, WIN_H / 2, 1440, WIN_H),
+          "TB: pane B is letterboxed inside the bottom half");
 
     /* SDR applies to BOTH panes — the split is spent on content, so the
      * treatment cannot also vary across it. */
@@ -464,6 +476,226 @@ static void test_rotated_source_plans_as_native(void)
     CHECK(dh < dw, "the same file unrotated reads as landscape (%dx%d)", dw, dh);
 }
 
+/* The central claim: whatever the mode, split, window shape, source
+ * shape or zoom, the drawn rect has the same aspect as the visible
+ * source region. Rather than assert a handful of rects, sweep the whole
+ * space and check the invariant — a regression anywhere in layout_plan
+ * shows up here even if nobody thought to write a case for it. */
+static float aspect_of(LayoutRect r)
+{
+    float w = r.x1 - r.x0, h = r.y1 - r.y0;
+    return (h > 0.0f) ? w / h : 0.0f;
+}
+
+static void test_aspect_is_always_preserved(void)
+{
+    puts("aspect is preserved on every path");
+
+    static const int dims[][2] = {
+        {1920, 1080}, {3840, 2160}, {1080, 1920}, {640, 480},
+        {720, 576},   {4096, 1716}, {256, 256},
+    };
+    static const int wins[][2] = {
+        {1920, 1080}, {1000, 1000}, {3000, 800}, {700, 1400}, {321, 987},
+    };
+    static const float zooms[] = { 0.0f, 1.0f, 2.0f, 0.5f, 8.0f };
+    const int modes[]   = { HDRPLAY_MODE_HDR, HDRPLAY_MODE_SDR, HDRPLAY_MODE_SPLIT };
+    const int orients[] = { HDRPLAY_SPLIT_LR, HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG };
+
+    int checked = 0, bad = 0;
+    float worst = 0.0f;
+
+    for (size_t da = 0; da < sizeof dims / sizeof dims[0]; da++)
+    for (size_t db = 0; db < sizeof dims / sizeof dims[0]; db++)
+    for (size_t wi = 0; wi < sizeof wins / sizeof wins[0]; wi++)
+    for (size_t zi = 0; zi < sizeof zooms / sizeof zooms[0]; zi++)
+    for (int nsrc = 1; nsrc <= 2; nsrc++)
+    for (int mi = 0; mi < 3; mi++)
+    for (int oi = 0; oi < 3; oi++) {
+        LayoutInput in = base_input();
+        in.n_sources = nsrc;
+        in.mode      = modes[mi];
+        in.orient    = orients[oi];
+        in.win_w = wins[wi][0]; in.win_h = wins[wi][1];
+        in.src_w[0] = dims[da][0]; in.src_h[0] = dims[da][1];
+        in.src_w[1] = dims[db][0]; in.src_h[1] = dims[db][1];
+        in.zoom = zooms[zi];
+
+        LayoutPlan pl;
+        layout_plan(&in, &pl);
+
+        for (int p = 0; p < pl.n_pass; p++) {
+            LayoutRect ic = pl.pass[p].image_crop;
+            int s = pl.pass[p].src;
+            /* All-zero crop means the whole frame. */
+            float src_aspect = rect_is_zero_t(ic)
+                ? (float)in.src_w[s] / (float)in.src_h[s]
+                : aspect_of(ic);
+            float tgt_aspect = aspect_of(pl.pass[p].target_crop);
+            checked++;
+            float err = fabsf(tgt_aspect - src_aspect) / src_aspect;
+            if (err > worst) worst = err;
+            if (err > 0.005f) {
+                if (bad == 0)
+                    printf("    first bad: %dx%d in %dx%d zoom %.1f mode %d "
+                           "orient %d nsrc %d -> src %.4f tgt %.4f\n",
+                           in.src_w[s], in.src_h[s], in.win_w, in.win_h,
+                           in.zoom, in.mode, in.orient, nsrc,
+                           src_aspect, tgt_aspect);
+                bad++;
+            }
+        }
+    }
+    CHECK(bad == 0, "%d plans, worst aspect error %.4f%% (%d bad)",
+          checked, worst * 100.0f, bad);
+
+    /* And the target never escapes its pane, which is the other half of
+     * "fits": an aspect-correct rect hanging off the edge of the window
+     * would satisfy the check above. */
+    int overflow = 0;
+    for (size_t wi = 0; wi < sizeof wins / sizeof wins[0]; wi++)
+    for (size_t da = 0; da < sizeof dims / sizeof dims[0]; da++)
+    for (size_t zi = 0; zi < sizeof zooms / sizeof zooms[0]; zi++) {
+        LayoutInput in = base_input();
+        in.n_sources = 2;
+        in.win_w = wins[wi][0]; in.win_h = wins[wi][1];
+        in.src_w[0] = in.src_w[1] = dims[da][0];
+        in.src_h[0] = in.src_h[1] = dims[da][1];
+        in.zoom = zooms[zi];
+        LayoutPlan pl;
+        layout_plan(&in, &pl);
+        for (int p = 0; p < pl.n_pass; p++) {
+            LayoutRect t = pl.pass[p].target_crop;
+            if (t.x0 < -0.01f || t.y0 < -0.01f ||
+                t.x1 > in.win_w + 0.01f || t.y1 > in.win_h + 0.01f)
+                overflow++;
+        }
+    }
+    CHECK(overflow == 0, "no target rect escapes the window (%d)", overflow);
+}
+
+/* 1:1 has to be exactly 1:1 -- one source pixel per framebuffer pixel --
+ * or it is useless for the thing it exists for, which is deciding
+ * whether a compression artifact is in the file or in the resampler. */
+static void test_one_to_one_is_exact(void)
+{
+    puts("zoom 1.0 is exactly 1:1");
+
+    struct { int sw, sh, ww, wh; } cases[] = {
+        { 3840, 2160, 1920, 1080 },   /* source larger than the window  */
+        {  640,  360, 1920, 1080 },   /* smaller: used to stretch to fit */
+        { 1920, 1080, 1920, 1080 },   /* exact match                     */
+        { 1080, 1920,  900,  700 },   /* portrait, both axes cropped     */
+    };
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        LayoutInput in = base_input();
+        in.n_sources = 1;
+        in.win_w = cases[i].ww; in.win_h = cases[i].wh;
+        in.src_w[0] = in.src_w[1] = cases[i].sw;
+        in.src_h[0] = in.src_h[1] = cases[i].sh;
+        in.zoom = 1.0f;
+
+        LayoutPlan pl;
+        layout_plan(&in, &pl);
+        LayoutRect ic = pl.pass[0].image_crop;
+        LayoutRect t  = pl.pass[0].target_crop;
+
+        float cw = rect_is_zero_t(ic) ? (float)cases[i].sw : ic.x1 - ic.x0;
+        float ch = rect_is_zero_t(ic) ? (float)cases[i].sh : ic.y1 - ic.y0;
+
+        CHECK(fabsf((t.x1 - t.x0) - cw) < 0.51f &&
+              fabsf((t.y1 - t.y0) - ch) < 0.51f,
+              "%dx%d in %dx%d: %.0fx%.0f source px -> %.0fx%.0f screen px",
+              cases[i].sw, cases[i].sh, cases[i].ww, cases[i].wh,
+              cw, ch, t.x1 - t.x0, t.y1 - t.y0);
+        CHECK(fabsf(pl.pass[0].scale - 1.0f) < 0.001f,
+              "%dx%d: reported scale is 1.0 (%.4f)",
+              cases[i].sw, cases[i].sh, pl.pass[0].scale);
+    }
+
+    /* A source smaller than the pane must be centred with borders, not
+     * blown up to fill -- the old behaviour, and the reason 1:1 could
+     * not actually be reached on small clips. */
+    LayoutInput in = base_input();
+    in.n_sources = 1;
+    in.win_w = 1920; in.win_h = 1080;
+    in.src_w[0] = in.src_w[1] = 640;
+    in.src_h[0] = in.src_h[1] = 360;
+    in.zoom = 1.0f;
+    LayoutPlan pl;
+    layout_plan(&in, &pl);
+    CHECK(rect_eq(pl.pass[0].target_crop, 640, 360, 1280, 720),
+          "a 640x360 clip at 1:1 sits centred in a 1920x1080 window");
+}
+
+/* Two letterboxed panes must meet at the seam, not sit centred in their
+ * own halves with the sum of both inner margins as a gutter between
+ * them. Portrait content in a left/right split is where this bites: each
+ * image is much narrower than its half, so centring puts a wide black
+ * band exactly between the two things being compared. */
+static void test_panes_meet_at_the_seam(void)
+{
+    puts("split panes are justified toward the seam");
+
+    /* 1080x1920 portrait in a 1920x1080 window: each half is 960x1080,
+     * each image fits as 608x1080, leaving 352px of slack per pane. */
+    LayoutInput in = base_input();
+    in.n_sources = 2;
+    in.orient = HDRPLAY_SPLIT_LR;
+    in.src_w[0] = in.src_w[1] = 1080;
+    in.src_h[0] = in.src_h[1] = 1920;
+    LayoutPlan pl;
+    layout_plan(&in, &pl);
+
+    LayoutRect ta = pl.pass[0].target_crop, tb = pl.pass[1].target_crop;
+    CHECK(fabsf(ta.x1 - WIN_W / 2.0f) < 0.51f,
+          "LR: pane A's right edge is on the seam (%.1f)", ta.x1);
+    CHECK(fabsf(tb.x0 - WIN_W / 2.0f) < 0.51f,
+          "LR: pane B's left edge is on the seam (%.1f)", tb.x0);
+    CHECK(fabsf((tb.x0 - ta.x1)) < 0.51f, "LR: no gutter between them");
+    CHECK(ta.x0 > 300.0f && tb.x1 < WIN_W - 300.0f,
+          "LR: the slack went to the outside edges (%.0f .. %.0f)",
+          ta.x0, tb.x1);
+
+    /* Swapping sides must not swap which edge is justified: the LEFT
+     * pane is always right-justified, whichever file is in it. */
+    in.swapped = true;
+    layout_plan(&in, &pl);
+    CHECK(pl.pass[0].src == 1 && pl.pass[1].src == 0, "X swapped the sources");
+    CHECK(fabsf(pl.pass[0].target_crop.x1 - WIN_W / 2.0f) < 0.51f &&
+          fabsf(pl.pass[1].target_crop.x0 - WIN_W / 2.0f) < 0.51f,
+          "LR swapped: still justified to the seam");
+
+    /* TB: a source wider than the very wide half-pane letterboxes
+     * vertically, and the two should meet at the horizontal seam. */
+    in = base_input();
+    in.n_sources = 2;
+    in.orient = HDRPLAY_SPLIT_TB;
+    in.win_w = 800; in.win_h = 1200;      /* halves are 800x600 */
+    in.src_w[0] = in.src_w[1] = 1920;     /* 16:9 -> 800x450, 150 slack */
+    in.src_h[0] = in.src_h[1] = 1080;
+    layout_plan(&in, &pl);
+    ta = pl.pass[0].target_crop; tb = pl.pass[1].target_crop;
+    CHECK(fabsf(ta.y1 - 600.0f) < 0.51f,
+          "TB: pane A's bottom edge is on the seam (%.1f)", ta.y1);
+    CHECK(fabsf(tb.y0 - 600.0f) < 0.51f,
+          "TB: pane B's top edge is on the seam (%.1f)", tb.y0);
+
+    /* Justification must not have broken the aspect guarantee. */
+    CHECK(fabsf(((ta.x1 - ta.x0) / (ta.y1 - ta.y0)) - 16.0f / 9.0f) < 0.01f,
+          "TB: aspect still correct after justifying");
+
+    /* A single pane stays centred — there is no seam to meet. */
+    in = base_input();
+    in.n_sources = 1;
+    in.src_w[0] = 1080; in.src_h[0] = 1920;
+    layout_plan(&in, &pl);
+    LayoutRect t = pl.pass[0].target_crop;
+    CHECK(fabsf((t.x0 + t.x1) / 2.0f - WIN_W / 2.0f) < 0.51f,
+          "single pane is still centred (%.0f..%.0f)", t.x0, t.x1);
+}
+
 int main(void)
 {
     test_single_file_unchanged();
@@ -476,6 +708,9 @@ int main(void)
     test_rotated_dims();
     test_unrotate_norm();
     test_rotated_source_plans_as_native();
+    test_aspect_is_always_preserved();
+    test_one_to_one_is_exact();
+    test_panes_meet_at_the_seam();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

@@ -70,12 +70,23 @@ typedef struct {
     int  src;                /* which source feeds it                 */
     int  mask;               /* enum AlphaMaskMode baked into alpha   */
     bool sdr;                /* true = SDR treatment, false = HDR     */
+    LayoutRect dst;          /* window-space rect the content lands in.
+                              * The texture is window-sized, so this is
+                              * both the render target crop and the
+                              * overlay's source rect — a 1:1 map, which
+                              * is what keeps the pre-baked alpha mask
+                              * aligned with window space. */
+    LayoutRect image_crop;   /* source-space crop; all-zero = full.
+                              * Must match what `dst` was sized from, or
+                              * the intermediate stretches. */
 } LayoutInter;
 
 typedef struct {
     int        src;          /* which source to render                */
     LayoutRect target_crop;  /* destination rect in window pixels     */
     LayoutRect image_crop;   /* source-space crop; all-zero = full    */
+    float      scale;        /* screen pixels per source pixel; 1.0
+                              * is exactly 1:1. Surfaced for the HUD  */
     LayoutOverlay ov[LAYOUT_MAX_OVERLAYS];
     int        n_ov;
 } LayoutPass;
@@ -121,10 +132,40 @@ typedef struct {
  * allocation, no global state. */
 void layout_plan(const LayoutInput *in, LayoutPlan *out);
 
+/* Place a source inside a pane with its aspect ratio preserved.
+ *
+ * This is the one place geometry is decided. It returns the visible
+ * source region and the window rect that region is drawn into, and the
+ * two are the same rectangle scaled by a single factor — so the drawn
+ * aspect always equals the source aspect, in every mode, at every window
+ * size, for every split. There is no separate letterbox pass that some
+ * code path could miss.
+ *
+ * `zoom` <= 0 means fit: the largest scale that gets the whole frame
+ * into the pane. `zoom` > 0 is screen pixels per REFERENCE source pixel,
+ * so 1.0 is exactly 1:1 (against the physical framebuffer, which is what
+ * matters when the question is whether a compression artifact is real).
+ * Passing the source's own size as the reference makes zoom mean 1:1 on
+ * that source.
+ *
+ * `align_x`/`align_y` decide where the leftover space in the pane goes:
+ * 0 = left/top, 0.5 = centred, 1 = right/bottom. A two-pane split aligns
+ * each image toward the seam, so the pair meets in the middle rather
+ * than being pushed apart by the sum of their inner margins.
+ *
+ * Returns the scale actually used, for the HUD to report.
+ *
+ * `out_image` is all-zero when the whole frame is visible, preserving
+ * the convention that lets the renderer leave pl_frame.crop untouched. */
+float layout_fit_pane(int src_w, int src_h, int ref_w, int ref_h,
+                      LayoutRect pane, float zoom, float pan_x, float pan_y,
+                      float align_x, float align_y,
+                      LayoutRect *out_image, LayoutRect *out_target);
+
 /* Visible source rect for a given zoom/pan, in the pixels of a source
- * of size (src_w, src_h). Exposed separately because the probe needs
- * the same mapping to turn a window coordinate back into a source
- * pixel.
+ * of size (src_w, src_h). A thin wrapper over layout_fit_pane that
+ * discards the target rect; kept because the probe needs the same
+ * mapping to turn a window coordinate back into a source pixel.
  *
  * `ref_w`/`ref_h` are the reference geometry that zoom is expressed
  * against. Passing the source's own size makes zoom mean "1:1 source

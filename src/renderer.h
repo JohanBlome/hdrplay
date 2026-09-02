@@ -19,8 +19,8 @@ typedef struct Renderer {
     pl_vk_inst          vk_inst;
     pl_vulkan           vulkan;
     pl_swapchain        swapchain;
-    pl_renderer         renderer;       /* HDR path / main render        */
-    pl_renderer         renderer_sdr;   /* SDR-to-intermediate path      */
+    pl_renderer         renderer;       /* swapchain passes, always      */
+    pl_renderer         renderer_inter; /* intermediates, always         */
 
     /* Per-source GPU state. Two sources means two sets of upload
      * textures and two intermediates: sharing one intermediate across
@@ -46,6 +46,10 @@ typedef struct Renderer {
          * swapchain peak. */
         pl_tex inter_tex;
         int    inter_w, inter_h, inter_mask;
+        /* Window-space rect the image occupies inside the texture. The
+         * mask is rebaked when this moves, since alpha outside it is
+         * forced to 0 to letterbox the pane. */
+        struct pl_rect2df inter_dst;
         bool   mapped;
         struct pl_frame image;
     } slot[2];
@@ -148,6 +152,12 @@ typedef struct Renderer {
     char   last_output_csp[128];
     char   last_source_csp[128];   /* primaries/transfer/peak from AVFrame */
     int    last_num_passes;
+
+    /* Screen pixels per source pixel for the focused pane, as last
+     * planned. Reported by the HUD: "is this actually 1:1?" is not
+     * answerable by eye, and at anything below 1:1 a resampler sits
+     * between you and the artifact you are trying to judge. */
+    float  last_scale;
 
     /* Per-frame source brightness statistics. Updated each frame by
      * probe_frame_stats(). Lets the HUD show peak/dr/% above SDR so

@@ -5,7 +5,7 @@
 /* Panel geometry, mirrored from hud.c. Layout needs the rects to decide
  * which pass each panel belongs to; hud.c owns the drawing. */
 #define STATUS_W  460
-#define STATUS_H  340
+#define STATUS_H  364
 #define SESSION_W 440
 #define SESSION_H 200
 #define LABEL_W   200
@@ -62,44 +62,93 @@ void layout_unrotate_norm(int rot, double *x, double *y)
     }
 }
 
-LayoutRect layout_image_crop_ref(int src_w, int src_h,
-                                 int ref_w, int ref_h,
-                                 int dst_w, int dst_h,
-                                 float zoom, float pan_x, float pan_y)
+float layout_fit_pane(int src_w, int src_h, int ref_w, int ref_h,
+                      LayoutRect pane, float zoom, float pan_x, float pan_y,
+                      float align_x, float align_y,
+                      LayoutRect *out_image, LayoutRect *out_target)
 {
-    /* zoom <= 0 means "fit": the whole source. Represented as an
-     * all-zero rect so callers can leave pl_frame.crop untouched and get
-     * libplacebo's default behaviour, which is what single-file mode
-     * does today. */
-    if (zoom <= 0.0f) return rect(0, 0, 0, 0);
+    float pane_w = pane.x1 - pane.x0;
+    float pane_h = pane.y1 - pane.y0;
+
+    if (src_w <= 0 || src_h <= 0 || pane_w <= 0.0f || pane_h <= 0.0f) {
+        *out_image  = rect(0, 0, 0, 0);
+        *out_target = pane;
+        return 1.0f;
+    }
     if (ref_w <= 0 || ref_h <= 0) { ref_w = src_w; ref_h = src_h; }
 
-    /* Work out the visible region as a FRACTION of the reference
-     * geometry, then apply that fraction to this source. Two files of
-     * different resolutions therefore show the same part of the scene,
-     * rather than the same pixel count — at 1:1 a 1080p pane would
-     * otherwise cover four times the area of a 4K one, which makes the
-     * two panes uncomparable exactly when you have zoomed in to compare
-     * them. */
-    float fw = (float)dst_w / zoom / (float)ref_w;
-    float fh = (float)dst_h / zoom / (float)ref_h;
-    if (fw >= 1.0f && fh >= 1.0f) return rect(0, 0, 0, 0);
-    if (fw > 1.0f) fw = 1.0f;
-    if (fh > 1.0f) fh = 1.0f;
+    /* One number does all the work: screen pixels per source pixel.
+     *
+     * Fit takes the larger scale that still gets the whole frame inside
+     * the pane. Zoom is expressed against the REFERENCE source, not this
+     * one, so that two files of different resolutions cover the same
+     * region of the scene rather than the same pixel count — at 1:1 a
+     * 1080p pane would otherwise show four times the area of a 4K one,
+     * which makes the panes uncomparable exactly when you have zoomed in
+     * to compare them. */
+    float scale;
+    if (zoom > 0.0f) {
+        scale = zoom * (float)ref_w / (float)src_w;
+    } else {
+        float sx = pane_w / (float)src_w;
+        float sy = pane_h / (float)src_h;
+        scale = sx < sy ? sx : sy;
+    }
+    if (!(scale > 0.0f)) scale = 1.0f;
 
-    float vis_w = fw * (float)src_w;
-    float vis_h = fh * (float)src_h;
+    /* Visible source region: as much as the pane holds at that scale,
+     * never more than exists. Clamping here rather than after scaling is
+     * what makes the target below fit the pane by construction, with no
+     * second clamp that could disagree with this one. */
+    float vis_w = pane_w / scale;
+    float vis_h = pane_h / scale;
+    if (vis_w > (float)src_w) vis_w = (float)src_w;
+    if (vis_h > (float)src_h) vis_h = (float)src_h;
 
     float x0 = pan_x * (float)src_w - vis_w * 0.5f;
     float y0 = pan_y * (float)src_h - vis_h * 0.5f;
-
-    /* Clamp so the visible rect stays inside the source. */
     if (x0 < 0.0f) x0 = 0.0f;
     if (y0 < 0.0f) y0 = 0.0f;
     if (x0 + vis_w > (float)src_w) x0 = (float)src_w - vis_w;
     if (y0 + vis_h > (float)src_h) y0 = (float)src_h - vis_h;
 
-    return rect(x0, y0, x0 + vis_w, y0 + vis_h);
+    /* The whole frame keeps the all-zero convention, so pl_frame.crop is
+     * left untouched exactly as before. */
+    if (vis_w >= (float)src_w && vis_h >= (float)src_h)
+        *out_image = rect(0, 0, 0, 0);
+    else
+        *out_image = rect(x0, y0, x0 + vis_w, y0 + vis_h);
+
+    /* Target aspect == crop aspect, always: both are the same rect times
+     * one scalar. That identity IS the aspect guarantee — there is no
+     * separate letterbox step that could be skipped on some path. */
+    float tw = vis_w * scale;
+    float th = vis_h * scale;
+
+    /* Where the slack goes. 0.5 centres; a two-pane split pushes each
+     * image toward the seam so the two meet in the middle instead of
+     * being separated by the sum of their inner margins. */
+    if (align_x < 0.0f) align_x = 0.0f;
+    if (align_x > 1.0f) align_x = 1.0f;
+    if (align_y < 0.0f) align_y = 0.0f;
+    if (align_y > 1.0f) align_y = 1.0f;
+    float ox = (pane_w - tw) * align_x;
+    float oy = (pane_h - th) * align_y;
+    *out_target = rect(pane.x0 + ox,      pane.y0 + oy,
+                       pane.x0 + ox + tw, pane.y0 + oy + th);
+    return scale;
+}
+
+LayoutRect layout_image_crop_ref(int src_w, int src_h,
+                                 int ref_w, int ref_h,
+                                 int dst_w, int dst_h,
+                                 float zoom, float pan_x, float pan_y)
+{
+    LayoutRect img, tgt;
+    layout_fit_pane(src_w, src_h, ref_w, ref_h,
+                    rect(0, 0, (float)dst_w, (float)dst_h),
+                    zoom, pan_x, pan_y, 0.5f, 0.5f, &img, &tgt);
+    return img;
 }
 
 LayoutRect layout_image_crop(int src_w, int src_h, int dst_w, int dst_h,
@@ -189,16 +238,18 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
 {
     int ref = layout_reference_source(in);
     LayoutRect full = rect(0, 0, (float)in->win_w, (float)in->win_h);
-    LayoutRect img  = layout_image_crop_ref(in->src_w[src], in->src_h[src],
-                                            in->src_w[ref], in->src_h[ref],
-                                            in->win_w, in->win_h,
-                                            in->zoom, in->pan_x, in->pan_y);
+    LayoutRect img, tgt;
+    float scale = layout_fit_pane(in->src_w[src], in->src_h[src],
+                                  in->src_w[ref], in->src_h[ref],
+                                  full, in->zoom, in->pan_x, in->pan_y,
+                                  0.5f, 0.5f, &img, &tgt);
 
     LayoutPass *p = &out->pass[0];
     out->n_pass   = 1;
     p->src         = src;
-    p->target_crop = full;
+    p->target_crop = tgt;
     p->image_crop  = img;
+    p->scale       = scale;
 
     if (in->mode != HDRPLAY_MODE_HDR) {
         out->inter[0] = (LayoutInter){
@@ -206,6 +257,8 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
             .mask = (in->mode == HDRPLAY_MODE_SDR)
                     ? ALPHA_MASK_FULL : mask_for_orient(in->orient),
             .sdr  = true,
+            .dst  = tgt,
+            .image_crop = img,
         };
         out->n_inter = 1;
         /* First, so HUD text drawn afterwards is not erased by it: the
@@ -259,21 +312,32 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
          * gets a FULL-mask intermediate of its own. */
         out->n_pass = 1;
         LayoutPass *p = &out->pass[0];
-        p->src         = a;
-        p->target_crop = full;
         int ref = layout_reference_source(in);
-        p->image_crop  = layout_image_crop_ref(in->src_w[a], in->src_h[a],
-                                               in->src_w[ref], in->src_h[ref],
-                                               in->win_w, in->win_h,
-                                               in->zoom, in->pan_x, in->pan_y);
+        LayoutRect ia, ta, ib_, tb;
+        p->src   = a;
+        p->scale = layout_fit_pane(in->src_w[a], in->src_h[a],
+                                   in->src_w[ref], in->src_h[ref],
+                                   full, in->zoom, in->pan_x, in->pan_y,
+                                   0.5f, 0.5f, &ia, &ta);
+        p->target_crop = ta;
+        p->image_crop  = ia;
+
+        /* B fills the same pane, so it is fitted independently — two
+         * files of different aspect each keep their own. */
+        layout_fit_pane(in->src_w[b], in->src_h[b],
+                        in->src_w[ref], in->src_h[ref],
+                        full, in->zoom, in->pan_x, in->pan_y,
+                        0.5f, 0.5f, &ib_, &tb);
 
         if (sdr) {
-            out->inter[out->n_inter++] =
-                (LayoutInter){ .src = a, .mask = ALPHA_MASK_FULL, .sdr = true };
+            out->inter[out->n_inter++] = (LayoutInter){
+                .src = a, .mask = ALPHA_MASK_FULL, .sdr = true,
+                .dst = ta, .image_crop = ia };
             add_ov(p, LAYOUT_OV_INTERMEDIATE, a, full);
         }
-        out->inter[out->n_inter++] =
-            (LayoutInter){ .src = b, .mask = ALPHA_MASK_DIAG, .sdr = sdr };
+        out->inter[out->n_inter++] = (LayoutInter){
+            .src = b, .mask = ALPHA_MASK_DIAG, .sdr = sdr,
+            .dst = tb, .image_crop = ib_ };
         add_ov(p, LAYOUT_OV_INTERMEDIATE, b, full);
 
         if (!in->hud_hidden)   add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
@@ -298,36 +362,50 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
         out->name = "AB-LR";
     }
 
-    int pane_w = (int)(ca.x1 - ca.x0);
-    int pane_h = (int)(ca.y1 - ca.y0);
     int ref = layout_reference_source(in);
 
-    /* One crop per source: the same FRACTION of each frame, resolved
-     * into that source's own pixels. Sharing a single rect would express
-     * pane B's crop in pane A's pixel space, which is silently wrong the
-     * moment the two files differ in resolution. */
-    LayoutRect ia = layout_image_crop_ref(in->src_w[a], in->src_h[a],
-                                          in->src_w[ref], in->src_h[ref],
-                                          pane_w, pane_h,
-                                          in->zoom, in->pan_x, in->pan_y);
-    LayoutRect ib_ = layout_image_crop_ref(in->src_w[b], in->src_h[b],
-                                           in->src_w[ref], in->src_h[ref],
-                                           pane_w, pane_h,
-                                           in->zoom, in->pan_x, in->pan_y);
+    /* One fit per source: the same FRACTION of each frame, resolved into
+     * that source's own pixels, and its own letterbox inside its own
+     * half. Sharing a single rect would express pane B's crop in pane
+     * A's pixel space, which is silently wrong the moment the two files
+     * differ in resolution — or, now, in aspect. */
+    /* Justify toward the seam: under LR pane A goes hard right and B
+     * hard left, so the two images touch in the middle. Centring each in
+     * its own half instead separates them by the sum of the two inner
+     * margins, which for portrait content in a left/right split is a
+     * wide black gutter down the centre — exactly between the two things
+     * you are trying to compare. */
+    float ax = 0.5f, ay = 0.5f, bx = 0.5f, by = 0.5f;
+    if (in->orient == HDRPLAY_SPLIT_TB) { ay = 1.0f; by = 0.0f; }
+    else                                { ax = 1.0f; bx = 0.0f; }
+
+    LayoutRect ia, ta, ib_, tb;
+    float sa_ = layout_fit_pane(in->src_w[a], in->src_h[a],
+                                in->src_w[ref], in->src_h[ref],
+                                ca, in->zoom, in->pan_x, in->pan_y,
+                                ax, ay, &ia, &ta);
+    float sb_ = layout_fit_pane(in->src_w[b], in->src_h[b],
+                                in->src_w[ref], in->src_h[ref],
+                                cb, in->zoom, in->pan_x, in->pan_y,
+                                bx, by, &ib_, &tb);
 
     out->n_pass = 2;
     LayoutPass *pa = &out->pass[0];
     LayoutPass *pb = &out->pass[1];
-    pa->src = a; pa->target_crop = ca; pa->image_crop = ia;
-    pb->src = b; pb->target_crop = cb; pb->image_crop = ib_;
+    pa->src = a; pa->target_crop = ta; pa->image_crop = ia; pa->scale = sa_;
+    pb->src = b; pb->target_crop = tb; pb->image_crop = ib_; pb->scale = sb_;
 
     if (sdr) {
-        out->inter[out->n_inter++] =
-            (LayoutInter){ .src = a, .mask = ALPHA_MASK_FULL, .sdr = true };
-        out->inter[out->n_inter++] =
-            (LayoutInter){ .src = b, .mask = ALPHA_MASK_FULL, .sdr = true };
-        add_ov(pa, LAYOUT_OV_INTERMEDIATE, a, ca);
-        add_ov(pb, LAYOUT_OV_INTERMEDIATE, b, cb);
+        out->inter[out->n_inter++] = (LayoutInter){
+            .src = a, .mask = ALPHA_MASK_FULL, .sdr = true,
+            .dst = ta, .image_crop = ia };
+        out->inter[out->n_inter++] = (LayoutInter){
+            .src = b, .mask = ALPHA_MASK_FULL, .sdr = true,
+            .dst = tb, .image_crop = ib_ };
+        /* Whole window for both: each intermediate is window-sized and
+         * already positioned, with alpha 0 outside its own pane. */
+        add_ov(pa, LAYOUT_OV_INTERMEDIATE, a, full);
+        add_ov(pb, LAYOUT_OV_INTERMEDIATE, b, full);
     }
 
     /* Route each panel to the pass whose crop contains it. Panels are

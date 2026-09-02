@@ -303,13 +303,28 @@ bool renderer_init(Renderer *r, int width, int height, const char *title, int di
 
     r->renderer = pl_renderer_create(r->pl_log, r->vulkan->gpu);
     if (!r->renderer) { LOG("GPU", "ERROR: pl_renderer_create"); return false; }
-    /* Separate renderer instance for the SDR-to-intermediate pass.
-     * Each pl_renderer caches its compiled shaders against the specific
-     * (source, target, params) signature. Reusing one renderer for both
-     * HDR and SDR passes caused 50-100 ms of shader-LUT regeneration
-     * every frame as it ping-ponged between the two configurations. */
-    r->renderer_sdr = pl_renderer_create(r->pl_log, r->vulkan->gpu);
-    if (!r->renderer_sdr) { LOG("GPU", "ERROR: pl_renderer_create (sdr)"); return false; }
+    /* Separate renderer instance for EVERY intermediate render, SDR or
+     * HDR. Each pl_renderer caches its compiled shaders against the
+     * specific (source, target, params) signature, so alternating one
+     * renderer between two configurations regenerates shader LUTs — 50
+     * to 100 ms per frame when this was first hit on the SDR pass.
+     *
+     * The split is by TARGET, not by colour treatment. Intermediates
+     * render into an RGBA texture with blend_params set (keep_alpha, so
+     * the pre-baked mask survives); swapchain passes render without
+     * blending. blend_params is part of that cached signature, and it is
+     * the only thing stopping the render from overwriting the alpha
+     * mask — so a renderer that ping-pongs between the two is not just
+     * slow, it loses the mask, and the pane composites fully opaque.
+     *
+     * That was the two-file diagonal wipe: it was the sole user of the
+     * HDR intermediate, which went through r->renderer and so shared an
+     * instance with the swapchain pass. Source B came out opaque
+     * everywhere and covered A completely. Single-file DIAG was fine
+     * because its intermediate is SDR and already had a dedicated
+     * renderer. Keep every intermediate on this one. */
+    r->renderer_inter = pl_renderer_create(r->pl_log, r->vulkan->gpu);
+    if (!r->renderer_inter) { LOG("GPU", "ERROR: pl_renderer_create (inter)"); return false; }
 
     renderer_update_display_state(r);
     LOG("SWAP", "swapchain ready, HDR signaling %s",
@@ -344,12 +359,30 @@ static inline float alpha_for_mask(int mask_mode, float nx, float ny, float aa)
     }
 }
 
-static void ensure_inter_tex(Renderer *r, int si, int w, int h, int mask_mode)
+static bool rect_same(struct pl_rect2df a, struct pl_rect2df b)
+{
+    return fabsf(a.x0 - b.x0) < 0.51f && fabsf(a.y0 - b.y0) < 0.51f &&
+           fabsf(a.x1 - b.x1) < 0.51f && fabsf(a.y1 - b.y1) < 0.51f;
+}
+
+/* `dst` is the window-space rect the image will actually occupy. Alpha
+ * is forced to 0 outside it, which is what letterboxes the intermediate.
+ *
+ * Doing it here, in the mask, rather than leaving it to libplacebo's
+ * border fill, is deliberate. The mask is uploaded ONCE and thereafter
+ * only survives because render_to_intermediate blends with dst_alpha =
+ * ONE. A border fill covering the letterbox region writes alpha there
+ * and the mask never comes back — the pane then composites opaque and
+ * hides everything under it. Owning the whole alpha channel here means
+ * the render never has to touch a pixel outside `dst`. */
+static void ensure_inter_tex(Renderer *r, int si, int w, int h, int mask_mode,
+                             struct pl_rect2df dst)
 {
     typeof(r->slot[0]) *sl = &r->slot[si];
     bool size_changed = !sl->inter_tex || sl->inter_w != w || sl->inter_h != h;
     bool mask_changed = sl->inter_mask != mask_mode;
-    if (!size_changed && !mask_changed) return;
+    bool dst_changed  = !rect_same(sl->inter_dst, dst);
+    if (!size_changed && !mask_changed && !dst_changed) return;
 
     if (size_changed) {
         if (sl->inter_tex) pl_tex_destroy(r->vulkan->gpu, &sl->inter_tex);
@@ -369,6 +402,7 @@ static void ensure_inter_tex(Renderer *r, int si, int w, int h, int mask_mode)
         if (!sl->inter_tex) { LOG("REND", "ensure_inter_tex: alloc failed"); return; }
     }
     sl->inter_mask = mask_mode;
+    sl->inter_dst  = dst;
 
     pl_fmt fmt = sl->inter_tex->params.format;
     bool is_half = (fmt && strcmp(fmt->name, "rgba16hf") == 0);
@@ -382,6 +416,11 @@ static void ensure_inter_tex(Renderer *r, int si, int w, int h, int mask_mode)
         for (int x = 0; x < w; x++) {
             float nx = (float)x / (float)w;
             float a = alpha_for_mask(mask_mode, nx, ny, aa);
+            /* Outside the drawn rect there is no image, only whatever
+             * the previous frame left behind. Make it invisible. */
+            if ((float)x < dst.x0 || (float)x >= dst.x1 ||
+                (float)y < dst.y0 || (float)y >= dst.y1)
+                a = 0.0f;
 
             size_t idx = ((size_t)y * w + x) * 4;
             if (is_half) {
@@ -473,15 +512,21 @@ static bool render_to_intermediate(
     int si,
     const struct pl_frame *src_image,
     int tw, int th,
+    struct pl_rect2df dst,
     int mask_mode,
     bool sdr,
     float sdr_peak,
     const struct pl_render_params *rp_base)
 {
-    ensure_inter_tex(r, si, tw, th, mask_mode);
+    ensure_inter_tex(r, si, tw, th, mask_mode, dst);
     pl_tex tex = r->slot[si].inter_tex;
     if (!tex) return false;
 
+    /* The texture is window-sized and `dst` is in window space, so the
+     * content lands at the same coordinates it will occupy on screen.
+     * That 1:1 correspondence keeps the pre-baked alpha mask (also
+     * window-space) aligned with the image, and lets the overlay blit
+     * the whole texture to the whole window with no offset. */
     struct pl_frame target = {
         .num_planes = 1,
         .planes = {{
@@ -489,7 +534,7 @@ static bool render_to_intermediate(
             .components        = 4,
             .component_mapping = { 0, 1, 2, 3 },
         }},
-        .crop  = { 0, 0, (float)tw, (float)th },
+        .crop  = dst,
         .repr  = pl_color_repr_rgb,
         .color = pl_color_space_hdr10,
     };
@@ -510,6 +555,14 @@ static bool render_to_intermediate(
     }
 
     struct pl_render_params rp = *rp_base;
+    /* The alpha mask outside `dst` is ours (see ensure_inter_tex) and a
+     * border fill would overwrite it, permanently — the mask is uploaded
+     * once, and only the keep_alpha blend below preserves it thereafter.
+     * This was the regression that broke the HDR/SDR wipe: once the
+     * target crop stopped covering the whole texture, the border fill
+     * started running and the mask went away. */
+    rp.border     = PL_CLEAR_SKIP;
+    rp.background = PL_CLEAR_SKIP;
     static const struct pl_blend_params keep_alpha = {
         .src_rgb   = PL_BLEND_ONE,
         .dst_rgb   = PL_BLEND_ZERO,
@@ -547,7 +600,7 @@ static bool render_to_intermediate(
     LOGV("REND", "%s->intermediate[%d] %dx%d (mask=%d): src.max=%.0fn tgt.max=%.0fn",
          sdr ? "SDR" : "HDR", si, tw, th, mask_mode,
          src_image->color.hdr.max_luma, target.color.hdr.max_luma);
-    return pl_render_image(sdr ? r->renderer_sdr : r->renderer,
+    return pl_render_image(r->renderer_inter,
                            src_image, &target, &rp);
 }
 
@@ -557,14 +610,19 @@ static void make_inter_overlay(
     int si,
     struct pl_overlay *out_overlay,
     struct pl_overlay_part *out_part,
-    int tw, int th,
-    struct pl_rect2df dst_rect,
+    int win_w, int win_h,
     bool sdr,
     float sdr_peak)
 {
+    /* Whole texture -> whole window, 1:1. The texture is window-sized and
+     * holds the image already positioned in window coordinates, with
+     * alpha 0 everywhere it does not cover, so there is nothing to
+     * rescale or offset here. Letterboxing lives in the mask, not in
+     * this rect — which is what keeps this identical for one pane or
+     * two, letterboxed or not. */
     *out_part = (struct pl_overlay_part){
-        .src = { 0, 0, (float)tw, (float)th },
-        .dst = dst_rect,
+        .src = { 0, 0, (float)win_w, (float)win_h },
+        .dst = { 0, 0, (float)win_w, (float)win_h },
     };
     *out_overlay = (struct pl_overlay){
         .tex   = r->slot[si].inter_tex,
@@ -574,6 +632,12 @@ static void make_inter_overlay(
         .repr  = pl_color_repr_rgb,
         .color = pl_color_space_hdr10,
     };
+    /* Do NOT set repr.alpha here. Declaring PL_ALPHA_INDEPENDENT looks
+     * more correct than leaving it PL_ALPHA_UNKNOWN — the mask really is
+     * a separate channel — but it changes how libplacebo composites and
+     * broke the single-file HDR/SDR wipe that had worked for months.
+     * The default is load-bearing. Leave it alone. */
+
     /* CRITICAL: pl_color_space_hdr10 leaves max_luma=0, which kicks
      * libplacebo's overlay compositor into a heuristic that renormalizes
      * our intermediate's PQ codes against an assumed max (usually the
@@ -728,34 +792,61 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         snprintf(last_plan, sizeof(last_plan), "%s", plan_desc);
     }
 
+    for (int i = 0; i < plan.n_pass; i++)
+        if (plan.pass[i].src == focus) { r->last_scale = plan.pass[i].scale; break; }
+
     /* The probe maps a window coordinate back to a source pixel, so it
      * has to account for zoom/pan the same way the render does. */
     if (r->probe_active && r->probe_x >= 0 && r->probe_y >= 0 &&
         r->probe_win_w > 0 && r->probe_win_h > 0)
     {
         AVFrame *pf = sources[focus].shown;
-        LayoutRect ic = plan.pass[0].image_crop;
-        double fx = (double)r->probe_x / r->probe_win_w;
-        double fy = (double)r->probe_y / r->probe_win_h;
-        /* Window space is rotated; the crop below is not. */
-        layout_unrotate_norm(r->rotation[focus], &fx, &fy);
-        int sx, sy;
-        if (rect_is_zero(ic)) {
-            sx = (int)(fx * pf->width);
-            sy = (int)(fy * pf->height);
-        } else {
-            sx = (int)(ic.x0 + fx * (ic.x1 - ic.x0));
-            sy = (int)(ic.y0 + fy * (ic.y1 - ic.y0));
-        }
-        ProbeResult pr;
-        if (probe_sample(pf, sx, sy, &pr)) {
-            r->probe_nits   = pr.luma_nits;
-            r->probe_y_norm = pr.y_norm;
-            r->probe_r_nits = pr.r_nits;
-            r->probe_g_nits = pr.g_nits;
-            r->probe_b_nits = pr.b_nits;
-        } else {
+
+        /* The pass that actually draws the focused source. Under a
+         * two-pane split that is not always pass 0, and now that each
+         * pass has its own letterboxed rect, using the wrong one puts
+         * the readout in the wrong pane. */
+        const LayoutPass *fp = &plan.pass[0];
+        for (int i = 0; i < plan.n_pass; i++)
+            if (plan.pass[i].src == focus) { fp = &plan.pass[i]; break; }
+
+        /* Cursor in window pixels, rescaled if the window changed size
+         * between the motion event and now. */
+        double wx = (double)r->probe_x * win_w / r->probe_win_w;
+        double wy = (double)r->probe_y * win_h / r->probe_win_h;
+
+        LayoutRect t = fp->target_crop;
+        double tw = t.x1 - t.x0, th = t.y1 - t.y0;
+        double fx = tw > 0 ? (wx - t.x0) / tw : -1.0;
+        double fy = th > 0 ? (wy - t.y0) / th : -1.0;
+
+        if (fx < 0.0 || fx > 1.0 || fy < 0.0 || fy > 1.0) {
+            /* Over a letterbox bar or the other pane — no source pixel
+             * there. Reporting the nearest edge pixel instead would be a
+             * confident answer about something not on screen. */
             r->probe_nits = NAN;
+        } else {
+            /* Window space is rotated; the crop below is not. */
+            layout_unrotate_norm(r->rotation[focus], &fx, &fy);
+            LayoutRect ic = fp->image_crop;
+            int sx, sy;
+            if (rect_is_zero(ic)) {
+                sx = (int)(fx * pf->width);
+                sy = (int)(fy * pf->height);
+            } else {
+                sx = (int)(ic.x0 + fx * (ic.x1 - ic.x0));
+                sy = (int)(ic.y0 + fy * (ic.y1 - ic.y0));
+            }
+            ProbeResult pr;
+            if (probe_sample(pf, sx, sy, &pr)) {
+                r->probe_nits   = pr.luma_nits;
+                r->probe_y_norm = pr.y_norm;
+                r->probe_r_nits = pr.r_nits;
+                r->probe_g_nits = pr.g_nits;
+                r->probe_b_nits = pr.b_nits;
+            } else {
+                r->probe_nits = NAN;
+            }
         }
     }
 
@@ -766,10 +857,23 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     for (int i = 0; i < plan.n_inter; i++) {
         int si = plan.inter[i].src;
         if (si < 0 || si >= n || !r->slot[si].mapped) continue;
-        if (!render_to_intermediate(r, si, &r->slot[si].image, win_w, win_h,
+        /* Same crop the corresponding pass uses, or the intermediate
+         * would draw the whole frame into a rect sized for a cropped
+         * one — i.e. stretch by exactly the zoom factor. */
+        struct pl_frame img = r->slot[si].image;
+        if (!rect_is_zero(plan.inter[i].image_crop))
+            img.crop = to_pl_rect(plan.inter[i].image_crop);
+        if (!render_to_intermediate(r, si, &img, win_w, win_h,
+                                    to_pl_rect(plan.inter[i].dst),
                                     plan.inter[i].mask, plan.inter[i].sdr,
                                     sdr_peak, &rp))
             LOG("REND", "render_to_intermediate(%d) failed", si);
+        else
+            LOGV("REND", "inter[%d] src=%d mask=%d sdr=%d dst=[%.0f,%.0f %.0fx%.0f]",
+                 i, si, plan.inter[i].mask, plan.inter[i].sdr,
+                 plan.inter[i].dst.x0, plan.inter[i].dst.y0,
+                 plan.inter[i].dst.x1 - plan.inter[i].dst.x0,
+                 plan.inter[i].dst.y1 - plan.inter[i].dst.y0);
     }
 
     /* 2. Swapchain passes.
@@ -818,8 +922,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
                 for (int k = 0; k < plan.n_inter; k++)
                     if (plan.inter[k].src == si) sdr = plan.inter[k].sdr;
                 make_inter_overlay(r, si, &ov_store[n_ov], &ov_parts[n_ov],
-                                   win_w, win_h, to_pl_rect(ov->dst),
-                                   sdr, sdr_peak);
+                                   win_w, win_h, sdr, sdr_peak);
                 n_ov++;
                 break;
             }
@@ -877,7 +980,7 @@ void renderer_close(Renderer *r)
         hud_close(r->vulkan->gpu);
     }
     if (r->renderer)     pl_renderer_destroy(&r->renderer);
-    if (r->renderer_sdr) pl_renderer_destroy(&r->renderer_sdr);
+    if (r->renderer_inter) pl_renderer_destroy(&r->renderer_inter);
     if (r->swapchain) pl_swapchain_destroy(&r->swapchain);
     if (r->vulkan)    pl_vulkan_destroy(&r->vulkan);
     if (r->vk_inst)   pl_vk_inst_destroy(&r->vk_inst);
