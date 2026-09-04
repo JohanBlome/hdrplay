@@ -102,6 +102,14 @@ typedef struct {
     double   p1, p50, p99, p99_9;
     double   dr_stops;        /* log2(p99.9 / p1)                      */
 
+    /* Most dynamic range this coding could express, from the transfer,
+     * bit depth and signal range. dr_stops above it is not a property
+     * of the content — it means p1 sits in the quantization floor.
+     * 0 when no frames were measured. */
+    double   dr_ceiling_stops;
+    int      bit_depth;
+    bool     full_range;
+
     double   spatial_stops;   /* sqrt(mean within-frame variance)      */
     double   temporal_stops;  /* sqrt(variance of frame means)         */
     double   total_stops;     /* sqrt(spatial^2 + temporal^2)          */

@@ -245,6 +245,8 @@ static void usage(void)
         "  --split-tb            split top/bottom instead of left/right\n"
         "  --split-diag          diagonal split: HDR upper-left, SDR lower-right\n"
         "                        — best demo of what 'broken HDR' looks like\n"
+        "  --split-wipe-lr       two inputs: full-frame left/right wipe\n"
+        "  --split-wipe-tb       two inputs: full-frame top/bottom wipe\n"
         "  --loop                rewind to start on EOF instead of quitting\n"
         "  --rotate [N:]DEG      rotate an input DEG degrees clockwise\n"
         "                        before display. DEG is 0, 90, 180 or 270.\n"
@@ -288,7 +290,8 @@ static void usage(void)
         "                            mask the gamut-narrowing advantage HDR\n"
         "                            has over SDR)\n"
         "  keys at runtime:      F=fullscreen  H=HDR  S=SDR  P=split\n"
-        "                        O=toggle split orientation  SPACE=pause\n"
+        "                        O=cycle pane layouts / comparison wipes\n"
+        "                          SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
         "                        M=toggle luminance probe (mouse → nits)\n"
         "                        I=show/hide top-left status HUD\n"
@@ -332,6 +335,25 @@ static void usage(void)
         "  --stride N            sample every Nth pixel in both axes.\n"
         "                        Default 1 = exact. Only 1 makes the\n"
         "                        MaxCLL comparison a true maximum.\n"
+        "  --sdr-black NITS      BT.1886 black level assumed when\n"
+        "                        measuring SDR sources. Default 0.1\n"
+        "                        (reference 100-nit / 1000:1 monitor),\n"
+        "                        which caps SDR dynamic range at a\n"
+        "                        physical 10 stops. 0 = bare 100*V^2.4\n"
+        "                        with no floor, where the darkest code\n"
+        "                        tends to zero and p99.9/p1 reports the\n"
+        "                        quantization lattice (up to 18.7 stops\n"
+        "                        on 8-bit) rather than the picture.\n"
+        "  --range MODE          colour range for the source:\n"
+        "                          auto (default) = trust the container,\n"
+        "                            and when it declares none, recover\n"
+        "                            it from the pixels — a limited-range\n"
+        "                            encode has a hard floor at code 16,\n"
+        "                            a full-range one does not\n"
+        "                          limited / full = force it\n"
+        "                        Matters most in the shadows: reading a\n"
+        "                        full-range source as limited buries\n"
+        "                        codes 1-15 in 'black'.\n"
         "  --hlg-peak NITS       nominal display peak assumed when\n"
         "                        converting HLG scene light to display\n"
         "                        light. Default: the file's mastering\n"
@@ -423,6 +445,8 @@ int main(int argc, char **argv)
     bool  analyze_json = false;
     int   analyze_stride = 1;         /* exact by default; offline, so affordable */
     double hlg_peak = 0.0;            /* 0 = take mastering display, else 1000 */
+    double sdr_black_nits = -1.0;     /* <0 = leave probe.c's BT.1886 default */
+    enum AVColorRange range_override = AVCOL_RANGE_UNSPECIFIED;  /* auto */
     const char *stats_path = NULL;
     const char *paths[2] = { NULL, NULL };
     int   n_paths = 0;
@@ -439,6 +463,17 @@ int main(int argc, char **argv)
             analyze_stride = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hlg-peak") && i+1 < argc)
             hlg_peak = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--sdr-black") && i+1 < argc)
+            sdr_black_nits = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--range") && i+1 < argc) {
+            const char *m = argv[++i];
+            if      (!strcmp(m, "auto"))    range_override = AVCOL_RANGE_UNSPECIFIED;
+            else if (!strcmp(m, "limited")) range_override = AVCOL_RANGE_MPEG;
+            else if (!strcmp(m, "tv"))      range_override = AVCOL_RANGE_MPEG;
+            else if (!strcmp(m, "full"))    range_override = AVCOL_RANGE_JPEG;
+            else if (!strcmp(m, "pc"))      range_override = AVCOL_RANGE_JPEG;
+            else { fprintf(stderr, "unknown --range mode: %s\n", m); usage(); return 2; }
+        }
         else if (!strcmp(argv[i], "--stats-file") && i+1 < argc)
             stats_path = argv[++i];
         else if (!strcmp(argv[i], "--step-buffer") && i+1 < argc)
@@ -448,6 +483,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--split-tb"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_TB; split_explicit = true; }
         else if (!strcmp(argv[i], "--split-lr"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_LR; split_explicit = true; }
         else if (!strcmp(argv[i], "--split-diag")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_DIAG; split_explicit = true; }
+        else if (!strcmp(argv[i], "--split-wipe-lr")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_WIPE_LR; split_explicit = true; }
+        else if (!strcmp(argv[i], "--split-wipe-tb")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_WIPE_TB; split_explicit = true; }
         else if (!strcmp(argv[i], "--loop"))     loop_at_eof = true;
         else if (!strcmp(argv[i], "--rotate") && i+1 < argc) {
             if (!parse_rotate(argv[++i], rotation)) return 2;
@@ -480,6 +517,8 @@ int main(int argc, char **argv)
     }
 
     if (hlg_peak > 0.0) probe_set_hlg_peak_override(hlg_peak);
+    if (sdr_black_nits >= 0.0) probe_set_sdr_black_nits(sdr_black_nits);
+    decoder_set_range_override(range_override);
 
     ensure_moltenvk_icd();
     /* Silence MoltenVK's 150-line extension dump unless user asks for it.
@@ -589,9 +628,11 @@ int main(int argc, char **argv)
     }
 
     const char *orient_name =
-        start_orient == HDRPLAY_SPLIT_TB   ? " (top/bottom)" :
-        start_orient == HDRPLAY_SPLIT_DIAG ? " (diagonal)"   :
-                                             " (left/right)";
+        rend.split_orient == HDRPLAY_SPLIT_TB      ? " (panes top/bottom)" :
+        rend.split_orient == HDRPLAY_SPLIT_DIAG    ? " (diagonal wipe)"   :
+        rend.split_orient == HDRPLAY_SPLIT_WIPE_LR ? " (left/right wipe)" :
+        rend.split_orient == HDRPLAY_SPLIT_WIPE_TB ? " (top/bottom wipe)" :
+                                                     " (panes left/right)";
     LOG("REND", "starting in mode: %s%s",
         rend.mode == HDRPLAY_MODE_HDR   ? "HDR" :
         rend.mode == HDRPLAY_MODE_SDR   ? "SDR" : "SPLIT",
@@ -651,10 +692,14 @@ int main(int argc, char **argv)
                 if (e.key.key == SDLK_S) { rend.mode = HDRPLAY_MODE_SDR;   LOG("REND", "mode -> SDR"); }
                 if (e.key.key == SDLK_P) { rend.mode = HDRPLAY_MODE_SPLIT; LOG("REND", "mode -> SPLIT"); }
                 if (e.key.key == SDLK_O) {
-                    rend.split_orient = (rend.split_orient + 1) % 3;
+                    rend.split_orient = layout_next_split_orient(
+                        rend.split_orient, rend.n_sources > 1 && rend.solo < 0);
                     LOG("REND", "split orientation -> %s",
-                        rend.split_orient == HDRPLAY_SPLIT_LR   ? "left/right" :
-                        rend.split_orient == HDRPLAY_SPLIT_TB   ? "top/bottom" : "diagonal");
+                        rend.split_orient == HDRPLAY_SPLIT_LR      ? "panes left/right" :
+                        rend.split_orient == HDRPLAY_SPLIT_TB      ? "panes top/bottom" :
+                        rend.split_orient == HDRPLAY_SPLIT_DIAG    ? "diagonal wipe" :
+                        rend.split_orient == HDRPLAY_SPLIT_WIPE_LR ? "left/right wipe" :
+                                                                    "top/bottom wipe");
                 }
                 if (e.key.key == SDLK_SPACE) {
                     paused = !paused;
@@ -944,10 +989,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < n_sources; i++) {
         char title[512];
         snprintf(title, sizeof(title), "session (playback)  %s", sources[i].label);
-        analyze_print_session(&sources[i].session,
-                              sources[i].dec.has_cll ? sources[i].dec.cll_max : -1,
-                              sources[i].dec.has_cll ? sources[i].dec.cll_avg : -1,
-                              title);
+        analyze_print_session(&sources[i].session, &sources[i].dec, title);
     }
 
     renderer_close(&rend);

@@ -38,7 +38,7 @@ typedef struct Renderer {
         /* Overlay intermediate. The pass renders into this RGBA texture
          * (with blend_params that preserve dst.alpha). The alpha channel
          * is pre-filled with a mask: FULL (opaque everywhere), LR / TB
-         * (hard edge halves), or DIAG (smooth antialiased diagonal). It
+         * (hard-edge full-frame wipes), or DIAG (smooth antialiased diagonal). It
          * then composites via pl_overlay — and crucially, overlay
          * composition bypasses libplacebo's tone-mapping pipeline, so
          * absolute PQ-encoded SDR brightness (~203 nits) actually lands

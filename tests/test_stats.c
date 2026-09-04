@@ -229,20 +229,183 @@ static void test_black_and_underflow(void)
     CHECK(fs.luma.valid == (uint64_t)fs.samples, "PQ near-black is in a real bin");
     av_frame_free(&g);
 
-    /* SDR: the same code is 8.7e-6 nits — below the histogram floor.
-     * This is where the underflow bucket earns its keep: without it
-     * these samples would pile into clamp-bin 0 at a nominal 1.5e-5
-     * nits and drag p1 down to a near-constant, making the dynamic
-     * range figure meaningless on every SDR clip. */
+    /* SDR at the BT.1886 default: the same code sits just above the
+     * 0.1-nit black level, so it is an ordinary low bin. That is the
+     * point of having a floor — the darkest codes stay resolvable
+     * instead of collapsing toward zero. */
     AVFrame *sdr = mkframe(AV_PIX_FMT_YUV420P10LE, 32, 32,
                            AVCOL_TRC_BT709, 65);
     CHECK(probe_frame_stats(sdr, 1, PROBE_LUMA_ONLY, &fs), "SDR near-black measured");
     CHECK(fs.luma.black == 0, "SDR near-black not counted as black");
+    CHECK(fs.luma.underflow == 0, "BT.1886 floor keeps SDR near-black resolvable");
+    CHECK(fs.luma.valid == (uint64_t)fs.samples,
+          "SDR near-black is in a real bin");
+    CHECK(NEAR(fs.peak_nits, 0.105, 0.01),
+          "SDR near-black reads %.4fN, just above the 0.1N floor", fs.peak_nits);
+
+    /* With the floor removed it is 8.7e-6 nits, below the bottom of the
+     * histogram. This is where the underflow bucket earns its keep:
+     * without it these samples would pile into clamp-bin 0 at a nominal
+     * 1.5e-5 nits and drag p1 down to a near-constant, making the
+     * dynamic range figure meaningless on every SDR clip. */
+    probe_set_sdr_black_nits(0.0);
+    CHECK(probe_frame_stats(sdr, 1, PROBE_LUMA_ONLY, &fs),
+          "SDR near-black measured with no floor");
     CHECK(fs.luma.underflow == (uint64_t)fs.samples,
-          "SDR near-black counted as underflow (%llu), kept out of percentiles",
-          (unsigned long long)fs.luma.underflow);
-    CHECK(fs.luma.valid == 0, "SDR near-black excluded from the percentile population");
+          "floorless SDR near-black counted as underflow (%llu), kept out "
+          "of percentiles", (unsigned long long)fs.luma.underflow);
+    CHECK(fs.luma.valid == 0,
+          "floorless SDR near-black excluded from the percentile population");
+    probe_set_sdr_black_nits(0.1);
     av_frame_free(&sdr);
+}
+
+static void test_sdr_black_level(void)
+{
+    puts("BT.1886 black level anchors the SDR transfer");
+    /* The two endpoints are the definition of the curve: L(0) = L_B and
+     * L(1) = L_W. Everything the dynamic-range figure rests on follows
+     * from the first of those being non-zero. */
+    probe_set_sdr_black_nits(0.1);
+    CHECK(NEAR(sdr_eotf(0.0), 0.1, 1e-9), "L(0) = %.6fN (expect 0.1)", sdr_eotf(0.0));
+    CHECK(NEAR(sdr_eotf(1.0), 100.0, 1e-9), "L(1) = %.4fN (expect 100)", sdr_eotf(1.0));
+    CHECK(sdr_eotf(0.5) > 0.0 && sdr_eotf(0.5) < 100.0, "monotone in between");
+
+    probe_set_sdr_black_nits(0.0);
+    CHECK(NEAR(sdr_eotf(0.0), 0.0, 1e-12), "L_B=0 -> L(0) = 0");
+    CHECK(NEAR(sdr_eotf(0.5), 100.0 * pow(0.5, 2.4), 1e-9),
+          "L_B=0 collapses to the bare 100*V^2.4");
+    probe_set_sdr_black_nits(0.1);
+}
+
+static void test_dr_ceiling(void)
+{
+    puts("dynamic-range ceiling bounds what a coding can express");
+    probe_set_sdr_black_nits(0.1);
+
+    /* 8-bit limited SDR. The darkest non-black code is 17, one step up
+     * from black in a 219-code window; against 100-nit white that is
+     * just under the 10 stops the 0.1-nit floor allows outright. */
+    double c8 = probe_dr_ceiling_stops(AVCOL_TRC_BT709, 8, false, 0.0);
+    CHECK(NEAR(c8, 9.75, 0.1), "8-bit limited SDR ceiling %.2f stops (expect ~9.7)", c8);
+    CHECK(c8 < log2(100.0 / 0.1) + 1e-9,
+          "never exceeds log2(L_W/L_B) = 10.0 stops");
+
+    /* More codes resolve a darker step, so the ceiling rises with depth
+     * and rises again over the wider full-range window. */
+    double c10 = probe_dr_ceiling_stops(AVCOL_TRC_BT709, 10, false, 0.0);
+    CHECK(c10 > c8, "10-bit ceiling %.2f > 8-bit %.2f", c10, c8);
+    CHECK(probe_dr_ceiling_stops(AVCOL_TRC_BT709, 8, true, 0.0) > c8,
+          "full range resolves further than limited at the same depth");
+
+    /* Removing the floor is exactly what turns the ceiling into a
+     * statement about the code lattice: 2.4 * log2(219) = 18.7. */
+    probe_set_sdr_black_nits(0.0);
+    double bare = probe_dr_ceiling_stops(AVCOL_TRC_BT709, 8, false, 0.0);
+    CHECK(NEAR(bare, 2.4 * log2(219.0), 0.01),
+          "floorless 8-bit ceiling %.2f = 2.4*log2(219)", bare);
+    probe_set_sdr_black_nits(0.1);
+
+    /* PQ carries its own absolute floor, so it is far deeper. */
+    CHECK(probe_dr_ceiling_stops(AVCOL_TRC_SMPTE2084, 10, false, 0.0) > 20.0,
+          "PQ 10-bit ceiling is deep (%.1f stops)",
+          probe_dr_ceiling_stops(AVCOL_TRC_SMPTE2084, 10, false, 0.0));
+
+    /* HLG's ceiling must ride the OOTF. The inverse OETF alone is fixed, so the
+     * whole L_W dependence enters through the system gamma — the ceiling scales
+     * by exactly g(L_W)/g(1000) and by nothing else. Skipping the OOTF (the bug
+     * this pins) would leave the ratio at 1.0. */
+    double h1k = probe_dr_ceiling_stops(AVCOL_TRC_ARIB_STD_B67, 10, false, 1000.0);
+    double h4k = probe_dr_ceiling_stops(AVCOL_TRC_ARIB_STD_B67, 10, false, 4000.0);
+    double want = hlg_system_gamma(4000.0) / hlg_system_gamma(1000.0);
+    CHECK(NEAR(h1k, 25.3614, 0.01), "HLG 10-bit ceiling at L_W=1000 is %.4f", h1k);
+    CHECK(NEAR(h4k / h1k, want, 1e-6),
+          "HLG ceiling scales by the system gamma: %.4f/%.4f = %.6f (expect %.6f)",
+          h4k, h1k, h4k / h1k, want);
+    CHECK(NEAR(hlg_system_gamma(1000.0), 1.2, 1e-12),
+          "system gamma is 1.2 at the reference peak");
+}
+
+static void test_dr_within_ceiling(void)
+{
+    puts("measured dynamic range stays inside the ceiling");
+    probe_set_sdr_black_nits(0.1);
+
+    /* A full 8-bit limited-range ramp is the worst case: it puts real
+     * population on the darkest and brightest codes there are, so the
+     * measurement should press right up against the ceiling without
+     * ever passing it. That was the failure — 16.2 measured against a
+     * format that can only carry 9.7. */
+    AVFrame *f = mkframe(AV_PIX_FMT_YUV420P, 256, 256, AVCOL_TRC_BT709, 0);
+    for (int y = 0; y < 256; y++)
+        for (int x = 0; x < 256; x++)
+            f->data[0][y * f->linesize[0] + x] = (uint8_t)(16 + (x * 219) / 255);
+
+    FrameStats fs;
+    CHECK(probe_frame_stats(f, 1, PROBE_LUMA_ONLY, &fs), "ramp measured");
+
+    SessionStats s;
+    session_stats_init(&s, 1.0 / 1000.0, 1.0);
+    session_stats_add(&s, 0, 0, &fs);
+    SessionDerived d;
+    session_stats_derive(&s, &d);
+
+    CHECK(d.bit_depth == 8, "depth carried through as %d", d.bit_depth);
+    CHECK(!d.full_range, "limited range carried through");
+    CHECK(d.dr_ceiling_stops > 0.0 && isfinite(d.dr_ceiling_stops),
+          "ceiling derived (%.2f stops)", d.dr_ceiling_stops);
+    CHECK(d.dr_stops <= d.dr_ceiling_stops + 0.25,
+          "measured %.2f within ceiling %.2f", d.dr_stops, d.dr_ceiling_stops);
+    CHECK(d.dr_stops > d.dr_ceiling_stops - 1.5,
+          "a full ramp gets close to it: %.2f vs %.2f",
+          d.dr_stops, d.dr_ceiling_stops);
+    av_frame_free(&f);
+}
+
+static void test_range_guess(void)
+{
+    puts("colour range recovered from the pixels when untagged");
+
+    /* Limited-range content: a ramp confined to 16..235 plus a few
+     * ringing samples just outside. Nothing deep enough to count. */
+    AVFrame *lim = mkframe(AV_PIX_FMT_YUV420P, 256, 256, AVCOL_TRC_BT709, 0);
+    for (int y = 0; y < 256; y++)
+        for (int x = 0; x < 256; x++)
+            lim->data[0][y * lim->linesize[0] + x] = (uint8_t)(16 + (x * 219) / 255);
+    /* One row of overshoot on each side — real encodes do this. */
+    for (int x = 0; x < 256; x++) {
+        lim->data[0][0 * lim->linesize[0] + x] = 14;
+        lim->data[0][1 * lim->linesize[0] + x] = 237;
+    }
+    double frac = -1.0;
+    CHECK(probe_guess_color_range(lim, &frac) == AVCOL_RANGE_MPEG,
+          "ramp inside 16..235 reads as limited (%.4f%% outside)", frac * 100.0);
+    CHECK(frac < PROBE_RANGE_FULL_FRAC, "ringing alone stays under the bar");
+    av_frame_free(&lim);
+
+    /* Full-range content: the same ramp over the whole 0..255 window.
+     * The deep-shadow population is what gives it away. */
+    AVFrame *full = mkframe(AV_PIX_FMT_YUV420P, 256, 256, AVCOL_TRC_BT709, 0);
+    for (int y = 0; y < 256; y++)
+        for (int x = 0; x < 256; x++)
+            full->data[0][y * full->linesize[0] + x] = (uint8_t)x;
+    CHECK(probe_guess_color_range(full, &frac) == AVCOL_RANGE_JPEG,
+          "ramp spanning 0..255 reads as full (%.2f%% outside)", frac * 100.0);
+    av_frame_free(&full);
+
+    /* Mid-grey only: genuinely undecidable from the pixels, and the
+     * standard reading of an absent flag is limited. The test exists to
+     * pin that the guess is one-sided rather than a coin toss. */
+    AVFrame *flat = mkframe(AV_PIX_FMT_YUV420P, 256, 256, AVCOL_TRC_BT709, 128);
+    CHECK(probe_guess_color_range(flat, &frac) == AVCOL_RANGE_MPEG,
+          "no evidence either way falls back to limited");
+    av_frame_free(&flat);
+
+    /* Unreadable pixel format must abstain, not guess. */
+    AVFrame *nv = mkframe(AV_PIX_FMT_RGB24, 32, 32, AVCOL_TRC_BT709, 0);
+    CHECK(probe_guess_color_range(nv, &frac) == AVCOL_RANGE_UNSPECIFIED,
+          "unreadable format abstains");
+    av_frame_free(&nv);
 }
 
 static void test_session_dedupe(void)
@@ -350,6 +513,10 @@ int main(void)
     test_format_guard();
     test_histogram();
     test_black_and_underflow();
+    test_sdr_black_level();
+    test_dr_ceiling();
+    test_dr_within_ceiling();
+    test_range_guess();
     test_session_dedupe();
     test_variance_decomposition();
     test_maxrgb();

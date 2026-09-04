@@ -62,6 +62,26 @@ void layout_unrotate_norm(int rot, double *x, double *y)
     }
 }
 
+HdrplaySplitOrient layout_next_split_orient(HdrplaySplitOrient current,
+                                             bool two_source_compare)
+{
+    if (two_source_compare) {
+        switch (current) {
+        case HDRPLAY_SPLIT_LR:      return HDRPLAY_SPLIT_TB;
+        case HDRPLAY_SPLIT_TB:      return HDRPLAY_SPLIT_DIAG;
+        case HDRPLAY_SPLIT_DIAG:    return HDRPLAY_SPLIT_WIPE_LR;
+        case HDRPLAY_SPLIT_WIPE_LR: return HDRPLAY_SPLIT_WIPE_TB;
+        default:                    return HDRPLAY_SPLIT_LR;
+        }
+    }
+
+    switch (current) {
+    case HDRPLAY_SPLIT_LR: return HDRPLAY_SPLIT_TB;
+    case HDRPLAY_SPLIT_TB: return HDRPLAY_SPLIT_DIAG;
+    default:               return HDRPLAY_SPLIT_LR;
+    }
+}
+
 float layout_fit_pane(int src_w, int src_h, int ref_w, int ref_h,
                       LayoutRect pane, float zoom, float pan_x, float pan_y,
                       float align_x, float align_y,
@@ -189,6 +209,7 @@ static void label_rects(const LayoutInput *in, LayoutRect *a, LayoutRect *b)
 {
     switch (in->orient) {
     case HDRPLAY_SPLIT_TB:
+    case HDRPLAY_SPLIT_WIPE_TB:
         *a = rect(MARGIN, in->win_h / 2.0f - LABEL_H - MARGIN,
                   MARGIN + LABEL_W, in->win_h / 2.0f - MARGIN);
         *b = rect(MARGIN, in->win_h / 2.0f + MARGIN,
@@ -201,6 +222,7 @@ static void label_rects(const LayoutInput *in, LayoutRect *a, LayoutRect *b)
                   in->win_w - MARGIN, MARGIN + LABEL_H * 4.0f);
         break;
     case HDRPLAY_SPLIT_LR:
+    case HDRPLAY_SPLIT_WIPE_LR:
     default:
         *a = rect(in->win_w / 2.0f - LABEL_W - MARGIN, MARGIN,
                   in->win_w / 2.0f - MARGIN, MARGIN + LABEL_H);
@@ -213,9 +235,12 @@ static void label_rects(const LayoutInput *in, LayoutRect *a, LayoutRect *b)
 static int mask_for_orient(HdrplaySplitOrient o)
 {
     switch (o) {
-    case HDRPLAY_SPLIT_TB:   return ALPHA_MASK_TB;
+    case HDRPLAY_SPLIT_TB:
+    case HDRPLAY_SPLIT_WIPE_TB:
+        return ALPHA_MASK_TB;
     case HDRPLAY_SPLIT_DIAG: return ALPHA_MASK_DIAG;
     case HDRPLAY_SPLIT_LR:
+    case HDRPLAY_SPLIT_WIPE_LR:
     default:                 return ALPHA_MASK_LR;
     }
 }
@@ -281,8 +306,11 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
 
     out->name = in->mode == HDRPLAY_MODE_HDR ? "HDR" :
                 in->mode == HDRPLAY_MODE_SDR ? "SDR" :
-                in->orient == HDRPLAY_SPLIT_LR ? "SPLIT-LR" :
-                in->orient == HDRPLAY_SPLIT_TB ? "SPLIT-TB" : "SPLIT-DIAG";
+                in->orient == HDRPLAY_SPLIT_LR      ? "SPLIT-LR" :
+                in->orient == HDRPLAY_SPLIT_TB      ? "SPLIT-TB" :
+                in->orient == HDRPLAY_SPLIT_WIPE_LR ? "SPLIT-WIPE-LR" :
+                in->orient == HDRPLAY_SPLIT_WIPE_TB ? "SPLIT-WIPE-TB" :
+                                                      "SPLIT-DIAG";
 }
 
 /* ------------------------------------------------------------------ */
@@ -291,11 +319,10 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
 /* treatment at once would leave any observed difference with two        */
 /* possible causes.                                                     */
 /*                                                                      */
-/* LR and TB use two passes with rectangular crops — direct, no          */
-/* round-trip, and it avoids hand-matching the overlay compositor's      */
-/* colour-space metadata. DIAG cannot be expressed as a crop, so it      */
-/* keeps the alpha-mask overlay path, with source B as the masked        */
-/* second image instead of the SDR version of A.                        */
+/* LR and TB are pane layouts and use two passes with rectangular crops. */
+/* WIPE-LR, WIPE-TB and DIAG compare full-frame aligned sources through  */
+/* the alpha-mask overlay path, with source B as the masked second image */
+/* instead of the SDR version of A.                                     */
 static void plan_pair(const LayoutInput *in, LayoutPlan *out)
 {
     int a = in->swapped ? 1 : 0;
@@ -306,8 +333,11 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
     LayoutRect la, lb;
     label_rects(in, &la, &lb);
 
-    if (in->orient == HDRPLAY_SPLIT_DIAG) {
-        /* Single pass: A underneath, B composited through the diagonal
+    bool wipe = in->orient == HDRPLAY_SPLIT_DIAG ||
+                in->orient == HDRPLAY_SPLIT_WIPE_LR ||
+                in->orient == HDRPLAY_SPLIT_WIPE_TB;
+    if (wipe) {
+        /* Single pass: A underneath, B composited through the selected
          * mask. When SDR is active both need the SDR treatment, so A
          * gets a FULL-mask intermediate of its own. */
         out->n_pass = 1;
@@ -336,7 +366,7 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
             add_ov(p, LAYOUT_OV_INTERMEDIATE, a, full);
         }
         out->inter[out->n_inter++] = (LayoutInter){
-            .src = b, .mask = ALPHA_MASK_DIAG, .sdr = sdr,
+            .src = b, .mask = mask_for_orient(in->orient), .sdr = sdr,
             .dst = tb, .image_crop = ib_ };
         add_ov(p, LAYOUT_OV_INTERMEDIATE, b, full);
 
@@ -346,7 +376,9 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
         if (in->session_panel)
             add_ov(p, LAYOUT_OV_SESSION, -1, session_rect(in, true));
 
-        out->name = "AB-DIAG";
+        out->name = in->orient == HDRPLAY_SPLIT_WIPE_LR ? "AB-WIPE-LR" :
+                    in->orient == HDRPLAY_SPLIT_WIPE_TB ? "AB-WIPE-TB" :
+                                                          "AB-DIAG";
         return;
     }
 

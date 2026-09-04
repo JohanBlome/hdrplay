@@ -41,6 +41,8 @@ typedef enum {
     HDRPLAY_SPLIT_LR = 0,
     HDRPLAY_SPLIT_TB,
     HDRPLAY_SPLIT_DIAG,
+    HDRPLAY_SPLIT_WIPE_LR,  /* two-source full-frame left/right wipe */
+    HDRPLAY_SPLIT_WIPE_TB,  /* two-source full-frame top/bottom wipe */
 } HdrplaySplitOrient;
 
 typedef struct { float x0, y0, x1, y1; } LayoutRect;
@@ -131,6 +133,11 @@ typedef struct {
 /* Compute the plan. Pure: same inputs always give the same output, no
  * allocation, no global state. */
 void layout_plan(const LayoutInput *in, LayoutPlan *out);
+
+/* Runtime O-key order. Two-source comparison includes the two full-frame
+ * rectangular wipes; single-source/solo keeps the original three modes. */
+HdrplaySplitOrient layout_next_split_orient(HdrplaySplitOrient current,
+                                             bool two_source_compare);
 
 /* Place a source inside a pane with its aspect ratio preserved.
  *

@@ -93,6 +93,9 @@ bool source_open(Source *s, const char *path, int ring_cap)
 {
     memset(s, 0, sizeof(*s));
     if (!decoder_open(&s->dec, path)) return false;
+    /* Before the first frame reaches the renderer or the probe, so both
+     * see the same range for an untagged source. */
+    decoder_resolve_color_range(&s->dec, 8);
 
     AVStream *st = s->dec.fmt->streams[s->dec.stream_idx];
     s->tb_sec = av_q2d(st->time_base);

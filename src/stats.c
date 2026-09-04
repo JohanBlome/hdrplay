@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string.h>
 #include <libavutil/avutil.h>
+#include <libavutil/pixdesc.h>
 
 void session_stats_init(SessionStats *s, double tb_sec, double duration_sec)
 {
@@ -152,6 +153,18 @@ void session_stats_derive(const SessionStats *s, SessionDerived *out)
     out->maxfall_nits = s->maxfall_nits;
     out->maxcll_valid = s->has_maxrgb;
     out->peak_luma_nits = s->peak_luma_nits;
+
+    /* Coding limits, so a dynamic-range figure can be read against what
+     * the format could actually carry rather than in isolation. */
+    if (s->frames) {
+        const AVPixFmtDescriptor *pd = (s->pix_fmt >= 0)
+            ? av_pix_fmt_desc_get((enum AVPixelFormat)s->pix_fmt) : NULL;
+        out->bit_depth  = pd ? pd->comp[0].depth : 8;
+        out->full_range = (s->color_range == AVCOL_RANGE_JPEG);
+        out->dr_ceiling_stops = probe_dr_ceiling_stops(
+            (enum AVColorTransferCharacteristic)s->color_trc,
+            out->bit_depth, out->full_range, s->hlg_lw);
+    }
 
     if (s->duration_sec > 0.0 && s->covered_sec >= 0.0) {
         double c = s->covered_sec / s->duration_sec;

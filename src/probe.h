@@ -29,6 +29,73 @@ const char  *lum_reference_name(LumReference r);
 bool         lum_reference_is_absolute(LumReference r);
 
 /* ------------------------------------------------------------------ */
+/* SDR black level (BT.1886 L_B, cd/m²).                               */
+/*                                                                     */
+/* The SDR transfer is BT.1886, which is a power law LIFTED by the     */
+/* display's black level:                                              */
+/*                                                                     */
+/*     L = a·(V + b)^2.4,  a and b chosen so L(0) = L_B, L(1) = L_W    */
+/*                                                                     */
+/* L_B matters far more than it looks. With L_B = 0 the curve is the   */
+/* bare 100·V^2.4, whose slope at the origin is infinite: the darkest  */
+/* non-black code maps arbitrarily close to zero, and any ratio        */
+/* statistic taken against it diverges. On 8-bit limited-range that    */
+/* alone puts log2(p99.9/p1) at up to 18.7 stops — a figure no 8-bit   */
+/* file can carry, produced entirely by the quantization floor rather  */
+/* than by anything in the picture.                                    */
+/*                                                                     */
+/* Default 0.1, the BT.1886 reference black for a 100-nit mastering    */
+/* display (1000:1), which caps SDR dynamic range at a physical 10     */
+/* stops. Pass 0 to restore the floorless power law — the numbers then */
+/* describe the code lattice, not a displayable image. Wired to        */
+/* --sdr-black. Rebuilds the transfer LUTs, so call before decoding. */
+void   probe_set_sdr_black_nits(double nits);
+double probe_sdr_black_nits(void);
+
+/* Largest dynamic range this coding can express, in stops: the ratio
+ * between nominal white and the darkest code that is not code-domain
+ * black. Depth-, range- and transfer-aware.
+ *
+ * A measured log2(p99.9/p1) above this is not a property of the
+ * content — it means p1 has landed in the quantization floor and the
+ * figure is measuring the code lattice. Returns INFINITY only if the
+ * transfer maps that darkest code to exactly zero, which no transfer
+ * here does once an SDR black level is set. */
+double probe_dr_ceiling_stops(enum AVColorTransferCharacteristic trc,
+                              int depth, bool full_range, double hlg_lw);
+
+/* ------------------------------------------------------------------ */
+/* Colour-range recovery for untagged sources.                         */
+/*                                                                     */
+/* An absent video_full_range_flag is not the same as "limited". The   */
+/* standard reading is limited, and that is the safe default, but      */
+/* getting it wrong on a full-range source is not a small error: codes */
+/* 1..15 become "black" and codes just above 16 have their signal      */
+/* value divided by roughly ten, which lands exactly on the shadow     */
+/* percentiles the dynamic-range figure is built from.                 */
+/*                                                                     */
+/* The pixels settle it. A limited-range encode has a hard floor at 16 */
+/* and a hard ceiling at 235; the only population outside is coding    */
+/* ringing, which stays within a few codes of the boundary. A          */
+/* full-range source that has any real black or any real white puts    */
+/* a substantial population well outside that window.                  */
+/*                                                                     */
+/* So: count luma samples beyond the limited-range window widened by a */
+/* ringing guard, and call it full range when that population is more  */
+/* than PROBE_RANGE_FULL_FRAC of the frame. Returns UNSPECIFIED when   */
+/* the frame cannot be read. `out_frac` receives the measured fraction */
+/* (may be NULL) so callers can report the evidence rather than just   */
+/* the verdict.                                                        */
+/*                                                                     */
+/* The test is one-sided by construction: content that is neither dark */
+/* nor bright leaves no trace either way, and falls back to limited.   */
+#define PROBE_RANGE_GUARD_CODES 4      /* 8-bit codes of ringing slack */
+#define PROBE_RANGE_FULL_FRAC   0.0025 /* 0.25% outside → full range   */
+
+enum AVColorRange probe_guess_color_range(const AVFrame *frame,
+                                          double *out_frac);
+
+/* ------------------------------------------------------------------ */
 /* Log-luminance histogram.                                            */
 /*                                                                     */
 /* 512 bins of 1/16 stop spanning 2^-16 .. 2^16 nits, which covers     */
@@ -106,6 +173,11 @@ double probe_hlg_peak_nits(const AVFrame *frame);
  * mastering display and the 1000-nit default. Pass <= 0 to clear.
  * Wired to --hlg-peak. */
 void probe_set_hlg_peak_override(double nits);
+
+/* The override in force, or 0 when none. Callers report which of the three
+ * sources an HLG figure actually rests on; without this they can only say
+ * what L_W is, not why. */
+double probe_hlg_peak_override_nits(void);
 
 /* ------------------------------------------------------------------ */
 /* Per-frame brightness statistics.                                    */

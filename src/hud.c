@@ -227,9 +227,11 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         r->mode == HDRPLAY_MODE_HDR ? "HDR" :
         r->mode == HDRPLAY_MODE_SDR ? "SDR" :
         r->mode == HDRPLAY_MODE_SPLIT
-            ? (r->split_orient == HDRPLAY_SPLIT_TB   ? "SPLIT TB" :
-               r->split_orient == HDRPLAY_SPLIT_DIAG ? "SPLIT DIAG" :
-                                                       "SPLIT LR")
+            ? (r->split_orient == HDRPLAY_SPLIT_TB      ? "SPLIT TB" :
+               r->split_orient == HDRPLAY_SPLIT_DIAG    ? "SPLIT DIAG" :
+               r->split_orient == HDRPLAY_SPLIT_WIPE_LR ? "WIPE LR" :
+               r->split_orient == HDRPLAY_SPLIT_WIPE_TB ? "WIPE TB" :
+                                                          "SPLIT LR")
             : "?";
     snprintf(line, sizeof(line), "MODE %s", mode_str);
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
@@ -445,8 +447,21 @@ static int build_session_panel_single(Renderer *r, pl_gpu gpu,
              d.p50, d.p1, d.p99);
     draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
 
-    snprintf(line, sizeof(line), "DR %.1f STOPS (P99.9/P1)", d.dr_stops);
-    draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
+    /* Against the ceiling, not bare: "9.0 OF 9.7" says the file uses
+     * its format, where a lone "9.0 STOPS" says nothing. A measurement
+     * above the ceiling is not content — p1 is in the code lattice. */
+    if (isfinite(d.dr_ceiling_stops) && d.dr_ceiling_stops > 0.0) {
+        snprintf(line, sizeof(line), "DR %.1f OF %.1f STOPS (P99.9/P1)",
+                 d.dr_stops, d.dr_ceiling_stops);
+        if (d.dr_stops > d.dr_ceiling_stops + 0.25)
+            draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 80, 80);
+        else
+            draw_text(buf, W, H, 6, y, hud_scale, line);
+    } else {
+        snprintf(line, sizeof(line), "DR %.1f STOPS (P99.9/P1)", d.dr_stops);
+        draw_text(buf, W, H, 6, y, hud_scale, line);
+    }
+    y += pitch;
 
     snprintf(line, sizeof(line), "SPREAD %.1f SPAT / %.1f TEMP",
              d.spatial_stops, d.temporal_stops);

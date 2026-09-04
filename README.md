@@ -143,8 +143,11 @@ synchronized has to mean when the rates differ — frame-index lockstep
 would drift them apart linearly. A shorter file holds its last frame
 instead of going black.
 
-With two files the split becomes the **layout**, so `H`/`S` apply to
-both panes and you compare A-vs-B under HDR, then A-vs-B under SDR.
+With two files the default split becomes the **layout**, so `H`/`S` apply to
+both panes and you compare A-vs-B under HDR, then A-vs-B under SDR. The
+comparison cycle also includes full-frame left/right, top/bottom and
+diagonal wipes; these align both complete images and replace half of A
+with B, which is especially useful for gradients and banding tests.
 Varying content and treatment at once would leave any difference you see
 with two possible causes. Press `1` or `2` to solo a file, which drops
 back to exactly single-file behaviour — including the HDR-vs-SDR split —
@@ -158,7 +161,7 @@ and `0` to return.
 | `Z` | toggle fit / 1:1 |
 | `+` `-` | zoom steps |
 | drag, `shift`+arrows | pan, locked across panes |
-| `P` `O` | split mode / cycle LR, TB, diagonal wipe |
+| `P` `O` | split mode / cycle pane LR, pane TB, diagonal, LR wipe, TB wipe |
 | `T` | rotate the focused pane 90° clockwise |
 | `W` | resize the window for exact 1:1, no letterbox |
 
@@ -191,6 +194,11 @@ edges. Centring each image in its own half instead puts the sum of both
 inner margins between them — a wide black gutter running exactly between
 the two things you are trying to compare. Top/bottom does the same
 vertically. A single pane stays centred; there is no seam to meet.
+
+The wipe modes are different: both sources use the full viewport and
+the second is composited over half of the first. Use
+`--split-wipe-lr` or `--split-wipe-tb` to start there directly; `O`
+cycles through them along with the pane layouts and diagonal wipe.
 
 `Z` toggles fit and 1:1; `+`/`-` step through 2x zoom levels. **1:1 means
 one source pixel per framebuffer pixel**, which on a HiDPI display is
@@ -239,7 +247,8 @@ content checks  clip.mov
   PASS  content exceeds SDR range         p99.9 = 3520N
   FAIL  MaxCLL vs declared                declares 400N but pixels reach 10000N
                                           under-declared: tone mappers trust this value
-  PASS  dynamic range                     14.4 stops (p99.9/p1)
+  PASS  dynamic range                     14.4 stops (p99.9/p1) of 27.5
+                                          possible at 10-bit limited range
   INFO  spread                            4.24 spatial / 0.01 temporal stops
 
 summary: 1 FAIL, 0 WARN
@@ -255,7 +264,7 @@ Exit codes **>= 64** are tool errors (unreadable file, unsupported pixel
 format), not content verdicts — otherwise a missing file is
 indistinguishable from "1 FAIL".
 
-Three things worth understanding about the numbers:
+Five things worth understanding about the numbers:
 
 - **Measurements are one-sided lower bounds.** Sampling stride, luma vs
   the spec's `max(R,G,B)`, and Jensen's inequality on a convex EOTF all
@@ -265,13 +274,39 @@ Three things worth understanding about the numbers:
   `--stride 1` (every pixel) precisely so the FAIL side is sound.
 - **HLG numbers rest on an assumption.** HLG carries no absolute
   luminance; converting scene light to display light needs a nominal
-  peak `L_W`. hdrplay takes the file's mastering-display max, else the
-  BT.2100 reference of 1000 nits, and always says which. Override with
-  `--hlg-peak`.
+  peak `L_W`, applied through the BT.2100 OOTF — a power, not a gain,
+  so `L_W` moves the shadows more than the highlights and the dynamic
+  range with them. hdrplay takes `--hlg-peak` if given, else the file's
+  mastering-display max, else the BT.2100 reference of 1000 nits, and
+  names which of the three it used.
 - **SDR gets no absolute figures at all.** A measured MaxCLL for an SDR
   file cannot exceed 100 nits by construction, so those checks are
   suppressed rather than printed with a caveat. Ratio statistics
   (dynamic range, spread) are still valid and still shown.
+- **Dynamic range is reported against a ceiling, because a bare ratio
+  is unreadable.** `log2(p99.9/p1)` only means something when the
+  transfer has a floor. PQ has one by definition; SDR's comes from the
+  BT.1886 black level, default 0.1 nits (reference 100-nit monitor,
+  1000:1), which caps SDR at a physical 10 stops. Set it with
+  `--sdr-black`. At `--sdr-black 0` the transfer is the bare
+  `100·V^2.4`, whose slope at the origin is infinite: the darkest
+  non-black code tends to zero and the ratio diverges toward the
+  quantization limit — 18.7 stops on 8-bit limited range — regardless
+  of what the picture contains. The printed ceiling comes from the
+  transfer, bit depth and signal range, so "9.0 of 9.7 possible" says
+  the file uses its format. A measurement *above* the ceiling is a
+  WARN, and it is a measurement finding rather than a content one: p1
+  has landed in the code lattice.
+- **An absent range flag is recovered from the pixels.** The standard
+  reading of a missing `video_full_range_flag` is limited, but getting
+  it wrong on a full-range source is not cosmetic — codes 1..15 get
+  counted as black and everything just above has its signal value
+  divided by roughly ten, which is exactly where the shadow
+  percentiles live. A limited-range encode has a hard floor at code 16
+  and a hard ceiling at 235, with only a few codes of ringing outside;
+  a full-range source with any real black or white does not. hdrplay
+  pools that excursion over the first frames and says what it decided
+  and on what evidence. Force it with `--range limited|full`.
 
 `--json` writes a machine-readable summary to stdout (checks stay on
 stderr, so `| jq` works). `--stats-file out.ndjson` writes a per-frame

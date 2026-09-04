@@ -246,6 +246,75 @@ static void test_pair_diag(void)
           "DIAG SDR: B keeps the diagonal mask on top");
 }
 
+static void test_pair_rect_wipes(void)
+{
+    puts("two sources, full-frame LR and TB wipes");
+    struct {
+        HdrplaySplitOrient orient;
+        int mask;
+        const char *name;
+    } cases[] = {
+        { HDRPLAY_SPLIT_WIPE_LR, ALPHA_MASK_LR, "WIPE-LR" },
+        { HDRPLAY_SPLIT_WIPE_TB, ALPHA_MASK_TB, "WIPE-TB" },
+    };
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        LayoutInput in = base_input();
+        in.n_sources = 2;
+        in.orient = cases[i].orient;
+        LayoutPlan pl;
+        layout_plan(&in, &pl);
+
+        CHECK(pl.n_pass == 1, "%s: one full-frame base pass", cases[i].name);
+        CHECK(pl.pass[0].src == 0, "%s: A renders underneath", cases[i].name);
+        CHECK(rect_eq(pl.pass[0].target_crop, 0, 0, WIN_W, WIN_H),
+              "%s: A uses the full viewport", cases[i].name);
+        CHECK(pl.n_inter == 1 && pl.inter[0].src == 1 &&
+              pl.inter[0].mask == cases[i].mask,
+              "%s: B uses mask %d", cases[i].name, cases[i].mask);
+        CHECK(rect_eq(pl.inter[0].dst, 0, 0, WIN_W, WIN_H),
+              "%s: B aligns over the full viewport", cases[i].name);
+
+        in.swapped = true;
+        layout_plan(&in, &pl);
+        CHECK(pl.pass[0].src == 1 && pl.inter[0].src == 0,
+              "%s: X swaps base and masked sources", cases[i].name);
+
+        in.swapped = false;
+        in.mode = HDRPLAY_MODE_SDR;
+        layout_plan(&in, &pl);
+        CHECK(pl.n_inter == 2 && pl.inter[0].mask == ALPHA_MASK_FULL &&
+              pl.inter[1].mask == cases[i].mask,
+              "%s SDR: A full intermediate, B masked", cases[i].name);
+    }
+}
+
+static void test_orientation_cycle(void)
+{
+    puts("split orientation cycle includes pair wipes only in compare mode");
+    HdrplaySplitOrient o = HDRPLAY_SPLIT_LR;
+    const HdrplaySplitOrient pair_expected[] = {
+        HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG,
+        HDRPLAY_SPLIT_WIPE_LR, HDRPLAY_SPLIT_WIPE_TB,
+        HDRPLAY_SPLIT_LR,
+    };
+    for (size_t i = 0; i < sizeof pair_expected / sizeof pair_expected[0]; i++) {
+        o = layout_next_split_orient(o, true);
+        CHECK(o == pair_expected[i], "pair cycle step %d", (int)i);
+    }
+
+    o = HDRPLAY_SPLIT_LR;
+    const HdrplaySplitOrient single_expected[] = {
+        HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG, HDRPLAY_SPLIT_LR,
+    };
+    for (size_t i = 0; i < sizeof single_expected / sizeof single_expected[0]; i++) {
+        o = layout_next_split_orient(o, false);
+        CHECK(o == single_expected[i], "single cycle step %d", (int)i);
+    }
+    CHECK(layout_next_split_orient(HDRPLAY_SPLIT_WIPE_TB, false) == HDRPLAY_SPLIT_LR,
+          "soloing from a pair-only wipe returns to the single-source cycle");
+}
+
 /* No overlay may be attached to more than one pass. */
 static void test_overlay_routing_is_exclusive(void)
 {
@@ -256,8 +325,9 @@ static void test_overlay_routing_is_exclusive(void)
     };
     HdrplaySplitOrient orients[] = {
         HDRPLAY_SPLIT_LR, HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG,
+        HDRPLAY_SPLIT_WIPE_LR, HDRPLAY_SPLIT_WIPE_TB,
     };
-    for (int o = 0; o < 3; o++) {
+    for (size_t o = 0; o < sizeof orients / sizeof orients[0]; o++) {
         for (int m = 0; m < 3; m++) {
             LayoutInput in = base_input();
             in.n_sources = 2;
@@ -268,7 +338,7 @@ static void test_overlay_routing_is_exclusive(void)
             for (int k = 0; k < 4; k++) {
                 int n = count_ov_plan(&pl, kinds[k]);
                 CHECK(n <= 1, "orient %d mode %d: overlay %d appears %dx",
-                      o, m, kinds[k], n);
+                      (int)o, m, kinds[k], n);
             }
         }
     }
@@ -500,7 +570,10 @@ static void test_aspect_is_always_preserved(void)
     };
     static const float zooms[] = { 0.0f, 1.0f, 2.0f, 0.5f, 8.0f };
     const int modes[]   = { HDRPLAY_MODE_HDR, HDRPLAY_MODE_SDR, HDRPLAY_MODE_SPLIT };
-    const int orients[] = { HDRPLAY_SPLIT_LR, HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG };
+    const int orients[] = {
+        HDRPLAY_SPLIT_LR, HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG,
+        HDRPLAY_SPLIT_WIPE_LR, HDRPLAY_SPLIT_WIPE_TB,
+    };
 
     int checked = 0, bad = 0;
     float worst = 0.0f;
@@ -511,7 +584,7 @@ static void test_aspect_is_always_preserved(void)
     for (size_t zi = 0; zi < sizeof zooms / sizeof zooms[0]; zi++)
     for (int nsrc = 1; nsrc <= 2; nsrc++)
     for (int mi = 0; mi < 3; mi++)
-    for (int oi = 0; oi < 3; oi++) {
+    for (size_t oi = 0; oi < sizeof orients / sizeof orients[0]; oi++) {
         LayoutInput in = base_input();
         in.n_sources = nsrc;
         in.mode      = modes[mi];
@@ -702,6 +775,8 @@ int main(void)
     test_solo_equals_single();
     test_pair_lr_tb();
     test_pair_diag();
+    test_pair_rect_wipes();
+    test_orientation_cycle();
     test_overlay_routing_is_exclusive();
     test_zoom_pan();
     test_mismatched_geometry();

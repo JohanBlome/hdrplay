@@ -37,11 +37,48 @@ static double hlg_inverse_oetf(double V)
     return (exp((V - c) / a) + b) / 12.0;
 }
 
-/* sRGB / BT.709 EOTF for SDR sources (simplified BT.1886, gamma 2.4). */
+/* BT.1886 EOTF for SDR sources. Gamma 2.4, 100-nit reference white,
+ * lifted by the display black level L_B:
+ *
+ *     L = a·max(V + b, 0)^2.4
+ *     a = (L_W^(1/2.4) - L_B^(1/2.4))^2.4
+ *     b = L_B^(1/2.4) / (L_W^(1/2.4) - L_B^(1/2.4))
+ *
+ * At L_B = 0 this collapses to the bare 100·V^2.4 the code used to
+ * assume unconditionally. That form has no floor, so the darkest
+ * non-black code maps arbitrarily close to zero and every ratio taken
+ * against it — the dynamic-range figure above all — reports the code
+ * lattice instead of the picture. See probe_set_sdr_black_nits(). */
+#define SDR_GAMMA 2.4
+#define SDR_LW    100.0
+
+static double g_sdr_black_nits = 0.1;   /* BT.1886 reference, 1000:1 */
+static double g_sdr_a = SDR_LW, g_sdr_b = 0.0;
+static bool   g_sdr_coeffs_valid = false;
+
+/* a and b are transcendental in L_B, so they cannot be static
+ * initializers; resolve them on first use and on every override. */
+static void sdr_coeffs_ensure(void)
+{
+    if (g_sdr_coeffs_valid) return;
+    g_sdr_coeffs_valid = true;
+
+    double lb = g_sdr_black_nits;
+    if (!(lb > 0.0)) { g_sdr_a = SDR_LW; g_sdr_b = 0.0; return; }
+    double lw_r = pow(SDR_LW, 1.0 / SDR_GAMMA);
+    double lb_r = pow(lb,     1.0 / SDR_GAMMA);
+    double den  = lw_r - lb_r;
+    if (!(den > 0.0)) { g_sdr_a = SDR_LW; g_sdr_b = 0.0; return; }
+    g_sdr_a = pow(den, SDR_GAMMA);
+    g_sdr_b = lb_r / den;
+}
+
 static double sdr_eotf(double V)
 {
-    if (V <= 0) return 0;
-    return 100.0 * pow(V, 2.4);  /* SDR reference white = 100 nits */
+    sdr_coeffs_ensure();
+    double x = V + g_sdr_b;
+    if (x <= 0.0) return 0.0;
+    return g_sdr_a * pow(x, SDR_GAMMA);
 }
 
 /* Nominal display peak (L_W) to assume when converting HLG scene light
@@ -54,6 +91,11 @@ static double g_hlg_peak_override = 0.0;
 void probe_set_hlg_peak_override(double nits)
 {
     g_hlg_peak_override = (nits > 0.0) ? nits : 0.0;
+}
+
+double probe_hlg_peak_override_nits(void)
+{
+    return g_hlg_peak_override;
 }
 
 double probe_hlg_peak_nits(const AVFrame *frame)
@@ -265,6 +307,98 @@ typedef struct {
 
 static LumaLut g_luma_lut;
 static SigLut  g_sig_lut;
+
+/* ------------------------------------------------------------------ */
+void probe_set_sdr_black_nits(double nits)
+{
+    g_sdr_black_nits    = (nits > 0.0) ? nits : 0.0;
+    g_sdr_coeffs_valid  = false;
+    /* Both tables bake the transfer in, and neither keys on the black
+     * level — invalidate rather than widen the cache key for a value
+     * that changes once, at startup. */
+    g_luma_lut.valid = false;
+    g_sig_lut.valid  = false;
+}
+
+double probe_sdr_black_nits(void)
+{
+    return g_sdr_black_nits;
+}
+
+double probe_dr_ceiling_stops(enum AVColorTransferCharacteristic trc,
+                              int depth, bool full_range, double hlg_lw)
+{
+    if (depth < 8)  depth = 8;
+    if (depth > 12) depth = 12;
+
+    int max_raw = (1 << depth) - 1;
+    int y_lo = full_range ? 0       : (16  << (depth - 8));
+    int y_hi = full_range ? max_raw : (235 << (depth - 8));
+    if (y_hi <= y_lo) return 0.0;
+
+    bool is_hlg = (trc == AVCOL_TRC_ARIB_STD_B67);
+    double (*eotf)(double) =
+        (trc == AVCOL_TRC_SMPTE2084) ? pq_eotf :
+        is_hlg                       ? hlg_inverse_oetf : sdr_eotf;
+
+    /* One code above code-domain black is the darkest value the coding
+     * can carry that the probe will admit to the percentile
+     * population. Everything below is counted as black and excluded. */
+    double darkest = eotf(1.0 / (double)(y_hi - y_lo));
+    double white   = eotf(1.0);
+    if (is_hlg) {
+        darkest = hlg_display_nits(darkest, hlg_lw);
+        white   = hlg_display_nits(white,   hlg_lw);
+    }
+    if (!(darkest > 0.0) || !(white > 0.0)) return INFINITY;
+    return log2(white / darkest);
+}
+
+/* Defined with the other pixel-format guards below. */
+static bool luma_plane_supported(const AVPixFmtDescriptor *desc, int *depth_out);
+
+enum AVColorRange probe_guess_color_range(const AVFrame *frame,
+                                          double *out_frac)
+{
+    if (out_frac) *out_frac = 0.0;
+    if (!frame || !frame->data[0]) return AVCOL_RANGE_UNSPECIFIED;
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    int depth = 0;
+    if (!luma_plane_supported(desc, &depth)) return AVCOL_RANGE_UNSPECIFIED;
+
+    int scale = 1 << (depth - 8);
+    int guard = PROBE_RANGE_GUARD_CODES * scale;
+    int lo    = 16  * scale - guard;
+    int hi    = 235 * scale + guard;
+
+    int w = frame->width, h = frame->height;
+    if (w <= 0 || h <= 0) return AVCOL_RANGE_UNSPECIFIED;
+    int y_stride_pix = (depth == 8) ? frame->linesize[0]
+                                    : (frame->linesize[0] / 2);
+
+    /* Striding is fine here: this is a population fraction, not a peak,
+     * and the threshold is three orders of magnitude above the sampling
+     * noise of a 4-in-both-axes stride on any real frame size. */
+    const int stride = (w >= 256 && h >= 256) ? 4 : 1;
+    uint64_t outside = 0, total = 0;
+    for (int y = 0; y < h; y += stride) {
+        const uint8_t  *row8  = frame->data[0] + (size_t)y * frame->linesize[0];
+        const uint16_t *row16 = (const uint16_t *)frame->data[0] +
+                                (size_t)y * y_stride_pix;
+        for (int x = 0; x < w; x += stride) {
+            int v = (depth == 8) ? row8[x] : row16[x];
+            if (v < lo || v > hi) outside++;
+            total++;
+        }
+    }
+    if (!total) return AVCOL_RANGE_UNSPECIFIED;
+
+    double frac = (double)outside / (double)total;
+    if (out_frac) *out_frac = frac;
+    return (frac > PROBE_RANGE_FULL_FRAC) ? AVCOL_RANGE_JPEG
+                                          : AVCOL_RANGE_MPEG;
+}
 
 static const LumaLut *luma_lut_get(int depth, bool full_range,
                                    enum AVColorTransferCharacteristic trc,

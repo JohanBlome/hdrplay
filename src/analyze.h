@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 struct SessionStats;
+struct Decoder;
 
 /* Headless whole-file content scan. Decodes every frame to EOF with no
  * SDL, no Vulkan and no window, so it runs over SSH and as fast as the
@@ -25,9 +26,13 @@ int analyze_run(const char *path, int stride, double hlg_lw,
 
 /* Print an accumulated session as a check report. Shared with playback
  * so the on-exit summary and the offline verdict read identically.
- * declared_cll_max / _avg are -1 when the container declares none. */
+ *
+ * The decoder is needed as well as the statistics: the declared
+ * MaxCLL/MaxFALL and whether the colour range had to be recovered from
+ * the pixels are properties of the source, not of the histogram, and
+ * both change how the numbers below should be read. */
 void analyze_print_session(const struct SessionStats *s,
-                           int declared_cll_max, int declared_cll_avg,
+                           const struct Decoder *dec,
                            const char *title);
 
 #endif

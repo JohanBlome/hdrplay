@@ -1,5 +1,6 @@
 #include "decoder.h"
 #include "log.h"
+#include "probe.h"
 
 #include <math.h>
 #include <libavutil/pixdesc.h>
@@ -34,7 +35,12 @@ static void log_metadata(const Decoder *d)
             d->mdcv_red_x, d->mdcv_red_y, d->mdcv_green_x, d->mdcv_green_y,
             d->mdcv_blue_x, d->mdcv_blue_y, d->mdcv_white_x, d->mdcv_white_y);
     } else {
-        LOG("META", "no mastering display metadata (HDR10 will fall back to defaults)");
+        /* Scoped deliberately: this reads STREAM side data, and x265 among others
+         * stamps the mastering display per frame instead. Saying a flat "none" here
+         * contradicts the report, which does find it once decoding starts — and for
+         * HLG that value sets L_W, so the two disagreeing is not cosmetic. */
+        LOG("META", "no mastering display metadata in stream side data "
+                    "(encoders that stamp it per frame are picked up on decode)");
     }
     if (d->has_cll)
         LOG("META", "content light: MaxCLL=%d MaxFALL=%d", d->cll_max, d->cll_avg);
@@ -124,6 +130,17 @@ void decoder_absorb_frame_side_data(Decoder *d)
     }
 }
 
+/* --range, applied to every input. A file-static rather than a
+ * per-open argument for the same reason probe's HLG peak is: it is a
+ * one-shot startup decision, and threading it through every caller
+ * buys nothing. */
+static enum AVColorRange g_range_override = AVCOL_RANGE_UNSPECIFIED;
+
+void decoder_set_range_override(enum AVColorRange r)
+{
+    g_range_override = r;
+}
+
 bool decoder_open(Decoder *d, const char *path)
 {
     memset(d, 0, sizeof(*d));
@@ -159,14 +176,70 @@ bool decoder_open(Decoder *d, const char *path)
     d->range     = d->cc->color_range;
     d->pix_fmt   = d->cc->pix_fmt;
 
+    /* An explicit --range beats the container; otherwise the container
+     * stands, and an absent flag is left for the pixel probe. */
+    d->range_effective = (g_range_override != AVCOL_RANGE_UNSPECIFIED)
+                         ? g_range_override : d->range;
+
     const AVPixFmtDescriptor *pd = av_pix_fmt_desc_get(d->pix_fmt);
     d->bit_depth = pd ? pd->comp[0].depth : 8;
 
     extract_hdr10_sidedata(d, st);
     log_metadata(d);
+    if (g_range_override != AVCOL_RANGE_UNSPECIFIED)
+        LOG("META", "range forced to %s by --range", rng_name(g_range_override));
 
     d->pkt   = av_packet_alloc();
     d->frame = av_frame_alloc();
+    return true;
+}
+
+/* See decoder.h. The pixels are the only evidence left once the
+ * container declined to say, and getting it wrong is not cosmetic:
+ * decoding full-range shadows as limited pushes codes 1..15 into the
+ * "black" bucket and divides the signal value of everything just above
+ * by roughly ten, which is exactly where the low percentiles live. */
+bool decoder_resolve_color_range(Decoder *d, int max_frames)
+{
+    if (!d) return false;
+    if (d->range_effective != AVCOL_RANGE_UNSPECIFIED) return true;
+    if (max_frames < 1) max_frames = 1;
+
+    /* Consuming frames is only acceptable if they can be put back. */
+    if (!d->fmt || !d->fmt->pb || !d->fmt->pb->seekable) {
+        LOG("META", "range unspecified and input not seekable — reading as limited");
+        return false;
+    }
+
+    double sum = 0.0;
+    int    n   = 0;
+    for (int i = 0; i < max_frames && decoder_next_frame(d) > 0; i++) {
+        double frac = 0.0;
+        if (probe_guess_color_range(d->frame, &frac) == AVCOL_RANGE_UNSPECIFIED)
+            continue;   /* pixel format the probe cannot read */
+        sum += frac;
+        n++;
+    }
+
+    bool rewound = decoder_seek_start(d);
+    if (!n) {
+        LOG("META", "range unspecified and no frame was readable — reading as limited");
+        return false;
+    }
+    if (!rewound)
+        LOG("DEC", "WARNING: could not rewind after the range probe; "
+                   "the first %d frames are lost", n);
+
+    /* Pooled over frames, not voted: a single fade-in or title card
+     * carries no excursions and would otherwise outvote the content. */
+    d->range_outside_frac = sum / n;
+    d->range_guessed      = true;
+    d->range_effective    = (d->range_outside_frac > PROBE_RANGE_FULL_FRAC)
+                            ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+    LOG("META", "range unspecified — %.3f%% of luma outside the limited-range "
+                "window over %d frame%s, reading as %s",
+        d->range_outside_frac * 100.0, n, n == 1 ? "" : "s",
+        rng_name(d->range_effective));
     return true;
 }
 
@@ -174,7 +247,16 @@ int decoder_next_frame(Decoder *d)
 {
     for (;;) {
         int r = avcodec_receive_frame(d->cc, d->frame);
-        if (r == 0)        return 1;
+        if (r == 0) {
+            /* Stamp the resolved range on the frame rather than
+             * handing it to each consumer separately: the probe, the
+             * session accumulator's format-change test and libplacebo
+             * all read it from here, so this is the one place that
+             * keeps them from disagreeing. */
+            if (d->range_effective != AVCOL_RANGE_UNSPECIFIED)
+                d->frame->color_range = d->range_effective;
+            return 1;
+        }
         if (r == AVERROR_EOF) return 0;
         if (r != AVERROR(EAGAIN)) { LOG("DEC", "decode error %d", r); return -1; }
 

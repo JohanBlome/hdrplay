@@ -216,7 +216,11 @@ src_alpha=ZERO, dst_alpha=ONE }` so the SDR render writes RGB but
 the CPU and re-uploaded only when the window size or mode/orientation
 changes.
 
-The split orientation cycles `LR → TB → DIAG → LR` via the `O` key.
+With one source, the split orientation cycles `LR → TB → DIAG → LR`
+via the `O` key. With two sources the cycle additionally includes
+full-frame `WIPE-LR` and `WIPE-TB`. Pane LR/TB renders each source into
+its own half; the three wipe modes align both complete sources in the
+same viewport and composite B over A through the corresponding mask.
 Switching invalidates `diag_tex.mask_mode`, which triggers a one-frame
 mask regeneration on the next render.
 
