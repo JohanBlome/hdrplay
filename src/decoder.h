@@ -10,7 +10,16 @@ typedef struct Decoder {
     AVCodecContext  *cc;
     int              stream_idx;
     AVPacket        *pkt;
-    AVFrame         *frame;
+    AVFrame         *frame;       /* software frame exposed to consumers */
+    AVFrame         *hw_frame;    /* decoder-owned hardware surface       */
+
+    /* Hardware decode is selected at open time. libplacebo cannot import
+     * VideoToolbox frames directly, so decoder_next_frame downloads them
+     * into `frame`; the decode itself still stays off the CPU. */
+    enum AVPixelFormat hw_pix_fmt;
+    bool               hw_requested;
+    bool               hw_active;
+    bool               hw_format_logged;
 
     /* Cached metadata extracted at open time, so the renderer and HUD
      * don't have to re-parse codecpar every frame. These describe what

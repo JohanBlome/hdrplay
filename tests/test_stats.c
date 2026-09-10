@@ -19,6 +19,18 @@ static int fails = 0;
 
 #define NEAR(a, b, tol) (fabs((a) - (b)) <= (tol))
 
+static void put_component(AVFrame *f, const AVPixFmtDescriptor *d,
+                          int c, int x, int y, unsigned value)
+{
+    const AVComponentDescriptor *cd = &d->comp[c];
+    uint8_t *p = f->data[cd->plane] +
+                 (size_t)y * f->linesize[cd->plane] +
+                 (size_t)x * cd->step + cd->offset;
+    unsigned stored = value << cd->shift;
+    int bytes = (cd->depth + cd->shift + 7) / 8;
+    for (int i = 0; i < bytes; i++) p[i] = (stored >> (8 * i)) & 0xff;
+}
+
 /* ------------------------------------------------------------------ */
 static AVFrame *mkframe(enum AVPixelFormat fmt, int w, int h,
                         enum AVColorTransferCharacteristic trc, uint16_t yval)
@@ -31,20 +43,15 @@ static AVFrame *mkframe(enum AVPixelFormat fmt, int w, int h,
     f->color_range = AVCOL_RANGE_MPEG;
     av_frame_get_buffer(f, 32);
     const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(fmt);
-    int depth = d->comp[0].depth;
     for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) {
-            if (depth == 8) f->data[0][y * f->linesize[0] + x] = (uint8_t)yval;
-            else ((uint16_t *)f->data[0])[y * (f->linesize[0] / 2) + x] = yval;
-        }
-    for (int p = 1; p <= 2 && f->data[p]; p++) {
+        for (int x = 0; x < w; x++)
+            put_component(f, d, 0, x, y, yval);
+    for (int c = 1; c <= 2; c++) {
         int cw = AV_CEIL_RSHIFT(w, d->log2_chroma_w);
         int ch = AV_CEIL_RSHIFT(h, d->log2_chroma_h);
         for (int y = 0; y < ch; y++)
-            for (int x = 0; x < cw; x++) {
-                if (depth == 8) f->data[p][y * f->linesize[p] + x] = 128;
-                else ((uint16_t *)f->data[p])[y * (f->linesize[p] / 2) + x] = 512;
-            }
+            for (int x = 0; x < cw; x++)
+                put_component(f, d, c, x, y, 1u << (d->comp[c].depth - 1));
     }
     return f;
 }
@@ -131,8 +138,8 @@ static void test_format_guard(void)
         { AV_PIX_FMT_YUV420P,     true,  true,  "yuv420p"     },
         { AV_PIX_FMT_YUV422P10LE, true,  true,  "yuv422p10le" },
         { AV_PIX_FMT_YUV444P10LE, true,  true,  "yuv444p10le" },
-        { AV_PIX_FMT_NV12,        true,  false, "nv12"        },
-        { AV_PIX_FMT_P010LE,      false, false, "p010le"      },
+        { AV_PIX_FMT_NV12,        true,  true,  "nv12"        },
+        { AV_PIX_FMT_P010LE,      true,  true,  "p010le"      },
         { AV_PIX_FMT_YUV420P10BE, false, false, "yuv420p10be" },
         { AV_PIX_FMT_GBRP10LE,    false, false, "gbrp10le"    },
     };
@@ -145,18 +152,31 @@ static void test_format_guard(void)
               "%-12s luma=%d chroma=%d", c[i].n, l, ch);
     }
 
-    /* P010's 10 bits sit at shift 6; reading them as packed would make
-     * every sample saturate to 10000 nits. */
+    /* P010's 10 bits sit at shift 6. They must be shifted down before
+     * indexing the transfer LUT, including on the interleaved UV plane. */
     FrameStats fs;
-    AVFrame *p = mkframe(AV_PIX_FMT_P010LE, 32, 32, AVCOL_TRC_SMPTE2084, 940 << 6);
-    CHECK(!probe_frame_stats(p, 1, PROBE_LUMA_ONLY, &fs),
-          "P010 refused, not read as 10000N");
+    AVFrame *p = mkframe(AV_PIX_FMT_P010LE, 32, 32, AVCOL_TRC_SMPTE2084, 940);
+    const AVPixFmtDescriptor *pd = av_pix_fmt_desc_get(p->format);
+    put_component(p, pd, 1, 2, 3, 100);
+    put_component(p, pd, 2, 2, 3, 900);
+    CHECK(read_component(p, pd, 1, 4, 6) == 100 &&
+          read_component(p, pd, 2, 4, 6) == 900,
+          "P010 interleaved chroma offsets and shifts decoded");
+    CHECK(probe_frame_stats(p, 1, PROBE_FULL_RGB, &fs), "P010 full-RGB works");
+    CHECK(NEAR(fs.peak_nits, 10000.0, 1.0),
+          "P010 code 940 -> %.1fN (expect 10000N)", fs.peak_nits);
     av_frame_free(&p);
 
-    /* NV12: luma stats fine, full-RGB declined. */
+    /* NV12 uses the same semi-planar layout at 8 bit. */
     AVFrame *n = mkframe(AV_PIX_FMT_NV12, 32, 32, AVCOL_TRC_SMPTE2084, 235);
+    const AVPixFmtDescriptor *nd = av_pix_fmt_desc_get(n->format);
+    put_component(n, nd, 1, 2, 3, 20);
+    put_component(n, nd, 2, 2, 3, 220);
+    CHECK(read_component(n, nd, 1, 4, 6) == 20 &&
+          read_component(n, nd, 2, 4, 6) == 220,
+          "NV12 interleaved chroma offsets decoded");
     CHECK(probe_frame_stats(n, 1, PROBE_LUMA_ONLY, &fs), "NV12 luma-only works");
-    CHECK(!probe_frame_stats(n, 1, PROBE_FULL_RGB, &fs), "NV12 full-RGB declined");
+    CHECK(probe_frame_stats(n, 1, PROBE_FULL_RGB, &fs), "NV12 full-RGB works");
     av_frame_free(&n);
 }
 

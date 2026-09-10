@@ -356,6 +356,9 @@ double probe_dr_ceiling_stops(enum AVColorTransferCharacteristic trc,
 
 /* Defined with the other pixel-format guards below. */
 static bool luma_plane_supported(const AVPixFmtDescriptor *desc, int *depth_out);
+static inline int read_component(const AVFrame *frame,
+                                 const AVPixFmtDescriptor *desc,
+                                 int c, int x, int y);
 
 enum AVColorRange probe_guess_color_range(const AVFrame *frame,
                                           double *out_frac)
@@ -374,20 +377,14 @@ enum AVColorRange probe_guess_color_range(const AVFrame *frame,
 
     int w = frame->width, h = frame->height;
     if (w <= 0 || h <= 0) return AVCOL_RANGE_UNSPECIFIED;
-    int y_stride_pix = (depth == 8) ? frame->linesize[0]
-                                    : (frame->linesize[0] / 2);
-
     /* Striding is fine here: this is a population fraction, not a peak,
      * and the threshold is three orders of magnitude above the sampling
      * noise of a 4-in-both-axes stride on any real frame size. */
     const int stride = (w >= 256 && h >= 256) ? 4 : 1;
     uint64_t outside = 0, total = 0;
     for (int y = 0; y < h; y += stride) {
-        const uint8_t  *row8  = frame->data[0] + (size_t)y * frame->linesize[0];
-        const uint16_t *row16 = (const uint16_t *)frame->data[0] +
-                                (size_t)y * y_stride_pix;
         for (int x = 0; x < w; x += stride) {
-            int v = (depth == 8) ? row8[x] : row16[x];
+            int v = read_component(frame, desc, 0, x, y);
             if (v < lo || v > hi) outside++;
             total++;
         }
@@ -466,21 +463,41 @@ static inline double sig_lut_eval(const SigLut *S, double V)
 /* ------------------------------------------------------------------ */
 /* Pixel-format guard.                                                 */
 /*                                                                     */
-/* Both readers below index the planes as tightly packed native-endian */
-/* uint8/uint16 arrays. That is only valid for planar, little-endian,  */
-/* non-padded YUV. Checking comp[0].depth alone is NOT enough: P010    */
-/* reports depth 10 but stores those bits in the HIGH end of a 16-bit  */
-/* word (shift == 6) with 2-byte steps, so dividing by (1<<10)-1       */
-/* overshoots ~64x and every sample saturates to the transfer's        */
-/* maximum — 10000 nits for PQ. P010 is a routine hardware-decoder     */
-/* output, so this silently poisoned the readout for a whole class of  */
-/* inputs.                                                             */
-/*                                                                     */
-/* The luma and chroma requirements are deliberately separate. NV12's  */
-/* Y plane is an ordinary 8-bit planar array and yields perfectly good */
-/* luma statistics; only its interleaved UV plane is unreadable here.  */
-/* Gating both on one predicate would throw away frame stats for a     */
-/* common hardware-decoder format for no reason.                       */
+/* Read through AVComponentDescriptor rather than assuming one tightly */
+/* packed plane per component. Hardware decoders normally download as  */
+/* NV12/P010: chroma is interleaved and P010 stores its 10-bit values in */
+/* the high bits of 16-bit words. The descriptor's plane/step/offset/   */
+/* shift fields describe both without pixel-format special cases.      */
+static bool component_supported(const AVPixFmtDescriptor *desc, int c)
+{
+    if (!desc || c < 0 || c >= desc->nb_components) return false;
+    const AVComponentDescriptor *cd = &desc->comp[c];
+    int bytes = (cd->depth + cd->shift + 7) / 8;
+    return cd->plane >= 0 && cd->plane < 4 &&
+           cd->depth > 0 && cd->depth <= 16 &&
+           cd->shift >= 0 && bytes > 0 &&
+           cd->step > 0 && cd->offset >= 0 &&
+           cd->offset + bytes <= cd->step;
+}
+
+static inline int read_component(const AVFrame *frame,
+                                 const AVPixFmtDescriptor *desc,
+                                 int c, int x, int y)
+{
+    const AVComponentDescriptor *cd = &desc->comp[c];
+    if (c == 1 || c == 2) {
+        x >>= desc->log2_chroma_w;
+        y >>= desc->log2_chroma_h;
+    }
+    const uint8_t *p = frame->data[cd->plane] +
+                       (size_t)y * frame->linesize[cd->plane] +
+                       (size_t)x * cd->step + cd->offset;
+    int bytes = (cd->depth + cd->shift + 7) / 8;
+    unsigned raw = 0;
+    for (int i = 0; i < bytes; i++) raw |= (unsigned)p[i] << (8 * i);
+    return (int)((raw >> cd->shift) & ((1u << cd->depth) - 1u));
+}
+
 static bool luma_plane_supported(const AVPixFmtDescriptor *desc, int *depth_out)
 {
     if (!desc || desc->nb_components < 1) return false;
@@ -492,32 +509,19 @@ static bool luma_plane_supported(const AVPixFmtDescriptor *desc, int *depth_out)
 
     int depth = desc->comp[0].depth;
     if (depth != 8 && depth != 10 && depth != 12) return false;
-
-    /* No bit offset within the word, and one sample per word. This is
-     * what excludes P010: depth 10, but shift 6 and a 2-byte step over
-     * a 16-bit word. (Reading it correctly would just mean a >> 6;
-     * left as a follow-up rather than smuggled into a bug fix.) */
-    if (desc->comp[0].shift != 0) return false;
-    if (desc->comp[0].step != (depth == 8 ? 1 : 2)) return false;
-    if (desc->comp[0].offset != 0) return false;
+    if (!component_supported(desc, 0)) return false;
 
     if (depth_out) *depth_out = depth;
     return true;
 }
 
-/* Cb and Cr each in their own plane, one sample per word, same depth
- * as luma. Excludes semi-planar layouts (NV12/NV21/P0xx) where both
- * chroma components share one interleaved plane. */
 static bool chroma_planes_supported(const AVPixFmtDescriptor *desc)
 {
     if (!desc || desc->nb_components < 3) return false;
     int depth = desc->comp[0].depth;
     for (int c = 1; c <= 2; c++) {
-        if (desc->comp[c].plane  != c) return false;
         if (desc->comp[c].depth  != depth) return false;
-        if (desc->comp[c].shift  != 0) return false;
-        if (desc->comp[c].offset != 0) return false;
-        if (desc->comp[c].step   != (depth == 8 ? 1 : 2)) return false;
+        if (!component_supported(desc, c)) return false;
     }
     return true;
 }
@@ -552,12 +556,13 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
     out->src_y = src_y;
     out->reference = lum_reference_of(frame->color_trc);
 
-    /* Inspect pix_fmt — 8/10/12-bit planar YUV, any chroma layout. */
+    /* Inspect pix_fmt — 8/10/12-bit planar or semi-planar YUV. */
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
     int depth = 0;
     if (!luma_plane_supported(desc, &depth)) return false;
     if (!chroma_planes_supported(desc)) return false;
-    if (!frame->data[1] || !frame->data[2]) return false;
+    for (int c = 0; c < 3; c++)
+        if (!frame->data[desc->comp[c].plane]) return false;
 
     /* Raw sample values. Limited range black/white differ by depth.   */
     /* Chroma siting comes from the descriptor rather than a hardcoded */
@@ -565,19 +570,9 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
     /* subsampling at all, so the old `cy = src_y / 2` read the wrong  */
     /* row for both. Those are ordinary mastering formats here.        */
     int y_raw, u_raw, v_raw;
-    int cx = src_x >> desc->log2_chroma_w;
-    int cy = src_y >> desc->log2_chroma_h;
-
-    if (depth == 8) {
-        y_raw = frame->data[0][src_y * frame->linesize[0] + src_x];
-        u_raw = frame->data[1][cy    * frame->linesize[1] + cx];
-        v_raw = frame->data[2][cy    * frame->linesize[2] + cx];
-    } else {
-        /* 10/12-bit planar little-endian. */
-        y_raw = ((uint16_t *)frame->data[0])[src_y * (frame->linesize[0] / 2) + src_x];
-        u_raw = ((uint16_t *)frame->data[1])[cy    * (frame->linesize[1] / 2) + cx];
-        v_raw = ((uint16_t *)frame->data[2])[cy    * (frame->linesize[2] / 2) + cx];
-    }
+    y_raw = read_component(frame, desc, 0, src_x, src_y);
+    u_raw = read_component(frame, desc, 1, src_x, src_y);
+    v_raw = read_component(frame, desc, 2, src_x, src_y);
 
     /* Normalize to [0,1] / [-0.5,0.5] honoring limited vs full range. */
     int max  = (1 << depth) - 1;
@@ -669,9 +664,10 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
     if (!luma_plane_supported(desc, &depth)) return false;
 
     bool want_rgb = (mode == PROBE_FULL_RGB);
-    if (want_rgb && (!chroma_planes_supported(desc) ||
-                     !frame->data[1] || !frame->data[2]))
-        return false;
+    if (want_rgb && !chroma_planes_supported(desc)) return false;
+    int components = want_rgb ? 3 : 1;
+    for (int c = 0; c < components; c++)
+        if (!frame->data[desc->comp[c].plane]) return false;
 
     bool  full_range = (frame->color_range == AVCOL_RANGE_JPEG);
     out->reference   = lum_reference_of(frame->color_trc);
@@ -697,8 +693,6 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
     int           max_raw = (1 << depth) - 1;
 
     int w = frame->width, h = frame->height;
-    int y_stride_pix = (depth == 8) ? frame->linesize[0] : (frame->linesize[0] / 2);
-
     double peak = 0.0, floor_min = 1e9, sum = 0.0;
     double rgb_peak = 0.0, rgb_sum = 0.0;
     int    n = 0, a100 = 0, a500 = 0, a1000 = 0, out709 = 0;
@@ -709,11 +703,8 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
     const double floor_cutoff_nits = 0.05;
 
     for (int y = 0; y < h; y += sample_stride) {
-        const uint8_t  *row8  = frame->data[0] + (size_t)y * frame->linesize[0];
-        const uint16_t *row16 = (const uint16_t *)frame->data[0] + (size_t)y * y_stride_pix;
-
         for (int x = 0; x < w; x += sample_stride) {
-            int yraw = (depth == 8) ? row8[x] : row16[x];
+            int yraw = read_component(frame, desc, 0, x, y);
             if (yraw < 0) yraw = 0;
             if (yraw > max_raw) yraw = max_raw;
 
@@ -733,16 +724,8 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
             if (!want_rgb) continue;
 
             /* --- per-channel path ------------------------------- */
-            int cx = x >> desc->log2_chroma_w;
-            int cy = y >> desc->log2_chroma_h;
-            int u_raw, v_raw;
-            if (depth == 8) {
-                u_raw = frame->data[1][cy * frame->linesize[1] + cx];
-                v_raw = frame->data[2][cy * frame->linesize[2] + cx];
-            } else {
-                u_raw = ((const uint16_t *)frame->data[1])[cy * (frame->linesize[1] / 2) + cx];
-                v_raw = ((const uint16_t *)frame->data[2])[cy * (frame->linesize[2] / 2) + cx];
-            }
+            int u_raw = read_component(frame, desc, 1, x, y);
+            int v_raw = read_component(frame, desc, 2, x, y);
 
             double Yn, Cb, Cr;
             if (full_range) {

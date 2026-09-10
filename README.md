@@ -7,7 +7,7 @@ Companion to `vca.py`: where `vca` answers "is this file really HDR?",
 ## The pipeline, in one diagram
 
 ```
-file                                      [DEC]   demux + decode
+file                                      [DEC]   demux + hardware decode
  │
  ▼
 AVFrame (10-bit P010 / YUV420P10 / …)    [META]  HDR10 side data extracted
@@ -30,6 +30,13 @@ SDL3 / OS compositor                      [HDR]   signals HDR to panel
  ▼
 display
 ```
+
+On macOS, H.264/HEVC and other supported formats are decoded by
+VideoToolbox. The hardware surface is downloaded as NV12/P010 because
+libplacebo's Vulkan mapper cannot directly import a VideoToolbox
+`CVPixelBuffer`; colour conversion and presentation remain on the GPU.
+Unsupported profiles and codecs automatically use FFmpeg's multithreaded
+software decoder.
 
 ## Build
 

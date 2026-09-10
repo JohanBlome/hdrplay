@@ -3,6 +3,8 @@
 #include "probe.h"
 
 #include <math.h>
+#include <libavutil/error.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/mastering_display_metadata.h>
 
@@ -141,9 +143,91 @@ void decoder_set_range_override(enum AVColorRange r)
     g_range_override = r;
 }
 
+static enum AVPixelFormat choose_hw_format(AVCodecContext *cc,
+                                            const enum AVPixelFormat *formats)
+{
+    Decoder *d = cc->opaque;
+    for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == d->hw_pix_fmt) {
+            d->hw_active = true;
+            LOG("DEC", "hardware decode active: VideoToolbox");
+            return *p;
+        }
+    }
+
+    /* A codec can advertise VideoToolbox globally yet reject a particular
+     * profile or bitstream. Pick its software format instead of failing the
+     * whole open. */
+    LOG("DEC", "WARNING: VideoToolbox rejected this stream; using software decode");
+    d->hw_active = false;
+    for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; p++) {
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
+        if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
+            return *p;
+    }
+    return AV_PIX_FMT_NONE;
+}
+
+/* Configure the platform decoder when the selected codec exposes it. This is
+ * deliberately best-effort: unusual H.264/HEVC profiles and codecs that
+ * VideoToolbox does not implement must remain playable. */
+static bool configure_hardware_decode(Decoder *d, const AVCodec *codec)
+{
+#ifdef __APPLE__
+    const enum AVHWDeviceType type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+        if (!cfg) break;
+        if (cfg->device_type != type ||
+            !(cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+            continue;
+
+        AVBufferRef *device = NULL;
+        int err = av_hwdevice_ctx_create(&device, type, NULL, NULL, 0);
+        if (err < 0) {
+            char msg[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(err, msg, sizeof(msg));
+            LOG("DEC", "WARNING: cannot create VideoToolbox device: %s; "
+                       "using software decode", msg);
+            return false;
+        }
+
+        d->hw_pix_fmt = cfg->pix_fmt;
+        d->hw_requested = true;
+        d->cc->opaque = d;
+        d->cc->get_format = choose_hw_format;
+        d->cc->hw_device_ctx = device; /* AVCodecContext owns this reference. */
+        LOG("DEC", "hardware decode requested: VideoToolbox");
+        return true;
+    }
+#else
+    (void)d;
+    (void)codec;
+#endif
+    return false;
+}
+
+static bool allocate_codec_context(Decoder *d, const AVCodec *codec,
+                                   const AVCodecParameters *params,
+                                   bool try_hardware)
+{
+    d->cc = avcodec_alloc_context3(codec);
+    if (!d->cc || avcodec_parameters_to_context(d->cc, params) < 0)
+        return false;
+
+    /* avcodec_alloc_context3 defaults to one thread. Even the hardware
+     * fallback must not silently regress to single-threaded decode. */
+    d->cc->thread_count = 0;
+    d->cc->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    if (try_hardware)
+        configure_hardware_decode(d, codec);
+    return true;
+}
+
 bool decoder_open(Decoder *d, const char *path)
 {
     memset(d, 0, sizeof(*d));
+    d->hw_pix_fmt = AV_PIX_FMT_NONE;
 
     if (avformat_open_input(&d->fmt, path, NULL, NULL) < 0) {
         LOG("DEC", "ERROR: cannot open %s", path);
@@ -161,12 +245,35 @@ bool decoder_open(Decoder *d, const char *path)
     const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
     if (!codec) { LOG("DEC", "ERROR: no decoder for codec id %d", st->codecpar->codec_id); return false; }
 
-    d->cc = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(d->cc, st->codecpar);
-    if (avcodec_open2(d->cc, codec, NULL) < 0) {
-        LOG("DEC", "ERROR: cannot open decoder");
+    if (!allocate_codec_context(d, codec, st->codecpar, true)) {
+        LOG("DEC", "ERROR: cannot allocate decoder");
         return false;
     }
+    int open_err = avcodec_open2(d->cc, codec, NULL);
+    if (open_err < 0 && d->hw_requested) {
+        /* Device setup can succeed while codec initialization fails for a
+         * profile VideoToolbox does not support. Recreate a clean software
+         * context; an opened codec context cannot safely be reused. */
+        char msg[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(open_err, msg, sizeof(msg));
+        LOG("DEC", "WARNING: VideoToolbox open failed: %s; using software decode", msg);
+        avcodec_free_context(&d->cc);
+        d->hw_requested = false;
+        d->hw_active = false;
+        d->hw_pix_fmt = AV_PIX_FMT_NONE;
+        if (!allocate_codec_context(d, codec, st->codecpar, false))
+            return false;
+        open_err = avcodec_open2(d->cc, codec, NULL);
+    }
+    if (open_err < 0) {
+        char msg[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(open_err, msg, sizeof(msg));
+        LOG("DEC", "ERROR: cannot open decoder: %s", msg);
+        return false;
+    }
+
+    if (!d->hw_requested)
+        LOG("DEC", "software decode: %d threads", d->cc->thread_count);
 
     d->width     = d->cc->width;
     d->height    = d->cc->height;
@@ -191,7 +298,9 @@ bool decoder_open(Decoder *d, const char *path)
 
     d->pkt   = av_packet_alloc();
     d->frame = av_frame_alloc();
-    return true;
+    if (d->hw_requested)
+        d->hw_frame = av_frame_alloc();
+    return d->pkt && d->frame && (!d->hw_requested || d->hw_frame);
 }
 
 /* See decoder.h. The pixels are the only evidence left once the
@@ -246,8 +355,32 @@ bool decoder_resolve_color_range(Decoder *d, int max_frames)
 int decoder_next_frame(Decoder *d)
 {
     for (;;) {
-        int r = avcodec_receive_frame(d->cc, d->frame);
+        AVFrame *decoded = d->hw_frame ? d->hw_frame : d->frame;
+        int r = avcodec_receive_frame(d->cc, decoded);
         if (r == 0) {
+            if (decoded != d->frame) {
+                av_frame_unref(d->frame);
+                if (decoded->format == d->hw_pix_fmt) {
+                    r = av_hwframe_transfer_data(d->frame, decoded, 0);
+                    if (r >= 0)
+                        r = av_frame_copy_props(d->frame, decoded);
+                    av_frame_unref(decoded);
+                    if (r < 0) {
+                        char msg[AV_ERROR_MAX_STRING_SIZE];
+                        av_strerror(r, msg, sizeof(msg));
+                        LOG("DEC", "hardware frame download failed: %s", msg);
+                        return -1;
+                    }
+                    if (!d->hw_format_logged) {
+                        LOG("DEC", "VideoToolbox output downloaded as %s",
+                            av_get_pix_fmt_name(d->frame->format) ?: "unknown");
+                        d->hw_format_logged = true;
+                    }
+                } else {
+                    /* get_format selected the software fallback. */
+                    av_frame_move_ref(d->frame, decoded);
+                }
+            }
             /* Stamp the resolved range on the frame rather than
              * handing it to each consumer separately: the probe, the
              * session accumulator's format-change test and libplacebo
@@ -311,6 +444,7 @@ double decoder_frame_seconds(const Decoder *d)
 
 void decoder_close(Decoder *d)
 {
+    if (d->hw_frame) av_frame_free(&d->hw_frame);
     if (d->frame) av_frame_free(&d->frame);
     if (d->pkt)   av_packet_free(&d->pkt);
     if (d->cc)    avcodec_free_context(&d->cc);
