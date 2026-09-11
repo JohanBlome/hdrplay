@@ -91,7 +91,7 @@ int brightness_set(int display_index, float value)
         return 2;
     }
     const char *name = display_name_at(display_index);
-    if (name && strcasestr(name, "XDR")) {
+    if (name && SDL_strcasestr(name, "XDR")) {
         LOG("HDR", "Pro Display XDR detected on [%d] %s — no public API can",
             display_index, name);
         LOG("HDR", "set brightness on this panel. Open System Settings →");
@@ -99,7 +99,8 @@ int brightness_set(int display_index, float value)
         return 3;
     }
 
-    bool is_builtin = name && (strcasestr(name, "Built-in") || strcasestr(name, "Retina"));
+    bool is_builtin = name && (SDL_strcasestr(name, "Built-in") ||
+                               SDL_strcasestr(name, "Retina"));
 
     /* Built-in first: IOKit, then Homebrew `brightness`. */
     if (is_builtin) {

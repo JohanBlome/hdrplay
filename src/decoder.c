@@ -150,15 +150,15 @@ static enum AVPixelFormat choose_hw_format(AVCodecContext *cc,
     for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == d->hw_pix_fmt) {
             d->hw_active = true;
-            LOG("DEC", "hardware decode active: VideoToolbox");
+            LOG("DEC", "hardware decode active: %s", d->hw_name);
             return *p;
         }
     }
 
-    /* A codec can advertise VideoToolbox globally yet reject a particular
-     * profile or bitstream. Pick its software format instead of failing the
-     * whole open. */
-    LOG("DEC", "WARNING: VideoToolbox rejected this stream; using software decode");
+    /* A codec can advertise a device globally yet reject a particular profile
+     * or bitstream. Pick its software format instead of failing the open. */
+    LOG("DEC", "WARNING: %s rejected this stream; using software decode",
+        d->hw_name);
     d->hw_active = false;
     for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; p++) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
@@ -174,35 +174,56 @@ static enum AVPixelFormat choose_hw_format(AVCodecContext *cc,
 static bool configure_hardware_decode(Decoder *d, const AVCodec *codec)
 {
 #ifdef __APPLE__
-    const enum AVHWDeviceType type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-    for (int i = 0;; i++) {
-        const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
-        if (!cfg) break;
-        if (cfg->device_type != type ||
-            !(cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
-            continue;
+    static const enum AVHWDeviceType preferred[] = {
+        AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+    };
+#elif defined(__linux__)
+    /* VAAPI covers Intel and AMD through Mesa; CUDA covers NVIDIA when
+     * FFmpeg was built with nv-codec-headers (as RPM Fusion's build is). */
+    static const enum AVHWDeviceType preferred[] = {
+        AV_HWDEVICE_TYPE_VAAPI,
+        AV_HWDEVICE_TYPE_CUDA,
+    };
+#else
+    (void)d;
+    (void)codec;
+    return false;
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+    for (size_t t = 0; t < sizeof(preferred) / sizeof(preferred[0]); t++) {
+        const enum AVHWDeviceType type = preferred[t];
+        const AVCodecHWConfig *match = NULL;
+        for (int i = 0;; i++) {
+            const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+            if (!cfg) break;
+            if (cfg->device_type == type &&
+                (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+                match = cfg;
+                break;
+            }
+        }
+        if (!match) continue;
 
         AVBufferRef *device = NULL;
         int err = av_hwdevice_ctx_create(&device, type, NULL, NULL, 0);
         if (err < 0) {
             char msg[AV_ERROR_MAX_STRING_SIZE];
             av_strerror(err, msg, sizeof(msg));
-            LOG("DEC", "WARNING: cannot create VideoToolbox device: %s; "
-                       "using software decode", msg);
-            return false;
+            LOG("DEC", "%s unavailable: %s",
+                av_hwdevice_get_type_name(type), msg);
+            continue;
         }
 
-        d->hw_pix_fmt = cfg->pix_fmt;
+        d->hw_pix_fmt = match->pix_fmt;
+        d->hw_name = av_hwdevice_get_type_name(type);
         d->hw_requested = true;
         d->cc->opaque = d;
         d->cc->get_format = choose_hw_format;
         d->cc->hw_device_ctx = device; /* AVCodecContext owns this reference. */
-        LOG("DEC", "hardware decode requested: VideoToolbox");
+        LOG("DEC", "hardware decode requested: %s", d->hw_name);
         return true;
     }
-#else
-    (void)d;
-    (void)codec;
 #endif
     return false;
 }
@@ -256,7 +277,8 @@ bool decoder_open(Decoder *d, const char *path)
          * context; an opened codec context cannot safely be reused. */
         char msg[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(open_err, msg, sizeof(msg));
-        LOG("DEC", "WARNING: VideoToolbox open failed: %s; using software decode", msg);
+        LOG("DEC", "WARNING: %s open failed: %s; using software decode",
+            d->hw_name, msg);
         avcodec_free_context(&d->cc);
         d->hw_requested = false;
         d->hw_active = false;
@@ -372,7 +394,7 @@ int decoder_next_frame(Decoder *d)
                         return -1;
                     }
                     if (!d->hw_format_logged) {
-                        LOG("DEC", "VideoToolbox output downloaded as %s",
+                        LOG("DEC", "%s output downloaded as %s", d->hw_name,
                             av_get_pix_fmt_name(d->frame->format) ?: "unknown");
                         d->hw_format_logged = true;
                     }

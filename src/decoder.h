@@ -13,10 +13,11 @@ typedef struct Decoder {
     AVFrame         *frame;       /* software frame exposed to consumers */
     AVFrame         *hw_frame;    /* decoder-owned hardware surface       */
 
-    /* Hardware decode is selected at open time. libplacebo cannot import
-     * VideoToolbox frames directly, so decoder_next_frame downloads them
-     * into `frame`; the decode itself still stays off the CPU. */
+    /* Hardware decode is selected at open time. decoder_next_frame downloads
+     * hardware surfaces into `frame`, keeping the renderer and pixel probes
+     * on one portable software-frame interface. */
     enum AVPixelFormat hw_pix_fmt;
+    const char        *hw_name;
     bool               hw_requested;
     bool               hw_active;
     bool               hw_format_logged;

@@ -53,6 +53,12 @@ target_link_libraries(hdrplay PRIVATE
     Vulkan::Vulkan
 )
 
+# Unlike Darwin's libSystem, glibc keeps pow/log2/fmax in a separate
+# library. probe.c and the renderer both use them.
+if(NOT APPLE)
+    target_link_libraries(hdrplay PRIVATE m)
+endif()
+
 if(APPLE)
     find_library(IOKIT_LIB IOKit REQUIRED)
     find_library(COREFOUNDATION_LIB CoreFoundation REQUIRED)

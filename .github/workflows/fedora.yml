@@ -1,0 +1,27 @@
+name: Fedora build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fedora:
+    runs-on: ubuntu-latest
+    container: fedora:43
+    steps:
+      - name: Install build dependencies
+        run: >-
+          dnf install -y
+          git gcc cmake pkgconf-pkg-config
+          ffmpeg-free-devel libplacebo-devel SDL3-devel
+          vulkan-loader-devel vulkan-headers
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build and test
+        run: |
+          cmake --build build --parallel
+          cmake --build build --target check

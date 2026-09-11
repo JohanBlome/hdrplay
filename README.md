@@ -31,12 +31,12 @@ SDL3 / OS compositor                      [HDR]   signals HDR to panel
 display
 ```
 
-On macOS, H.264/HEVC and other supported formats are decoded by
-VideoToolbox. The hardware surface is downloaded as NV12/P010 because
-libplacebo's Vulkan mapper cannot directly import a VideoToolbox
-`CVPixelBuffer`; colour conversion and presentation remain on the GPU.
-Unsupported profiles and codecs automatically use FFmpeg's multithreaded
-software decoder.
+On macOS, supported formats are decoded by VideoToolbox. On Linux,
+hdrplay tries VAAPI (Intel/AMD) and then CUDA (NVIDIA, when enabled in
+FFmpeg). The hardware surface is downloaded as NV12/P010 for the pixel
+probes and session statistics; colour conversion and presentation remain
+on the GPU. Unsupported profiles, codecs and systems automatically use
+FFmpeg's multithreaded software decoder.
 
 ## Build
 
@@ -80,7 +80,34 @@ It tries, in order:
 
 If nothing is found, the `[GPU]` log prints every path it tried.
 
-### Linux (Ubuntu 24.04+)
+### Fedora Linux 43+
+
+Fedora's own FFmpeg build is sufficient to compile hdrplay, but omits
+some patent-encumbered codecs. For a build that can also play ordinary
+H.264 and HEVC files, enable RPM Fusion Free and install its FFmpeg:
+
+```bash
+sudo dnf install \
+  "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"
+sudo dnf install --allowerasing \
+  gcc cmake pkgconf-pkg-config ffmpeg ffmpeg-devel \
+  libplacebo-devel SDL3-devel \
+  vulkan-loader-devel vulkan-headers mesa-vulkan-drivers
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j
+cmake --build build --target check
+./build/hdrplay path/to/video.mp4
+```
+
+For a build using only the official Fedora repositories, replace
+`ffmpeg ffmpeg-devel` with `ffmpeg-free ffmpeg-free-devel`. The binary
+will build normally, but codec availability is limited by that package.
+`mesa-vulkan-drivers` supplies Vulkan for Intel and AMD GPUs; systems
+using NVIDIA's proprietary driver already obtain Vulkan from that
+driver instead.
+
+### Ubuntu 24.04+
 
 ```bash
 sudo apt install build-essential cmake pkg-config \
