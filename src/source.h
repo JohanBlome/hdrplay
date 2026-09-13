@@ -72,10 +72,15 @@ double source_shown_sec(const Source *s);
  * NAN at EOF. */
 double source_peek_next_sec(Source *s);
 
-/* Advance until the frame in effect at `t` seconds is shown — i.e. the
- * last frame whose PTS is <= t. Returns true if the shown frame
- * changed. At EOF the last frame is held rather than going black. */
+/* Align to the frame in effect at `t` seconds — i.e. the last frame whose
+ * PTS is <= t. Forward movement decodes normally; backward movement uses
+ * retained frames when possible and seeks otherwise. Returns true if the
+ * shown frame changed. At EOF the last frame is held rather than going black. */
 bool source_advance_to(Source *s, double t);
+
+/* Seek the decoder and immediately align the displayed frame to `t`.
+ * Unlike decoder_seek_to()+source_flush(), this is complete while paused. */
+bool source_seek_to(Source *s, double t);
 
 /* Show the next frame and return its time, or NAN if none. Walks the
  * ring cursor forward first when stepping back has left it behind. */
@@ -87,7 +92,7 @@ double source_step_forward(Source *s);
  * back-steps stay fast. */
 double source_step_back(Source *s);
 
-/* Drop decoded state after a seek. */
+/* Drop decoded and displayed state after a seek. */
 void source_flush(Source *s);
 
 #endif

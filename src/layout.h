@@ -139,6 +139,11 @@ void layout_plan(const LayoutInput *in, LayoutPlan *out);
 HdrplaySplitOrient layout_next_split_orient(HdrplaySplitOrient current,
                                              bool two_source_compare);
 
+/* P means HDR/SDR split for one input, but returns to A/B comparison when
+ * two inputs are open. The active HDR/SDR treatment is preserved for A/B. */
+void layout_activate_split_or_compare(int n_sources, int *solo,
+                                      HdrplayMode *mode);
+
 /* Place a source inside a pane with its aspect ratio preserved.
  *
  * This is the one place geometry is decided. It returns the visible

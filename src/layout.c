@@ -472,3 +472,12 @@ void layout_plan(const LayoutInput *in, LayoutPlan *out)
     }
     plan_pair(in, out);
 }
+
+void layout_activate_split_or_compare(int n_sources, int *solo,
+                                      HdrplayMode *mode)
+{
+    if (n_sources > 1)
+        *solo = -1;
+    else
+        *mode = HDRPLAY_MODE_SPLIT;
+}

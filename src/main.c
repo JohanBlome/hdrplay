@@ -289,7 +289,8 @@ static void usage(void)
         "                            may pass wide-gamut colors through and\n"
         "                            mask the gamut-narrowing advantage HDR\n"
         "                            has over SDR)\n"
-        "  keys at runtime:      F=fullscreen  H=HDR  S=SDR  P=split\n"
+        "  keys at runtime:      F=fullscreen  H=HDR  S=SDR\n"
+        "                        P=split (one file) / compare (two files)\n"
         "                        O=cycle pane layouts / comparison wipes\n"
         "                          SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
@@ -374,8 +375,8 @@ static void usage(void)
         "                        than by frame index.\n"
         "                        The split becomes the LAYOUT, so\n"
         "                        H/S apply to both panes; press\n"
-        "                        1 or 2 to solo a file and get the\n"
-        "                        HDR-vs-SDR split back.\n"
+        "                        1 or 2 to solo a file; P or 0 returns\n"
+        "                        to the two-file comparison.\n"
         "  --step-buffer N       frames retained per file for\n"
         "                        instant step-back. Default 8.\n"
         "                        ~25MB/frame at 4K 10-bit, ~6MB at\n"
@@ -690,7 +691,14 @@ int main(int argc, char **argv)
                 }
                 if (e.key.key == SDLK_H) { rend.mode = HDRPLAY_MODE_HDR;   LOG("REND", "mode -> HDR"); }
                 if (e.key.key == SDLK_S) { rend.mode = HDRPLAY_MODE_SDR;   LOG("REND", "mode -> SDR"); }
-                if (e.key.key == SDLK_P) { rend.mode = HDRPLAY_MODE_SPLIT; LOG("REND", "mode -> SPLIT"); }
+                if (e.key.key == SDLK_P) {
+                    layout_activate_split_or_compare(n_sources, &rend.solo,
+                                                     &rend.mode);
+                    if (n_sources > 1)
+                        LOG("REND", "compare A|B");
+                    else
+                        LOG("REND", "mode -> SPLIT");
+                }
                 if (e.key.key == SDLK_O) {
                     rend.split_orient = layout_next_split_orient(
                         rend.split_orient, rend.n_sources > 1 && rend.solo < 0);
@@ -713,10 +721,8 @@ int main(int argc, char **argv)
                     LOG("DEC", "loop %s", loop_at_eof ? "ON" : "OFF");
                 }
                 if (e.key.key == SDLK_R) {
-                    for (int i = 0; i < n_sources; i++) {
-                        decoder_seek_start(&sources[i].dec);
-                        source_flush(&sources[i]);
-                    }
+                    for (int i = 0; i < n_sources; i++)
+                        source_seek_to(&sources[i], 0.0);
                     clock_sec = 0.0;
                     rebase = true;
                     LOG("DEC", "restarted from beginning");
@@ -728,10 +734,8 @@ int main(int argc, char **argv)
                     double delta = (e.key.key == SDLK_RIGHT) ? 10.0 : -10.0;
                     double target = clock_sec + delta;
                     if (target < 0.0) target = 0.0;
-                    for (int i = 0; i < n_sources; i++) {
-                        if (decoder_seek_to(&sources[i].dec, target))
-                            source_flush(&sources[i]);
-                    }
+                    for (int i = 0; i < n_sources; i++)
+                        source_seek_to(&sources[i], target);
                     clock_sec = target;
                     rebase = true;
                     LOG("DEC", "seek %+.0fs -> %.2f", delta, target);
@@ -926,12 +930,11 @@ int main(int argc, char **argv)
             if (all_eof) {
                 LOG("DEC", "EOF");
                 if (loop_at_eof) {
-                    for (int i = 0; i < n_sources; i++) {
-                        decoder_seek_start(&sources[i].dec);
-                        source_flush(&sources[i]);
-                    }
+                    for (int i = 0; i < n_sources; i++)
+                        source_seek_to(&sources[i], 0.0);
                     clock_sec = 0.0;
                     rebase = true;
+                    dirty = true;
                     continue;
                 }
                 quit = true;

@@ -315,6 +315,29 @@ static void test_orientation_cycle(void)
           "soloing from a pair-only wipe returns to the single-source cycle");
 }
 
+static void test_split_key_semantics(void)
+{
+    puts("P selects split for one source and comparison for two");
+
+    int solo = -1;
+    HdrplayMode mode = HDRPLAY_MODE_HDR;
+    layout_activate_split_or_compare(1, &solo, &mode);
+    CHECK(mode == HDRPLAY_MODE_SPLIT && solo == -1,
+          "one source: P selects HDR/SDR split");
+
+    solo = 1;
+    mode = HDRPLAY_MODE_HDR;
+    layout_activate_split_or_compare(2, &solo, &mode);
+    CHECK(solo == -1 && mode == HDRPLAY_MODE_HDR,
+          "two sources: P leaves solo and preserves HDR treatment");
+
+    solo = 0;
+    mode = HDRPLAY_MODE_SDR;
+    layout_activate_split_or_compare(2, &solo, &mode);
+    CHECK(solo == -1 && mode == HDRPLAY_MODE_SDR,
+          "two sources: P preserves SDR treatment");
+}
+
 /* No overlay may be attached to more than one pass. */
 static void test_overlay_routing_is_exclusive(void)
 {
@@ -777,6 +800,7 @@ int main(void)
     test_pair_diag();
     test_pair_rect_wipes();
     test_orientation_cycle();
+    test_split_key_semantics();
     test_overlay_routing_is_exclusive();
     test_zoom_pan();
     test_mismatched_geometry();

@@ -126,9 +126,11 @@ double source_shown_sec(const Source *s)
 
 void source_flush(Source *s)
 {
+    av_frame_free(&s->shown);
     av_frame_free(&s->pending);
     ring_clear(&s->ring);
     s->eof = false;
+    s->frame_stats_valid = false;
 }
 
 /* Pull one frame into `pending` if there isn't one already. */
@@ -147,6 +149,14 @@ static bool fill_pending(Source *s)
 
 double source_peek_next_sec(Source *s)
 {
+    /* When parked in retained history, the next frame is already in the
+     * ring. Looking at decoder pending here would pace against the frame
+     * beyond the newest retained one and skip the history on resume. */
+    if (s->ring.back > 0) {
+        int idx = s->ring.len - s->ring.back;
+        if (idx >= 0 && idx < s->ring.len)
+            return pts_to_sec(s, s->ring.buf[idx]);
+    }
     if (!fill_pending(s)) return NAN;
     return pts_to_sec(s, s->pending);
 }
@@ -181,12 +191,50 @@ bool source_advance_to(Source *s, double t)
 {
     bool changed = false;
 
-    /* Live playback always resumes at the newest frame. */
-    while (s->ring.back > 0) { ring_step_fwd(&s->ring); changed = true; }
-    if (changed) {
-        AVFrame *cur = ring_current(&s->ring);
-        if (cur) { av_frame_free(&s->shown); s->shown = av_frame_clone(cur); }
+    /* A master-clock move can go backward after frame stepping or a seek.
+     * Find the retained frame in effect at that instant. Previously only
+     * the focused source moved backward; the other stayed in the future. */
+    double shown_t = source_shown_sec(s);
+    if (!isnan(shown_t) && shown_t > t + 1e-9) {
+        int best = -1;
+        for (int i = 0; i < s->ring.len; i++) {
+            double ft = pts_to_sec(s, s->ring.buf[i]);
+            if (!isnan(ft) && ft <= t + 1e-9) best = i;
+        }
+        if (best >= 0) {
+            s->ring.back = s->ring.len - 1 - best;
+            AVFrame *cur = ring_current(&s->ring);
+            av_frame_free(&s->shown);
+            s->shown = av_frame_clone(cur);
+            s->eof = false;
+            changed = true;
+        } else {
+            /* The target predates retained history. Decode forward from
+             * the preceding keyframe to reconstruct the correct frame. */
+            if (!decoder_seek_to(&s->dec, t)) return false;
+            source_flush(s);
+            changed = true;
+        }
     }
+
+    /* Walk retained frames according to their timestamps. Do not jump to
+     * the newest frame merely because playback resumed. */
+    while (s->ring.back > 0) {
+        int idx = s->ring.len - s->ring.back;
+        double next = pts_to_sec(s, s->ring.buf[idx]);
+        if (!isnan(next) && next > t + 1e-9) break;
+        ring_step_fwd(&s->ring);
+        AVFrame *cur = ring_current(&s->ring);
+        if (cur) {
+            av_frame_free(&s->shown);
+            s->shown = av_frame_clone(cur);
+        }
+        changed = true;
+    }
+
+    /* More retained frames are still in the future; decoding pending is
+     * not due yet. */
+    if (s->ring.back > 0) return changed;
 
     for (;;) {
         double next = source_peek_next_sec(s);
@@ -203,6 +251,15 @@ bool source_advance_to(Source *s, double t)
         changed = true;
     }
     return changed;
+}
+
+bool source_seek_to(Source *s, double t)
+{
+    if (t < 0.0) t = 0.0;
+    if (!decoder_seek_to(&s->dec, t)) return false;
+    source_flush(s);
+    source_advance_to(s, t);
+    return true;
 }
 
 double source_step_forward(Source *s)
@@ -224,6 +281,7 @@ double source_step_forward(Source *s)
 double source_step_back(Source *s)
 {
     if (ring_step_back(&s->ring)) {
+        s->eof = false;
         AVFrame *cur = ring_current(&s->ring);
         if (cur) {
             av_frame_free(&s->shown);

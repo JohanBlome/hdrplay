@@ -177,15 +177,18 @@ synchronized has to mean when the rates differ — frame-index lockstep
 would drift them apart linearly. A shorter file holds its last frame
 instead of going black.
 
+Soloing with `1` or `2` only changes what is rendered. Both sources keep
+following the same master clock during playback, seeking and frame stepping,
+so returning to comparison with `0` or `P` cannot reveal a stale hidden source.
+
 With two files the default split becomes the **layout**, so `H`/`S` apply to
 both panes and you compare A-vs-B under HDR, then A-vs-B under SDR. The
 comparison cycle also includes full-frame left/right, top/bottom and
 diagonal wipes; these align both complete images and replace half of A
 with B, which is especially useful for gradients and banding tests.
 Varying content and treatment at once would leave any difference you see
-with two possible causes. Press `1` or `2` to solo a file, which drops
-back to exactly single-file behaviour — including the HDR-vs-SDR split —
-and `0` to return.
+with two possible causes. Press `1` or `2` to solo a file; `P` or `0`
+returns to the two-file comparison.
 
 | Key | |
 |---|---|
@@ -195,7 +198,7 @@ and `0` to return.
 | `Z` | toggle fit / 1:1 |
 | `+` `-` | zoom steps |
 | drag, `shift`+arrows | pan, locked across panes |
-| `P` `O` | split mode / cycle pane LR, pane TB, diagonal, LR wipe, TB wipe |
+| `P` `O` | return to A/B comparison / cycle pane LR, pane TB, diagonal, LR wipe, TB wipe |
 | `T` | rotate the focused pane 90° clockwise |
 | `W` | resize the window for exact 1:1, no letterbox |
 
