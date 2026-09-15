@@ -464,9 +464,12 @@ static void ensure_inter_tex(Renderer *r, int si, int w, int h, int mask_mode,
 
 /* ------------------------------------------------------------------ */
 /* Helpers to apply a colorspace to the target frame.                 */
-/* The swapchain is always HDR-capable; we synthesize SDR by clamping */
-/* the target's peak luminance, so libplacebo's tone-mapper does the  */
-/* heavy lifting.                                                     */
+/* On an HDR-capable swapchain we synthesize SDR by clamping the      */
+/* target's peak luminance, so libplacebo's tone-mapper does the      */
+/* heavy lifting. The swapchain is NOT always HDR-capable, though —   */
+/* macOS/CoreAnimation always grants EDR, but a Linux compositor      */
+/* without HDR negotiates plain BT.709 + sRGB. Pick the target to     */
+/* match what the swapchain actually gave us; see apply_sdr_target.   */
 /* ------------------------------------------------------------------ */
 static void apply_hdr_target(struct pl_frame *t, float headroom)
 {
@@ -494,6 +497,18 @@ static float inter_min_luma(const Renderer *r, float peak)
 {
     float cap = r->sdr_dr_stops_cap > 0.0f ? r->sdr_dr_stops_cap : 12.0f;
     return peak / powf(2.0f, cap);
+}
+
+/* Non-HDR swapchain (Linux/X11, or any compositor without HDR): keep the
+ * colorspace pl_frame_from_swapchain already negotiated — BT.709 + sRGB —
+ * and only declare the luminance range, so libplacebo tone-maps PQ down
+ * into it. Overwriting the negotiated transfer with PQ is what made HDR
+ * content look washed out: PQ codes landed in an sRGB buffer and the
+ * display applied the sRGB EOTF to them, lifting every shadow. */
+static void apply_sdr_target(const Renderer *r, struct pl_frame *t, float peak)
+{
+    t->color.hdr.max_luma = peak;
+    t->color.hdr.min_luma = inter_min_luma(r, peak);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1162,7 +1177,10 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         struct pl_frame image  = r->slot[lp->src].image;
         struct pl_frame target = base_target;
         target.crop = to_pl_rect(lp->target_crop);
-        apply_hdr_target(&target, r->display_hdr_headroom);
+        if (r->display_hdr_capable)
+            apply_hdr_target(&target, r->display_hdr_headroom);
+        else
+            apply_sdr_target(r, &target, sdr_peak);
 
         /* libplacebo rotates AFTER cropping, so image_crop stays in the
          * frame's own unrotated pixels and layout needs no rotation
