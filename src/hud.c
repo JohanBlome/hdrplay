@@ -127,7 +127,14 @@ static void draw_text(uint8_t *rgba, int W, int H,
  *
  * Each slot owns its own pl_tex so they can be sized independently and
  * positioned anywhere on the swapchain image via the overlay's dst rect. */
-enum { SLOT_STATUS, SLOT_HDR_LABEL, SLOT_SDR_LABEL, SLOT_SESSION, SLOT_COUNT };
+enum {
+    SLOT_STATUS,
+    SLOT_HDR_LABEL,
+    SLOT_SDR_LABEL,
+    SLOT_PLANE_LABEL,
+    SLOT_SESSION,
+    SLOT_COUNT,
+};
 
 typedef struct { pl_tex tex; int W, H; } HudSlot;
 
@@ -233,7 +240,11 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
                r->split_orient == HDRPLAY_SPLIT_WIPE_TB ? "WIPE TB" :
                                                           "SPLIT LR")
             : "?";
-    snprintf(line, sizeof(line), "MODE %s", mode_str);
+    const char *plane_str =
+        r->plane_view == HDRPLAY_PLANE_Y  ? " PLANE Y" :
+        r->plane_view == HDRPLAY_PLANE_CB ? " PLANE CB" :
+        r->plane_view == HDRPLAY_PLANE_CR ? " PLANE CR" : "";
+    snprintf(line, sizeof(line), "MODE %s%s", mode_str, plane_str);
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
 
     /* Headroom line — turns red when so high that dark content disappears.
@@ -647,6 +658,23 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                 if (rc == 0) {
                     out->session     = overlay_arr[SLOT_SESSION];
                     out->has_session = true;
+                }
+                break;
+            }
+
+            case LAYOUT_OV_PLANE: {
+                const char *big =
+                    r->plane_view == HDRPLAY_PLANE_Y  ? "Y" :
+                    r->plane_view == HDRPLAY_PLANE_CB ? "CB" :
+                    r->plane_view == HDRPLAY_PLANE_CR ? "CR" : "COLOR";
+                const char *sub =
+                    r->plane_view == HDRPLAY_PLANE_Y ? "LUMA PLANE" :
+                    r->plane_view == HDRPLAY_PLANE_COLOR ? "COMPOSITE" :
+                                                           "CHROMA PLANE";
+                if (build_label_badge(SLOT_PLANE_LABEL, gpu, big, sub,
+                                      ov->dst) == 0) {
+                    out->plane = overlay_arr[SLOT_PLANE_LABEL];
+                    out->has_plane = true;
                 }
                 break;
             }

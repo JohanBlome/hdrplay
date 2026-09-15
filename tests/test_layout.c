@@ -127,6 +127,8 @@ static void test_single_file_unchanged(void)
     in.hud_hidden = true;
     layout_plan(&in, &pl);
     CHECK(count_ov_plan(&pl, LAYOUT_OV_STATUS) == 0, "hud_hidden drops status");
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_PLANE) == 1,
+          "hud_hidden keeps the current plane badge");
 
     /* Session panel is bottom-right with one source. */
     in = base_input();
@@ -344,7 +346,7 @@ static void test_overlay_routing_is_exclusive(void)
     puts("every overlay lands in exactly one pass");
     LayoutOverlayKind kinds[] = {
         LAYOUT_OV_STATUS, LAYOUT_OV_SESSION,
-        LAYOUT_OV_LABEL_A, LAYOUT_OV_LABEL_B,
+        LAYOUT_OV_PLANE, LAYOUT_OV_LABEL_A, LAYOUT_OV_LABEL_B,
     };
     HdrplaySplitOrient orients[] = {
         HDRPLAY_SPLIT_LR, HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG,
@@ -358,11 +360,14 @@ static void test_overlay_routing_is_exclusive(void)
             in.orient = orients[o];
             in.mode = (HdrplayMode)m;
             LayoutPlan pl; layout_plan(&in, &pl);
-            for (int k = 0; k < 4; k++) {
+            for (int k = 0; k < 5; k++) {
                 int n = count_ov_plan(&pl, kinds[k]);
                 CHECK(n <= 1, "orient %d mode %d: overlay %d appears %dx",
                       (int)o, m, kinds[k], n);
             }
+            CHECK(count_ov_plan(&pl, LAYOUT_OV_PLANE) == 1,
+                  "orient %d mode %d: plane badge appears once",
+                  (int)o, m);
         }
     }
 

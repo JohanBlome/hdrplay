@@ -241,6 +241,7 @@ static void usage(void)
         "  -d INDEX              place the window on display INDEX\n"
         "                        (0-based; see --list-displays)\n"
         "  --start-sdr           start in SDR-fallback rendering mode\n"
+        "  --plane MODE          start with color, y, cb or cr view\n"
         "  --split               start in split-screen (HDR left, SDR right)\n"
         "  --split-tb            split top/bottom instead of left/right\n"
         "  --split-diag          diagonal split: HDR upper-left, SDR lower-right\n"
@@ -291,6 +292,7 @@ static void usage(void)
         "                            has over SDR)\n"
         "  keys at runtime:      F=fullscreen  H=HDR  S=SDR\n"
         "                        P=split (one file) / compare (two files)\n"
+        "                        C=cycle color / Y / Cb / Cr plane\n"
         "                        O=cycle pane layouts / comparison wipes\n"
         "                          SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
@@ -435,6 +437,7 @@ int main(int argc, char **argv)
     float brightness_val = -1.0f;
     int  display_index = -1;
     int  start_mode = HDRPLAY_MODE_HDR;
+    HdrplayPlaneView start_plane = HDRPLAY_PLANE_COLOR;
     int  start_orient = HDRPLAY_SPLIT_LR;
     bool split_explicit = false;   /* user picked an orientation */
     bool loop_at_eof = false;
@@ -480,6 +483,20 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--step-buffer") && i+1 < argc)
             step_buffer = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--start-sdr")) start_mode = HDRPLAY_MODE_SDR;
+        else if (!strcmp(argv[i], "--plane") && i+1 < argc) {
+            const char *p = argv[++i];
+            if      (!strcmp(p, "color")) start_plane = HDRPLAY_PLANE_COLOR;
+            else if (!strcmp(p, "y"))     start_plane = HDRPLAY_PLANE_Y;
+            else if (!strcmp(p, "cb") || !strcmp(p, "u"))
+                start_plane = HDRPLAY_PLANE_CB;
+            else if (!strcmp(p, "cr") || !strcmp(p, "v"))
+                start_plane = HDRPLAY_PLANE_CR;
+            else {
+                fprintf(stderr, "unknown --plane mode: %s\n", p);
+                usage();
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--split"))     start_mode = HDRPLAY_MODE_SPLIT;
         else if (!strcmp(argv[i], "--split-tb"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_TB; split_explicit = true; }
         else if (!strcmp(argv[i], "--split-lr"))   { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_LR; split_explicit = true; }
@@ -586,6 +603,7 @@ int main(int argc, char **argv)
 
     rend.mode = start_mode;
     rend.split_orient = start_orient;
+    rend.plane_view = start_plane;
     rend.loop_enabled = loop_at_eof;
     rend.sdr_peak_override = sdr_peak_override;
     rend.sdr_saturation    = sdr_saturation;
@@ -708,6 +726,15 @@ int main(int argc, char **argv)
                         rend.split_orient == HDRPLAY_SPLIT_DIAG    ? "diagonal wipe" :
                         rend.split_orient == HDRPLAY_SPLIT_WIPE_LR ? "left/right wipe" :
                                                                     "top/bottom wipe");
+                }
+                if (e.key.key == SDLK_C) {
+                    rend.plane_view = (HdrplayPlaneView)
+                        ((rend.plane_view + 1) % HDRPLAY_PLANE_COUNT);
+                    LOG("REND", "plane view -> %s",
+                        rend.plane_view == HDRPLAY_PLANE_Y  ? "Y (grayscale)" :
+                        rend.plane_view == HDRPLAY_PLANE_CB ? "Cb (grayscale)" :
+                        rend.plane_view == HDRPLAY_PLANE_CR ? "Cr (grayscale)" :
+                                                             "color");
                 }
                 if (e.key.key == SDLK_SPACE) {
                     paused = !paused;

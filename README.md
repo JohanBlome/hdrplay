@@ -137,8 +137,23 @@ hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
 # F toggles fullscreen, Q/Esc quits.
 # I toggles the status HUD, A the accumulated-statistics panel.
 # . and , step one frame forward / back.
+# C cycles normal color, Y, Cb and Cr component views.
 # T rotates the focused pane 90° clockwise.
 ```
+
+### Plane inspection
+
+Press `C` to cycle through normal color, Y, Cb and Cr. Each selected
+component is repeated into RGB and shown as grayscale, making quantization
+steps in the color-difference planes much easier to see. Chroma is sampled
+nearest-neighbor when enlarged so the viewer does not hide boundaries by
+interpolating them. The selected plane applies to both files in comparison
+mode and remains independent of HDR/SDR treatment. A persistent badge in the
+top-right identifies `COLOR`, `Y`, `CB` or `CR`, even when the status HUD is
+hidden.
+
+Start directly in a component view with `--plane y`, `--plane cb` or
+`--plane cr`; `u` and `v` are accepted aliases.
 
 ### Rotation
 
@@ -199,6 +214,7 @@ returns to the two-file comparison.
 | `+` `-` | zoom steps |
 | drag, `shift`+arrows | pan, locked across panes |
 | `P` `O` | return to A/B comparison / cycle pane LR, pane TB, diagonal, LR wipe, TB wipe |
+| `C` | cycle normal color / Y / Cb / Cr; individual planes are grayscale |
 | `T` | rotate the focused pane 90° clockwise |
 | `W` | resize the window for exact 1:1, no letterbox |
 

@@ -12,6 +12,18 @@
 struct SDL_Window;
 struct Source;
 
+/* Diagnostic source-component view. COLOR is normal rendering; the other
+ * modes display one decoded YCbCr component as neutral grayscale. Keeping
+ * this orthogonal to HdrplayMode means it also works in SDR, split and
+ * two-file comparison layouts. */
+typedef enum {
+    HDRPLAY_PLANE_COLOR = 0,
+    HDRPLAY_PLANE_Y,
+    HDRPLAY_PLANE_CB,
+    HDRPLAY_PLANE_CR,
+    HDRPLAY_PLANE_COUNT,
+} HdrplayPlaneView;
+
 typedef struct Renderer {
     struct SDL_Window *window;
 
@@ -63,6 +75,7 @@ typedef struct Renderer {
      * owns every decision that depends on them. */
     HdrplayMode        mode;
     HdrplaySplitOrient split_orient;
+    HdrplayPlaneView   plane_view;
 
     /* Two-file comparison state. n_sources == 1 keeps every code path
      * identical to single-file playback; the rest is inert. */

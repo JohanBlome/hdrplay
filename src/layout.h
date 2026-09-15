@@ -53,6 +53,7 @@ typedef enum {
     LAYOUT_OV_INTERMEDIATE,  /* source `src`'s intermediate texture   */
     LAYOUT_OV_STATUS,        /* top-left status panel                 */
     LAYOUT_OV_SESSION,       /* accumulated-statistics panel          */
+    LAYOUT_OV_PLANE,         /* current COLOR/Y/Cb/Cr view badge      */
     LAYOUT_OV_LABEL_A,       /* badge for the first pane              */
     LAYOUT_OV_LABEL_B,       /* badge for the second pane             */
 } LayoutOverlayKind;
@@ -65,7 +66,7 @@ typedef struct {
 
 #define LAYOUT_MAX_PASSES   2
 #define LAYOUT_MAX_INTER    2
-#define LAYOUT_MAX_OVERLAYS 6
+#define LAYOUT_MAX_OVERLAYS 8
 
 /* An intermediate render, performed before any swapchain pass. */
 typedef struct {

@@ -10,6 +10,7 @@
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 #include <libavutil/frame.h>
+#include <libplacebo/shaders/custom.h>
 
 /* ------------------------------------------------------------------ */
 /* libplacebo logger bridge                                           */
@@ -668,6 +669,67 @@ static bool rect_is_zero(LayoutRect r)
     return r.x0 == 0 && r.y0 == 0 && r.x1 == 0 && r.y1 == 0;
 }
 
+static struct pl_hook_res plane_hook(void *priv,
+                                     const struct pl_hook_params *params)
+{
+    int component = *(const int *)priv;
+    int width = (int)roundf(fabsf(params->rect.x1 - params->rect.x0));
+    int height = (int)roundf(fabsf(params->rect.y1 - params->rect.y0));
+    const char *body = component == 0 ? "color.rgb = color.rrr;" :
+                       component == 1 ? "color.rgb = color.ggg;" :
+                                        "color.rgb = color.bbb;";
+    bool ok = pl_shader_custom(params->sh, &(struct pl_custom_shader){
+        .description = "grayscale component view",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+        .output_w = width,
+        .output_h = height,
+    });
+
+    struct pl_color_repr repr = params->repr;
+    repr.sys = PL_COLOR_SYSTEM_RGB;
+    repr.alpha = PL_ALPHA_NONE;
+    repr.dovi = NULL;
+    return (struct pl_hook_res){
+        .failed = !ok,
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = params->sh,
+        .repr = repr,
+        .color = params->color,
+        .components = 3,
+        .rect = params->rect,
+    };
+}
+
+/* At NATIVE, libplacebo has already aligned and combined the decoded Y, Cb
+ * and Cr textures but has not converted them to RGB. Replicating the selected
+ * native component here gives true grayscale without copying a plane or
+ * binding the same texture multiple times. Distinct signatures keep the
+ * renderer's shader cache correct as C cycles between components. */
+static const int plane_components[3] = { 0, 1, 2 };
+static const struct pl_hook plane_hooks[3] = {
+    {
+        .stages = PL_HOOK_NATIVE,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = (void *)&plane_components[0],
+        .hook = plane_hook,
+        .signature = UINT64_C(0x687064706c616e59),
+    }, {
+        .stages = PL_HOOK_NATIVE,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = (void *)&plane_components[1],
+        .hook = plane_hook,
+        .signature = UINT64_C(0x687064706c614362),
+    }, {
+        .stages = PL_HOOK_NATIVE,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = (void *)&plane_components[2],
+        .hook = plane_hook,
+        .signature = UINT64_C(0x687064706c614372),
+    },
+};
+
 /* Which source the HUD, probe and statistics should describe. In a
  * two-file comparison that is the left/top pane; when soloed it is
  * whichever file is on screen. */
@@ -743,6 +805,16 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     struct pl_render_params rp = pl_render_default_params;
     rp.info_callback = pl_info_cb;
     rp.info_priv     = r;
+    const struct pl_hook *plane_hook_ptr = NULL;
+    if (r->plane_view != HDRPLAY_PLANE_COLOR) {
+        plane_hook_ptr = &plane_hooks[r->plane_view - HDRPLAY_PLANE_Y];
+        rp.hooks = &plane_hook_ptr;
+        rp.num_hooks = 1;
+        /* Preserve individual 4:2:0/4:2:2 chroma samples when zooming rather
+         * than smoothing their boundaries before the diagnostic hook sees
+         * them. */
+        rp.plane_upscaler = &pl_filter_nearest;
+    }
 
     struct pl_frame base_target;
     pl_frame_from_swapchain(&base_target, &sf);
@@ -931,6 +1003,9 @@ bool renderer_render(Renderer *r, Source *sources, int n)
                 break;
             case LAYOUT_OV_SESSION:
                 if (hud_ov.has_session) ov_store[n_ov++] = hud_ov.session;
+                break;
+            case LAYOUT_OV_PLANE:
+                if (hud_ov.has_plane)   ov_store[n_ov++] = hud_ov.plane;
                 break;
             case LAYOUT_OV_LABEL_A:
                 if (hud_ov.has_label_a) ov_store[n_ov++] = hud_ov.label_a;

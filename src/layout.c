@@ -191,6 +191,12 @@ static LayoutRect status_rect(void)
     return rect(MARGIN, MARGIN, MARGIN + STATUS_W, MARGIN + STATUS_H);
 }
 
+static LayoutRect plane_rect(const LayoutInput *in)
+{
+    return rect(in->win_w - MARGIN - LABEL_W, MARGIN,
+                in->win_w - MARGIN, MARGIN + LABEL_H);
+}
+
 static LayoutRect session_rect(const LayoutInput *in, bool two_pane)
 {
     /* Single pane: bottom-right, the only corner nothing else uses.
@@ -294,6 +300,8 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
     if (!in->hud_hidden)
         add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
 
+    add_ov(p, LAYOUT_OV_PLANE, -1, plane_rect(in));
+
     if (in->mode == HDRPLAY_MODE_SPLIT) {
         LayoutRect la, lb;
         label_rects(in, &la, &lb);
@@ -371,6 +379,7 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
         add_ov(p, LAYOUT_OV_INTERMEDIATE, b, full);
 
         if (!in->hud_hidden)   add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
+        add_ov(p, LAYOUT_OV_PLANE, -1, plane_rect(in));
         add_ov(p, LAYOUT_OV_LABEL_A, -1, la);
         add_ov(p, LAYOUT_OV_LABEL_B, -1, lb);
         if (in->session_panel)
@@ -446,6 +455,9 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
     LayoutRect sr = status_rect();
     if (!in->hud_hidden)
         add_ov(rect_contains(ca, sr) ? pa : pb, LAYOUT_OV_STATUS, -1, sr);
+
+    LayoutRect pr = plane_rect(in);
+    add_ov(rect_contains(ca, pr) ? pa : pb, LAYOUT_OV_PLANE, -1, pr);
 
     add_ov(rect_contains(ca, la) ? pa : pb, LAYOUT_OV_LABEL_A, -1, la);
     add_ov(rect_contains(ca, lb) ? pa : pb, LAYOUT_OV_LABEL_B, -1, lb);
