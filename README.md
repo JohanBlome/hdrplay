@@ -82,27 +82,49 @@ If nothing is found, the `[GPU]` log prints every path it tried.
 
 ### Fedora Linux 43+
 
-Fedora's own FFmpeg build is sufficient to compile hdrplay, but omits
-some patent-encumbered codecs. For a build that can also play ordinary
-H.264 and HEVC files, enable RPM Fusion Free and install its FFmpeg:
+Fedora's own FFmpeg build (`ffmpeg-free`) compiles hdrplay, but ships no
+H.264 or HEVC decoder at all — only AV1 and VP9. Most HDR10 content is
+HEVC, so a stock-Fedora build will fail to open typical test files. RPM
+Fusion Free supplies the missing decoders; there are two ways to get them.
+
+**Recommended — keep Fedora's FFmpeg, add the codec library:**
 
 ```bash
 sudo dnf install \
   "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"
+sudo dnf install \
+  gcc cmake pkgconf-pkg-config ffmpeg-free-devel libavcodec-freeworld \
+  libplacebo-devel SDL3-devel \
+  vulkan-loader-devel vulkan-headers mesa-vulkan-drivers
+```
+
+`libavcodec-freeworld` installs into `/usr/lib64/ffmpeg/`, which
+`/etc/ld.so.conf.d/ffmpeg-lib64.conf` places ahead of `/usr/lib64` — so it
+transparently replaces `libavcodec` at load time. Build against the
+`ffmpeg-free-devel` headers as normal; no `--allowerasing`, and no other
+application on the system is affected.
+
+**Alternative — replace FFmpeg wholesale:**
+
+```bash
 sudo dnf install --allowerasing \
   gcc cmake pkgconf-pkg-config ffmpeg ffmpeg-devel \
   libplacebo-devel SDL3-devel \
   vulkan-loader-devel vulkan-headers mesa-vulkan-drivers
+```
 
+This swaps `ffmpeg-free` for RPM Fusion's `ffmpeg` system-wide, affecting
+every application that links FFmpeg.
+
+Then, either way:
+
+```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 cmake --build build --target check
 ./build/hdrplay path/to/video.mp4
 ```
 
-For a build using only the official Fedora repositories, replace
-`ffmpeg ffmpeg-devel` with `ffmpeg-free ffmpeg-free-devel`. The binary
-will build normally, but codec availability is limited by that package.
 `mesa-vulkan-drivers` supplies Vulkan for Intel and AMD GPUs; systems
 using NVIDIA's proprietary driver already obtain Vulkan from that
 driver instead.
