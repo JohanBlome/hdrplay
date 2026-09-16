@@ -326,6 +326,8 @@ bool renderer_init(Renderer *r, int width, int height, const char *title, int di
      * renderer. Keep every intermediate on this one. */
     r->renderer_inter = pl_renderer_create(r->pl_log, r->vulkan->gpu);
     if (!r->renderer_inter) { LOG("GPU", "ERROR: pl_renderer_create (inter)"); return false; }
+    r->dispatch_diff = pl_dispatch_create(r->pl_log, r->vulkan->gpu);
+    if (!r->dispatch_diff) { LOG("GPU", "ERROR: pl_dispatch_create (diff)"); return false; }
 
     renderer_update_display_state(r);
     LOG("SWAP", "swapchain ready, HDR signaling %s",
@@ -659,6 +661,163 @@ static void make_inter_overlay(
 }
 
 /* ------------------------------------------------------------------ */
+/* GPU A/B difference.                                                */
+/*                                                                    */
+/* The two inputs are already display-referred BT.2020/BT.709 PQ in   */
+/* window-sized intermediates. Decode PQ, subtract in linear display  */
+/* light, amplify 4x, then encode PQ again for the HDR swapchain.      */
+/* This makes black mean equal while retaining the colour of an RGB    */
+/* error. Alpha limits the comparison to pixels covered by both files, */
+/* so mismatched aspect ratios do not turn letterbox bars into signal. */
+/* ------------------------------------------------------------------ */
+static bool ensure_diff_tex(Renderer *r, int w, int h)
+{
+    if (r->diff_tex && r->diff_w == w && r->diff_h == h) return true;
+    if (r->diff_tex) pl_tex_destroy(r->vulkan->gpu, &r->diff_tex);
+
+    r->diff_w = w;
+    r->diff_h = h;
+    pl_fmt fmt = pl_find_named_fmt(r->vulkan->gpu, "rgba16hf");
+    if (!fmt) fmt = pl_find_named_fmt(r->vulkan->gpu, "rgba8");
+    r->diff_tex = pl_tex_create(r->vulkan->gpu, pl_tex_params(
+        .w          = w,
+        .h          = h,
+        .format     = fmt,
+        .sampleable = true,
+        .renderable = true,
+    ));
+    if (!r->diff_tex) {
+        LOG("REND", "diff texture allocation failed");
+        return false;
+    }
+    LOG("REND", "diff texture %dx%d (%s) allocated",
+        w, h, fmt ? fmt->name : "?");
+    return true;
+}
+
+static bool render_diff_texture(Renderer *r, int w, int h)
+{
+    if (!r->slot[0].inter_tex || !r->slot[1].inter_tex ||
+        !ensure_diff_tex(r, w, h))
+        return false;
+
+    struct pl_shader_desc desc[] = {
+        {
+            .desc = { .name = "diff_a", .type = PL_DESC_SAMPLED_TEX },
+            .binding = { .object = r->slot[0].inter_tex,
+                         .address_mode = PL_TEX_ADDRESS_CLAMP,
+                         .sample_mode = PL_TEX_SAMPLE_NEAREST },
+        }, {
+            .desc = { .name = "diff_b", .type = PL_DESC_SAMPLED_TEX },
+            .binding = { .object = r->slot[1].inter_tex,
+                         .address_mode = PL_TEX_ADDRESS_CLAMP,
+                         .sample_mode = PL_TEX_SAMPLE_NEAREST },
+        },
+    };
+    const float uv[4][2] = {
+        { 0.0f, 0.0f }, { 1.0f, 0.0f },
+        { 0.0f, 1.0f }, { 1.0f, 1.0f },
+    };
+    struct pl_shader_va va = {
+        .attr = {
+            .name = "diff_uv",
+            .fmt = pl_find_vertex_fmt(r->vulkan->gpu, PL_FMT_FLOAT, 2),
+        },
+        .data = { uv[0], uv[1], uv[2], uv[3] },
+    };
+    if (!va.attr.fmt) {
+        LOG("REND", "diff shader has no vec2 vertex format");
+        return false;
+    }
+
+    static const char *header =
+        "vec3 pq_eotf(vec3 e) {\n"
+        "    const float m1 = 0.1593017578125;\n"
+        "    const float m2 = 78.84375;\n"
+        "    const float c1 = 0.8359375;\n"
+        "    const float c2 = 18.8515625;\n"
+        "    const float c3 = 18.6875;\n"
+        "    vec3 p = pow(clamp(e, 0.0, 1.0), vec3(1.0 / m2));\n"
+        "    return pow(max(p - c1, 0.0) / (c2 - c3 * p), vec3(1.0 / m1));\n"
+        "}\n"
+        "vec3 pq_oetf(vec3 l) {\n"
+        "    const float m1 = 0.1593017578125;\n"
+        "    const float m2 = 78.84375;\n"
+        "    const float c1 = 0.8359375;\n"
+        "    const float c2 = 18.8515625;\n"
+        "    const float c3 = 18.6875;\n"
+        "    vec3 p = pow(clamp(l, 0.0, 1.0), vec3(m1));\n"
+        "    return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));\n"
+        "}\n";
+    static const char *body =
+        "vec4 a = texture(diff_a, diff_uv);\n"
+        "vec4 b = texture(diff_b, diff_uv);\n"
+        "vec3 delta = min(abs(pq_eotf(a.rgb) - pq_eotf(b.rgb)) * 4.0, 1.0);\n"
+        "color = vec4(pq_oetf(delta), 1.0);\n"
+        "if (min(a.a, b.a) < 0.5) color.rgb = vec3(0.0);\n";
+
+    pl_dispatch_reset_frame(r->dispatch_diff);
+    pl_shader sh = pl_dispatch_begin(r->dispatch_diff);
+    if (!sh) {
+        LOG("REND", "diff shader allocation failed");
+        return false;
+    }
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader){
+            .header = header,
+            .description = "4x absolute linear-light A/B difference",
+            .body = body,
+            .input = PL_SHADER_SIG_NONE,
+            .output = PL_SHADER_SIG_COLOR,
+            .descriptors = desc,
+            .num_descriptors = 2,
+            .vertex_attribs = &va,
+            .num_vertex_attribs = 1,
+            .output_w = w,
+            .output_h = h,
+        })) {
+        LOG("REND", "diff shader generation failed");
+        pl_dispatch_abort(r->dispatch_diff, &sh);
+        return false;
+    }
+
+    if (!pl_dispatch_finish(r->dispatch_diff, pl_dispatch_params(
+            .shader = &sh,
+            .target = r->diff_tex,
+        ))) {
+        LOG("REND", "diff shader dispatch failed");
+        return false;
+    }
+    return true;
+}
+
+static void make_diff_overlay(Renderer *r, struct pl_overlay *out_overlay,
+                              struct pl_overlay_part *out_part,
+                              int win_w, int win_h, bool sdr, float sdr_peak)
+{
+    *out_part = (struct pl_overlay_part){
+        .src = { 0, 0, (float)win_w, (float)win_h },
+        .dst = { 0, 0, (float)win_w, (float)win_h },
+    };
+    *out_overlay = (struct pl_overlay){
+        .tex = r->diff_tex,
+        .mode = PL_OVERLAY_NORMAL,
+        .parts = out_part,
+        .num_parts = 1,
+        .repr = pl_color_repr_rgb,
+        .color = pl_color_space_hdr10,
+    };
+    if (sdr) {
+        out_overlay->color.primaries = PL_COLOR_PRIM_BT_709;
+        out_overlay->color.hdr.max_luma = sdr_peak;
+        out_overlay->color.hdr.min_luma = inter_min_luma(r, sdr_peak);
+    } else {
+        out_overlay->color.primaries = PL_COLOR_PRIM_BT_2020;
+        out_overlay->color.hdr.max_luma = 203.0f * r->display_hdr_headroom;
+        out_overlay->color.hdr.min_luma = 0.005f;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 static struct pl_rect2df to_pl_rect(LayoutRect r)
 {
     return (struct pl_rect2df){ r.x0, r.y0, r.x1, r.y1 };
@@ -828,6 +987,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     LayoutInput li = {
         .mode = r->mode, .orient = r->split_orient,
         .n_sources = n, .solo = r->solo, .swapped = r->swapped,
+        .diff_view = r->diff_view,
         .win_w = win_w, .win_h = win_h,
         /* Filled in below: rotation swaps the axes, and layout has to see
          * the frame as displayed. */
@@ -948,6 +1108,14 @@ bool renderer_render(Renderer *r, Source *sources, int n)
                  plan.inter[i].dst.y1 - plan.inter[i].dst.y0);
     }
 
+    bool diff_ready = false;
+    if (r->diff_view && n > 1 && r->solo < 0) {
+        diff_ready = r->slot[0].mapped && r->slot[1].mapped &&
+                     render_diff_texture(r, win_w, win_h);
+        if (!diff_ready)
+            LOG("REND", "difference view unavailable for this frame");
+    }
+
     /* 2. Swapchain passes.
      *
      * With more than one pass the border handling has to change. By
@@ -998,6 +1166,13 @@ bool renderer_render(Renderer *r, Source *sources, int n)
                 n_ov++;
                 break;
             }
+            case LAYOUT_OV_DIFF:
+                if (!diff_ready) break;
+                make_diff_overlay(r, &ov_store[n_ov], &ov_parts[n_ov],
+                                  win_w, win_h,
+                                  r->mode == HDRPLAY_MODE_SDR, sdr_peak);
+                n_ov++;
+                break;
             case LAYOUT_OV_STATUS:
                 if (hud_ov.has_status)  ov_store[n_ov++] = hud_ov.status;
                 break;
@@ -1052,10 +1227,13 @@ void renderer_close(Renderer *r)
             if (r->slot[s].inter_tex)
                 pl_tex_destroy(r->vulkan->gpu, &r->slot[s].inter_tex);
         }
+        if (r->diff_tex)
+            pl_tex_destroy(r->vulkan->gpu, &r->diff_tex);
         hud_close(r->vulkan->gpu);
     }
     if (r->renderer)     pl_renderer_destroy(&r->renderer);
     if (r->renderer_inter) pl_renderer_destroy(&r->renderer_inter);
+    if (r->dispatch_diff) pl_dispatch_destroy(&r->dispatch_diff);
     if (r->swapchain) pl_swapchain_destroy(&r->swapchain);
     if (r->vulkan)    pl_vulkan_destroy(&r->vulkan);
     if (r->vk_inst)   pl_vk_inst_destroy(&r->vk_inst);

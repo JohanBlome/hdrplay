@@ -468,6 +468,54 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
     }
 }
 
+/* Full-frame A/B difference. Both sources are first rendered through the
+ * same HDR or SDR display pipeline into aligned, window-sized intermediates;
+ * the renderer then subtracts those textures in linear display light. */
+static void plan_diff(const LayoutInput *in, LayoutPlan *out)
+{
+    int a = in->swapped ? 1 : 0;
+    int b = in->swapped ? 0 : 1;
+    int ref = layout_reference_source(in);
+    bool sdr = in->mode == HDRPLAY_MODE_SDR;
+    LayoutRect full = rect(0, 0, (float)in->win_w, (float)in->win_h);
+    LayoutRect ia, ta, ib, tb;
+
+    float sa = layout_fit_pane(in->src_w[a], in->src_h[a],
+                               in->src_w[ref], in->src_h[ref],
+                               full, in->zoom, in->pan_x, in->pan_y,
+                               0.5f, 0.5f, &ia, &ta);
+    layout_fit_pane(in->src_w[b], in->src_h[b],
+                    in->src_w[ref], in->src_h[ref],
+                    full, in->zoom, in->pan_x, in->pan_y,
+                    0.5f, 0.5f, &ib, &tb);
+
+    /* A remains the base pass only to give libplacebo a swapchain pass on
+     * which the opaque diff and HUD overlays can be attached. */
+    out->n_pass = 1;
+    out->pass[0] = (LayoutPass){
+        .src = a, .target_crop = ta, .image_crop = ia, .scale = sa,
+    };
+    out->inter[0] = (LayoutInter){
+        .src = a, .mask = ALPHA_MASK_FULL, .sdr = sdr,
+        .dst = ta, .image_crop = ia,
+    };
+    out->inter[1] = (LayoutInter){
+        .src = b, .mask = ALPHA_MASK_FULL, .sdr = sdr,
+        .dst = tb, .image_crop = ib,
+    };
+    out->n_inter = 2;
+
+    /* The diff is opaque, so it must precede the diagnostic overlays. */
+    add_ov(&out->pass[0], LAYOUT_OV_DIFF, -1, full);
+    if (!in->hud_hidden)
+        add_ov(&out->pass[0], LAYOUT_OV_STATUS, -1, status_rect());
+    add_ov(&out->pass[0], LAYOUT_OV_PLANE, -1, plane_rect(in));
+    if (in->session_panel)
+        add_ov(&out->pass[0], LAYOUT_OV_SESSION, -1,
+               session_rect(in, false));
+    out->name = sdr ? "DIFF-SDR" : "DIFF-HDR";
+}
+
 /* ------------------------------------------------------------------ */
 void layout_plan(const LayoutInput *in, LayoutPlan *out)
 {
@@ -480,6 +528,10 @@ void layout_plan(const LayoutInput *in, LayoutPlan *out)
         int src = (in->n_sources < 2) ? 0
                 : (in->solo >= 0 ? in->solo : 0);
         plan_single(in, out, src);
+        return;
+    }
+    if (in->diff_view) {
+        plan_diff(in, out);
         return;
     }
     plan_pair(in, out);

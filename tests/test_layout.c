@@ -291,6 +291,44 @@ static void test_pair_rect_wipes(void)
     }
 }
 
+static void test_pair_diff(void)
+{
+    puts("two sources, full-frame difference");
+    LayoutInput in = base_input();
+    in.n_sources = 2;
+    in.diff_view = true;
+    LayoutPlan pl;
+    layout_plan(&in, &pl);
+
+    CHECK(pl.n_pass == 1, "DIFF: one base pass");
+    CHECK(pl.n_inter == 2, "DIFF: two aligned intermediates");
+    CHECK(pl.inter[0].src == 0 && pl.inter[1].src == 1,
+          "DIFF: one intermediate per source");
+    CHECK(pl.inter[0].mask == ALPHA_MASK_FULL &&
+          pl.inter[1].mask == ALPHA_MASK_FULL,
+          "DIFF: both intermediates carry coverage alpha");
+    CHECK(!pl.inter[0].sdr && !pl.inter[1].sdr,
+          "DIFF HDR: both use HDR treatment");
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_DIFF) == 1,
+          "DIFF: result overlay attached exactly once");
+    CHECK(pl.pass[0].ov[0].kind == LAYOUT_OV_DIFF,
+          "DIFF: result is below HUD overlays");
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_LABEL_A) == 0 &&
+          count_ov_plan(&pl, LAYOUT_OV_LABEL_B) == 0,
+          "DIFF: pane labels are hidden");
+
+    in.mode = HDRPLAY_MODE_SDR;
+    layout_plan(&in, &pl);
+    CHECK(pl.inter[0].sdr && pl.inter[1].sdr,
+          "DIFF SDR: both use SDR treatment");
+
+    in.solo = 1;
+    layout_plan(&in, &pl);
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_DIFF) == 0 &&
+          pl.n_inter == 1 && pl.inter[0].sdr && pl.pass[0].src == 1,
+          "DIFF is inert while a source is soloed");
+}
+
 static void test_orientation_cycle(void)
 {
     puts("split orientation cycle includes pair wipes only in compare mode");
@@ -804,6 +842,7 @@ int main(void)
     test_pair_lr_tb();
     test_pair_diag();
     test_pair_rect_wipes();
+    test_pair_diff();
     test_orientation_cycle();
     test_split_key_semantics();
     test_overlay_routing_is_exclusive();

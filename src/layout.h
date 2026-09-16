@@ -51,6 +51,7 @@ typedef struct { float x0, y0, x1, y1; } LayoutRect;
  * pl_overlay structs; layout only decides which appear where. */
 typedef enum {
     LAYOUT_OV_INTERMEDIATE,  /* source `src`'s intermediate texture   */
+    LAYOUT_OV_DIFF,          /* absolute A/B difference texture       */
     LAYOUT_OV_STATUS,        /* top-left status panel                 */
     LAYOUT_OV_SESSION,       /* accumulated-statistics panel          */
     LAYOUT_OV_PLANE,         /* current COLOR/Y/Cb/Cr view badge      */
@@ -112,6 +113,7 @@ typedef struct {
     int   n_sources;         /* 1 or 2                                */
     int   solo;              /* -1 = compare both; else source index  */
     bool  swapped;           /* B on the left                         */
+    bool  diff_view;         /* full-frame absolute A/B difference    */
 
     int   win_w, win_h;
 

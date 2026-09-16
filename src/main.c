@@ -293,6 +293,7 @@ static void usage(void)
         "  keys at runtime:      F=fullscreen  H=HDR  S=SDR\n"
         "                        P=split (one file) / compare (two files)\n"
         "                        C=cycle color / Y / Cb / Cr plane\n"
+        "                        D=toggle full-frame A/B difference\n"
         "                        O=cycle pane layouts / comparison wipes\n"
         "                          SPACE=pause\n"
         "                        L=toggle loop  R=restart  Q/Esc=quit\n"
@@ -612,6 +613,7 @@ int main(int argc, char **argv)
     rend.n_sources         = n_sources;
     rend.solo              = -1;
     rend.swapped           = false;
+    rend.diff_view         = false;
     rend.zoom              = 0.0f;      /* fit */
     rend.pan_x = rend.pan_y = 0.5f;
     rend.rotation[0]       = rotation[0];
@@ -712,12 +714,14 @@ int main(int argc, char **argv)
                 if (e.key.key == SDLK_P) {
                     layout_activate_split_or_compare(n_sources, &rend.solo,
                                                      &rend.mode);
-                    if (n_sources > 1)
+                    if (n_sources > 1) {
+                        rend.diff_view = false;
                         LOG("REND", "compare A|B");
-                    else
+                    } else
                         LOG("REND", "mode -> SPLIT");
                 }
                 if (e.key.key == SDLK_O) {
+                    rend.diff_view = false;
                     rend.split_orient = layout_next_split_orient(
                         rend.split_orient, rend.n_sources > 1 && rend.solo < 0);
                     LOG("REND", "split orientation -> %s",
@@ -735,6 +739,17 @@ int main(int argc, char **argv)
                         rend.plane_view == HDRPLAY_PLANE_CB ? "Cb (grayscale)" :
                         rend.plane_view == HDRPLAY_PLANE_CR ? "Cr (grayscale)" :
                                                              "color");
+                }
+                if (e.key.key == SDLK_D) {
+                    if (n_sources > 1) {
+                        rend.diff_view = !rend.diff_view;
+                        if (rend.diff_view) rend.solo = -1;
+                        LOG("REND", "difference view %s%s",
+                            rend.diff_view ? "ON" : "OFF",
+                            rend.diff_view ? " (absolute linear light, 4x)" : "");
+                    } else {
+                        LOG("REND", "difference view needs two inputs");
+                    }
                 }
                 if (e.key.key == SDLK_SPACE) {
                     paused = !paused;
@@ -862,13 +877,16 @@ int main(int argc, char **argv)
                 /* Comparison controls. Inert with one file open. */
                 if (n_sources > 1) {
                     if (e.key.key == SDLK_0) {
-                        rend.solo = -1; LOG("REND", "compare A|B");
+                        rend.solo = -1; rend.diff_view = false;
+                        LOG("REND", "compare A|B");
                     }
                     if (e.key.key == SDLK_1) {
-                        rend.solo = 0;  LOG("REND", "solo %s", sources[0].label);
+                        rend.solo = 0; rend.diff_view = false;
+                        LOG("REND", "solo %s", sources[0].label);
                     }
                     if (e.key.key == SDLK_2) {
-                        rend.solo = 1;  LOG("REND", "solo %s", sources[1].label);
+                        rend.solo = 1; rend.diff_view = false;
+                        LOG("REND", "solo %s", sources[1].label);
                     }
                     if (e.key.key == SDLK_X) {
                         rend.swapped = !rend.swapped;

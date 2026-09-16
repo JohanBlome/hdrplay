@@ -138,6 +138,7 @@ hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
 # I toggles the status HUD, A the accumulated-statistics panel.
 # . and , step one frame forward / back.
 # C cycles normal color, Y, Cb and Cr component views.
+# D toggles a full-frame difference when two files are open.
 # T rotates the focused pane 90° clockwise.
 ```
 
@@ -209,6 +210,7 @@ returns to the two-file comparison.
 |---|---|
 | `.` `,` | step one frame forward / back (pauses) |
 | `0` `1` `2` | compare A\|B / solo A / solo B |
+| `D` | toggle full-frame A/B difference (absolute linear light, 4x) |
 | `X` | swap sides |
 | `Z` | toggle fit / 1:1 |
 | `+` `-` | zoom steps |
@@ -231,6 +233,14 @@ differences — grade, banding, blown highlights. `Z` gives 1:1 source
 pixels, which is where compression artifacts actually become visible.
 Pan is locked across panes, so you are always looking at the same region
 of both.
+
+Press `D` for a full-frame pixel difference. Both frames first pass through
+the same selected HDR or SDR display treatment, then the GPU takes their
+absolute RGB difference in linear display light and amplifies it 4x. Black
+means the displayed pixels match; brighter or coloured areas expose luma or
+channel differences. Only the image area covered by both files is compared,
+so unequal aspect ratios do not light up the letterbox bars. `C` can still
+select Y, Cb or Cr before the difference, and zoom/pan remain locked.
 
 ### Aspect ratio and 1:1
 

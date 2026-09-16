@@ -231,6 +231,8 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
     int y = 6;
 
     const char *mode_str =
+        r->diff_view ? (r->mode == HDRPLAY_MODE_SDR
+                        ? "DIFF SDR 4X" : "DIFF HDR 4X") :
         r->mode == HDRPLAY_MODE_HDR ? "HDR" :
         r->mode == HDRPLAY_MODE_SDR ? "SDR" :
         r->mode == HDRPLAY_MODE_SPLIT
@@ -664,10 +666,16 @@ void hud_prepare(Renderer *r, Source *sources, int n,
 
             case LAYOUT_OV_PLANE: {
                 const char *big =
+                    r->diff_view ? "DIFF" :
                     r->plane_view == HDRPLAY_PLANE_Y  ? "Y" :
                     r->plane_view == HDRPLAY_PLANE_CB ? "CB" :
                     r->plane_view == HDRPLAY_PLANE_CR ? "CR" : "COLOR";
                 const char *sub =
+                    r->diff_view
+                        ? (r->plane_view == HDRPLAY_PLANE_Y  ? "ABS Y 4X" :
+                           r->plane_view == HDRPLAY_PLANE_CB ? "ABS CB 4X" :
+                           r->plane_view == HDRPLAY_PLANE_CR ? "ABS CR 4X" :
+                                                              "ABS LINEAR 4X") :
                     r->plane_view == HDRPLAY_PLANE_Y ? "LUMA PLANE" :
                     r->plane_view == HDRPLAY_PLANE_COLOR ? "COMPOSITE" :
                                                            "CHROMA PLANE";
@@ -714,6 +722,7 @@ void hud_prepare(Renderer *r, Source *sources, int n,
             }
 
             case LAYOUT_OV_INTERMEDIATE:
+            case LAYOUT_OV_DIFF:
                 break;   /* renderer owns these */
             }
         }
