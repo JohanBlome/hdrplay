@@ -41,6 +41,7 @@ add_executable(hdrplay
     src/stats.c
     src/layout.c
     src/source.c
+    src/ambient.c
 )
 
 target_link_libraries(hdrplay PRIVATE
@@ -140,10 +141,22 @@ add_test(NAME stats  COMMAND test_stats)
 add_test(NAME source COMMAND test_source)
 add_test(NAME layout COMMAND test_layout)
 
+add_executable(test_ambient EXCLUDE_FROM_ALL
+    tests/test_ambient.c
+    src/ambient.c
+)
+target_include_directories(test_ambient PRIVATE src)
+if(APPLE)
+    target_link_libraries(test_ambient PRIVATE ${IOKIT_LIB} ${COREFOUNDATION_LIB})
+else()
+    target_link_libraries(test_ambient PRIVATE m)
+endif()
+add_test(NAME ambient COMMAND test_ambient)
+
 # ctest won't build EXCLUDE_FROM_ALL targets on its own.
 add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_stats test_layout test_source)
+    DEPENDS test_stats test_layout test_source test_ambient)
 
 # `cmake --install build --prefix ~` puts hdrplay on your PATH along
 # with the MoltenVK ICD + dylib it needs, so the installed copy is

@@ -2,6 +2,7 @@
 #define HDRPLAY_RENDERER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/vulkan.h>
@@ -21,6 +22,8 @@ typedef enum {
     HDRPLAY_PLANE_Y,
     HDRPLAY_PLANE_CB,
     HDRPLAY_PLANE_CR,
+    HDRPLAY_PLANE_LEGAL,
+    HDRPLAY_PLANE_CLIP,
     HDRPLAY_PLANE_COUNT,
 } HdrplayPlaneView;
 
@@ -33,6 +36,7 @@ typedef struct Renderer {
     pl_swapchain        swapchain;
     pl_renderer         renderer;       /* swapchain passes, always      */
     pl_renderer         renderer_inter; /* intermediates, always         */
+    pl_renderer         renderer_hlg;   /* forced-L_W HLG -> absolute PQ */
     pl_dispatch         dispatch_diff;  /* absolute frame difference     */
     pl_tex              diff_tex;
     int                 diff_w, diff_h;
@@ -49,6 +53,15 @@ typedef struct Renderer {
          * (re)creates them on first use; we just keep the array alive
          * so pl_unmap_avframe doesn't have to destroy them. */
         pl_tex plane_tex[4];
+
+        /* When --hlg-peak is set, libplacebo's normal one-pass policy
+         * would replace that value with the destination peak. Render HLG
+         * once into this source-sized absolute-PQ texture so the selected
+         * L_W survives subsequent HDR or SDR output mapping. */
+        pl_tex hlg_tex;
+        int    hlg_w, hlg_h;
+        float  hlg_peak_effective;
+        struct pl_frame render_image;
 
         /* Overlay intermediate. The pass renders into this RGBA texture
          * (with blend_params that preserve dst.alpha). The alpha channel
@@ -73,6 +86,38 @@ typedef struct Renderer {
     bool   display_hdr_capable;     /* SDL says display is in HDR mode */
     float  display_sdr_white;       /* current SDR white level, nits   */
     float  display_hdr_headroom;    /* current EDR headroom, ratio     */
+
+    /* Nominal HLG display peak (L_W), in nits. When > 0, HLG is first
+     * converted into an absolute-PQ intermediate at this peak. This avoids
+     * libplacebo's normal policy of replacing HLG L_W with the destination
+     * peak and makes the option affect playback as well as measurement. */
+    float  hlg_peak_override;
+    bool   hlg_peak_logged[2];
+
+    /* Viewing-environment policy. Reference lux comes from
+     * --reference-lux or the source AMVE; viewing lux comes from
+     * --ambient-lux or the MacBook sensor. The resulting exponent is
+     * applied in display-linear light while holding black and HLG peak. */
+    float    ambient_reference_override;
+    float    ambient_lux_override;
+    float    ambient_lux_current;
+    bool     ambient_sensor_available;
+    bool     ambient_unavailable_logged;
+    uint64_t ambient_next_poll_ms;
+    float    ambient_reference_effective[2];
+    float    ambient_exponent[2];
+    bool     ambient_logged[2];
+
+    /* Dynamic uniforms for the HLG preconversion hook. */
+    float ambient_shader_exponent;
+    float ambient_shader_peak_norm;
+
+    /* Decoded-source luma boundaries in libplacebo's normalized native-plane
+     * representation. LEGAL uses nominal video-range endpoints; CLIP uses
+     * the literal minimum/maximum codewords of the encoded bit depth. */
+    float legal_low[2], legal_high[2];
+    float clip_low[2], clip_high[2], clip_epsilon[2];
+    float clip_low_active, clip_high_active, clip_epsilon_active;
 
     /* Output mode and split orientation. Defined in layout.h, which
      * owns every decision that depends on them. */

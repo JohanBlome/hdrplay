@@ -4,6 +4,16 @@
 #include <stdbool.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/version.h>
+
+/* AVAmbientViewingEnvironment and its AVFrame side-data tag arrived in
+ * libavutil 57.44.100 (FFmpeg 6). Keep hdrplay buildable against older
+ * distro FFmpeg packages while exposing one feature switch to the tests. */
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 44, 100)
+#define HDRPLAY_HAVE_AMVE 1
+#else
+#define HDRPLAY_HAVE_AMVE 0
+#endif
 
 typedef struct Decoder {
     AVFormatContext *fmt;
@@ -51,6 +61,13 @@ typedef struct Decoder {
     double mdcv_min_luma, mdcv_max_luma;
     bool   has_cll;
     int    cll_max, cll_avg;
+
+    /* H.274 / ISOBMFF `amve`: the nominal environment assumed when the
+     * content was authored. This is descriptive metadata, not the viewer's
+     * current ambient-light measurement. */
+    bool   has_ambient_viewing;
+    double ambient_illuminance_lux;
+    double ambient_light_x, ambient_light_y;
 } Decoder;
 
 /* Force the colour range for sources that do not declare one, or
@@ -70,9 +87,8 @@ bool  decoder_open(Decoder *d, const char *path);
 bool  decoder_resolve_color_range(Decoder *d, int max_frames);
 
 int   decoder_next_frame(Decoder *d);   /* >0 got frame, 0 EOF, <0 error */
-/* Fold any per-frame HDR10 side data into the cached stream metadata.
- * Encoders that stamp MaxCLL/MaxFALL per frame rather than per stream
- * would otherwise look like they declare nothing. */
+/* Fold per-frame HDR/AMVE side data into the cached stream metadata.
+ * Encoders and demuxers do not expose all metadata at the same level. */
 void  decoder_absorb_frame_side_data(Decoder *d);
 bool  decoder_seek_start(Decoder *d);   /* rewind for --loop; false on err */
 bool  decoder_seek_to(Decoder *d, double seconds);   /* seek to absolute time; clamps to >= 0 */

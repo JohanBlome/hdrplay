@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <math.h>
 #include <libavutil/frame.h>
+#if HDRPLAY_HAVE_AMVE
+#include <libavutil/ambient_viewing_environment.h>
+#endif
 
 static int fails = 0;
 #define CHECK(cond, fmt, ...) do {                                  \
@@ -184,6 +187,35 @@ static void test_source_clock_alignment_in_history(void)
     ring_free(&s.ring);
 }
 
+#if HDRPLAY_HAVE_AMVE
+static void test_ambient_viewing_metadata(void)
+{
+    puts("decoder: per-frame ambient viewing environment metadata");
+    Decoder d = {0};
+    d.frame = av_frame_alloc();
+    AVFrameSideData *sd = av_frame_new_side_data(
+        d.frame, AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT,
+        sizeof(AVAmbientViewingEnvironment));
+    CHECK(sd != NULL, "AMVE side data allocated");
+    if (sd) {
+        AVAmbientViewingEnvironment *a =
+            (AVAmbientViewingEnvironment *)sd->data;
+        a->ambient_illuminance = (AVRational){ 3140000, 10000 };
+        a->ambient_light_x     = (AVRational){ 15635, 50000 };
+        a->ambient_light_y     = (AVRational){ 16450, 50000 };
+        decoder_absorb_frame_side_data(&d);
+        CHECK(d.has_ambient_viewing, "AMVE presence retained");
+        CHECK(NEAR(d.ambient_illuminance_lux, 314.0, 1e-9),
+              "AMVE illuminance is %.1f lux", d.ambient_illuminance_lux);
+        CHECK(NEAR(d.ambient_light_x, 0.3127, 1e-9) &&
+              NEAR(d.ambient_light_y, 0.3290, 1e-9),
+              "AMVE white is (%.4f, %.4f)",
+              d.ambient_light_x, d.ambient_light_y);
+    }
+    av_frame_free(&d.frame);
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* The sync rule, as arithmetic. Given a clock and a list of frame
  * times, the frame in effect is the last one whose PTS <= clock. */
@@ -237,6 +269,9 @@ int main(void)
     test_ring_disabled();
     test_temporal_previous();
     test_source_clock_alignment_in_history();
+#if HDRPLAY_HAVE_AMVE
+    test_ambient_viewing_metadata();
+#endif
     test_sync_rule();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

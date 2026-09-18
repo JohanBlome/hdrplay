@@ -70,6 +70,44 @@ Per-layer responsibilities:
   the desktop scene, signal HDR to the display per its protocol.
 - **Panel**: decode PQ codes back to absolute nits, display.
 
+HLG is scene-referred, so it needs a nominal display peak `L_W` before it
+has an absolute display-light meaning. With `--hlg-peak NITS`, hdrplay first
+renders HLG into a source-sized, absolute-PQ intermediate whose peak is the
+selected `L_W`. All HDR, SDR, split and comparison paths consume that PQ
+result. This two-stage conversion is necessary because libplacebo's normal
+one-pass policy deliberately replaces an HLG source peak with the HDR
+destination peak. The luminance probe uses the same override, keeping the
+displayed image and reported nits on one interpretation. PQ, Dolby Vision and
+SDR sources are unaffected.
+
+### hdrplay's ambient contrast policy (deliberately non-standard)
+
+H.274 AMVE describes a reference ambient illuminance and chromaticity. It
+does **not** prescribe a display transform. hdrplay therefore labels its
+adaptation as its own policy rather than claiming standards compliance.
+
+The neutral reference comes from `--reference-lux`, or from source AMVE when
+the option is absent. For an untagged HLG source, explicitly specifying
+`--ambient-lux` uses a labelled 314-lux fallback reference (Apple's documented
+default HLG capture environment, not a standards requirement). Current room
+illuminance comes from `--ambient-lux`, or from the built-in ambient-light
+sensor on supported MacBooks. Sensor-only automatic adaptation is disabled for
+untagged sources unless `--reference-lux` supplies the missing reference.
+
+The policy computes:
+
+```
+exponent = clamp(1 + 0.08 * log2(reference_lux / viewing_lux), 0.75, 1.40)
+```
+
+After the HLG OOTF, display-linear RGB is scaled by normalized luma raised to
+`exponent - 1`. This holds black and the selected HLG peak fixed and preserves
+RGB ratios. A dark room produces an exponent above 1: midtones fall while the
+highlight ceiling remains, increasing contrast and avoiding an unnecessarily
+bright adaptation level. A bright room produces an exponent below 1 and lifts
+midtones. The HUD and `[AMBIENT]` log report the reference, current lux and
+effective exponent, followed by `NONSTD` / `not standardized`.
+
 The "interesting" layer for color correctness is libplacebo; the
 "interesting" layer for HDR signaling is the swapchain/OS boundary.
 
@@ -403,6 +441,26 @@ to pick a specific monitor for the playback window.
 ---
 
 ## 9. Known limitations and "but-what-about" answers
+
+### Does HLG ambient-viewing metadata change the picture?
+
+hdrplay reads H.274 / ISOBMFF `amve` metadata from both stream and frame
+side data. It reports the illuminance and white point in `[META]` logs,
+`--analyze`, JSON output, and A/B pane badges.
+
+When current ambient lux is available, hdrplay now applies the explicitly
+non-standard policy documented above. Source AMVE supplies the neutral
+reference unless `--reference-lux` overrides it; `--ambient-lux` or the
+MacBook sensor supplies the current room level. libplacebo itself has no AMVE
+input, so this is hdrplay policy rather than an interpretation mandated by
+H.274, BT.2100 or BT.2390.
+
+This differs from Chromium on macOS, which supplies a synthetic 314-lux AMVE
+attachment for every HLG video. Chromium notes that the values themselves do
+not affect Apple's rendering there: the attachment's presence selects the HLG
+presentation behavior. Consequently, tagged and untagged HLG can look the same
+in Chrome on macOS while differing in a Linux playback stack that preserves
+the source distinction.
 
 ### Why doesn't SDR brightness match ffplay / QuickTime?
 

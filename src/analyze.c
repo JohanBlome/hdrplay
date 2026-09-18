@@ -175,6 +175,15 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
         check_note(buf);
     }
 
+    if (dec && dec->has_ambient_viewing) {
+        snprintf(buf, sizeof(buf), "%.1f lux, white x=%.5f y=%.5f",
+                 dec->ambient_illuminance_lux,
+                 dec->ambient_light_x, dec->ambient_light_y);
+        check(R_INFO, "ambient viewing environment", buf);
+    } else if (d.reference == LUM_HLG_OOTF) {
+        check(R_INFO, "ambient viewing environment", "not declared");
+    }
+
     bool absolute = lum_reference_is_absolute(d.reference);
 
     /* Mislabelled SDR in an HDR container. Absolute references only —
@@ -229,11 +238,16 @@ static void stats_write_header(FILE *fp, const Decoder *d, int stride)
     fprintf(fp,
         "{\"type\":\"header\",\"schema\":1,\"width\":%d,\"height\":%d,"
         "\"bit_depth\":%d,\"stride\":%d,\"transfer\":%d,\"primaries\":%d,"
-        "\"declared_maxcll\":%d,\"declared_maxfall\":%d}\n",
+        "\"declared_maxcll\":%d,\"declared_maxfall\":%d,"
+        "\"has_amve\":%s,\"amve_lux\":%.4f,"
+        "\"amve_x\":%.6f,\"amve_y\":%.6f}\n",
         d->width, d->height, d->bit_depth, stride,
         (int)d->transfer, (int)d->primaries,
         d->has_cll ? d->cll_max : -1,
-        d->has_cll ? d->cll_avg : -1);
+        d->has_cll ? d->cll_avg : -1,
+        d->has_ambient_viewing ? "true" : "false",
+        d->ambient_illuminance_lux,
+        d->ambient_light_x, d->ambient_light_y);
 }
 
 static void stats_write_frame(FILE *fp, int64_t idx, double pts_sec,
@@ -309,6 +323,8 @@ static void emit_json(const SessionStats *s, const Decoder *d, const char *path)
     printf("{\"file\":\"%s\",\"frames\":%llu,\"coverage\":%.6f,"
            "\"reference\":\"%s\",\"hlg_lw\":%.1f,"
            "\"declared_maxcll\":%d,\"declared_maxfall\":%d,"
+           "\"has_amve\":%s,\"amve_lux\":%.4f,"
+           "\"amve_x\":%.6f,\"amve_y\":%.6f,"
            "\"measured_maxcll\":%.4f,\"measured_maxfall\":%.4f,"
            "\"maxcll_exact\":%s,"
            "\"bit_depth\":%d,\"full_range\":%s,\"range_guessed\":%s,"
@@ -322,6 +338,9 @@ static void emit_json(const SessionStats *s, const Decoder *d, const char *path)
            path, (unsigned long long)v.frames, v.coverage,
            lum_reference_name(v.reference), v.hlg_lw,
            d->has_cll ? d->cll_max : -1, d->has_cll ? d->cll_avg : -1,
+           d->has_ambient_viewing ? "true" : "false",
+           d->ambient_illuminance_lux,
+           d->ambient_light_x, d->ambient_light_y,
            v.maxcll_nits, v.maxfall_nits, v.maxcll_valid ? "true" : "false",
            v.bit_depth, v.full_range ? "true" : "false",
            d->range_guessed ? "true" : "false", d->range_outside_frac,

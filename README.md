@@ -10,7 +10,7 @@ Companion to `vca.py`: where `vca` answers "is this file really HDR?",
 file                                      [DEC]   demux + hardware decode
  │
  ▼
-AVFrame (10-bit P010 / YUV420P10 / …)    [META]  HDR10 side data extracted
+AVFrame (10-bit P010 / YUV420P10 / …)    [META]  HDR10 + H.274 AMVE side data extracted
  │
  ▼
 pl_map_avframe_ex ── pl_frame             [REND]  uploaded to GPU
@@ -159,7 +159,7 @@ hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
 # F toggles fullscreen, Q/Esc quits.
 # I toggles the status HUD, A the accumulated-statistics panel.
 # . and , step one frame forward / back.
-# C cycles normal color, Y, Cb and Cr component views.
+# C cycles color, Y, Cb, Cr, legal-range and literal-clipping views.
 # D toggles a full-frame current/previous difference with one file,
 # or an A/B difference when two files are open.
 # T rotates the focused pane 90° clockwise.
@@ -167,17 +167,25 @@ hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
 
 ### Plane inspection
 
-Press `C` to cycle through normal color, Y, Cb and Cr. Each selected
+Press `C` to cycle through normal color, Y, Cb, Cr, `LEGAL` and `CLIP`. Each selected
 component is repeated into RGB and shown as grayscale, making quantization
 steps in the color-difference planes much easier to see. Chroma is sampled
 nearest-neighbor when enlarged so the viewer does not hide boundaries by
 interpolating them. The selected plane applies to both files in comparison
 mode and remains independent of HDR/SDR treatment. A persistent badge in the
-top-right identifies `COLOR`, `Y`, `CB` or `CR`, even when the status HUD is
-hidden.
+top-right identifies the current view, even when the status HUD is hidden.
+`LEGAL` marks decoded luma at/beyond nominal video-range white red and nominal
+black blue (for example 940/64 in 10-bit limited range), which exposes range
+mislabelling. `CLIP` is stricter: only the literal storage endpoints are red
+and blue (1023/0 in 10-bit), regardless of nominal range. Everything else is
+grayscale. Both tests inspect the delivered source before HLG, tone mapping
+or display processing. Endpoint contact proves saturation of the delivered
+code value, but cannot identify whether the camera, grade or encoder caused
+it, or whether it was intentional.
 
 Start directly in a component view with `--plane y`, `--plane cb` or
-`--plane cr`; `u` and `v` are accepted aliases.
+`--plane cr`; `--plane legal` and `--plane clip` start the two false-color
+views, and `u` and `v` are accepted aliases.
 
 ### Rotation
 
@@ -239,7 +247,7 @@ returns to the two-file comparison.
 | `+` `-` | zoom steps |
 | drag, `shift`+arrows | pan, locked across panes |
 | `P` `O` | return to A/B comparison / cycle pane LR, pane TB, diagonal, LR wipe, TB wipe |
-| `C` | cycle normal color / Y / Cb / Cr; individual planes are grayscale |
+| `C` | cycle color / Y / Cb / Cr / legal range / literal clipping |
 | `T` | rotate the focused pane 90° clockwise |
 | `W` | resize the window for exact 1:1, no letterbox |
 
@@ -363,10 +371,21 @@ Five things worth understanding about the numbers:
 - **HLG numbers rest on an assumption.** HLG carries no absolute
   luminance; converting scene light to display light needs a nominal
   peak `L_W`, applied through the BT.2100 OOTF — a power, not a gain,
-  so `L_W` moves the shadows more than the highlights and the dynamic
-  range with them. hdrplay takes `--hlg-peak` if given, else the file's
-  mastering-display max, else the BT.2100 reference of 1000 nits, and
-  names which of the three it used.
+  so it changes both absolute brightness and contrast. `--hlg-peak`
+  overrides `L_W` for both libplacebo playback and measurement. Without
+  an override, playback follows the mapped source/libplacebo policy;
+  measurement takes the file's mastering-display max when present, else
+  the BT.2100 reference of 1000 nits, and reports which value it used.
+- **Ambient adaptation is an explicit hdrplay policy, not a standard.**
+  `--reference-lux` overrides the file's AMVE reference environment;
+  otherwise AMVE is used when present. On untagged HLG, explicitly supplying
+  `--ambient-lux` selects a clearly labelled 314-lux fallback reference, so
+  the control remains useful without metadata. `--ambient-lux` supplies the
+  current room level; on supported MacBooks hdrplay reads the built-in sensor
+  when a source reference exists and that option is omitted. Darker-than-reference playback lowers midtones
+  while fixing black and the HLG peak, exposing more of the display's
+  contrast without making diffuse levels needlessly bright. Neither H.274
+  AMVE nor BT.2100 specifies this mapping.
 - **SDR gets no absolute figures at all.** A measured MaxCLL for an SDR
   file cannot exceed 100 nits by construction, so those checks are
   suppressed rather than printed with a caveat. Ratio statistics

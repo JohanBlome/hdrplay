@@ -7,6 +7,9 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/mastering_display_metadata.h>
+#if HDRPLAY_HAVE_AMVE
+#include <libavutil/ambient_viewing_environment.h>
+#endif
 
 static const char *prim_name(enum AVColorPrimaries p)        { return av_color_primaries_name(p) ?: "unknown"; }
 static const char *trc_name(enum AVColorTransferCharacteristic t) { return av_color_transfer_name(t) ?: "unknown"; }
@@ -48,12 +51,37 @@ static void log_metadata(const Decoder *d)
         LOG("META", "content light: MaxCLL=%d MaxFALL=%d", d->cll_max, d->cll_avg);
     else
         LOG("META", "no MaxCLL/MaxFALL");
+
+    if (d->has_ambient_viewing)
+        LOG("META", "ambient viewing environment: %.1f lux, white=(%.5f,%.5f)",
+            d->ambient_illuminance_lux,
+            d->ambient_light_x, d->ambient_light_y);
+    else if (d->transfer == AVCOL_TRC_ARIB_STD_B67)
+        LOG("META", "no ambient viewing environment metadata");
 }
 
-/* HDR10 static metadata lives on the stream as side data. Some encoders
- * also stamp it on each AVFrame; we read from codecpar->coded_side_data
- * first, then accept per-frame upgrades silently in the render path. */
-static void extract_hdr10_sidedata(Decoder *d, const AVStream *st)
+#if HDRPLAY_HAVE_AMVE
+static bool absorb_amve(Decoder *d, const uint8_t *data, size_t size)
+{
+    if (!data || size < sizeof(AVAmbientViewingEnvironment)) return false;
+
+    const AVAmbientViewingEnvironment *a =
+        (const AVAmbientViewingEnvironment *)data;
+    d->has_ambient_viewing = true;
+    d->ambient_illuminance_lux = a->ambient_illuminance.den
+                               ? av_q2d(a->ambient_illuminance) : 0.0;
+    d->ambient_light_x = a->ambient_light_x.den
+                       ? av_q2d(a->ambient_light_x) : 0.0;
+    d->ambient_light_y = a->ambient_light_y.den
+                       ? av_q2d(a->ambient_light_y) : 0.0;
+    return true;
+}
+#endif
+
+/* HDR10 static and ambient-viewing metadata can live on the stream. Some
+ * encoders also stamp it on each AVFrame; read codecpar first, then accept
+ * per-frame upgrades in the decode path. */
+static void extract_stream_sidedata(Decoder *d, const AVStream *st)
 {
 #if LIBAVCODEC_VERSION_MAJOR >= 60
     const AVPacketSideData *sd_mdcv = av_packet_side_data_get(
@@ -62,13 +90,24 @@ static void extract_hdr10_sidedata(Decoder *d, const AVStream *st)
     const AVPacketSideData *sd_cll = av_packet_side_data_get(
         st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data,
         AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+#if HDRPLAY_HAVE_AMVE && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 39, 100)
+    const AVPacketSideData *sd_amve = av_packet_side_data_get(
+        st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data,
+        AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT);
+#endif
 #else
     /* Older ffmpeg: iterate codecpar->coded_side_data manually. */
     const AVPacketSideData *sd_mdcv = NULL, *sd_cll = NULL;
+#if HDRPLAY_HAVE_AMVE && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 39, 100)
+    const AVPacketSideData *sd_amve = NULL;
+#endif
     for (int i = 0; i < st->codecpar->nb_coded_side_data; i++) {
         const AVPacketSideData *sd = &st->codecpar->coded_side_data[i];
         if (sd->type == AV_PKT_DATA_MASTERING_DISPLAY_METADATA) sd_mdcv = sd;
         if (sd->type == AV_PKT_DATA_CONTENT_LIGHT_LEVEL)        sd_cll  = sd;
+#if HDRPLAY_HAVE_AMVE && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 39, 100)
+        if (sd->type == AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT) sd_amve = sd;
+#endif
     }
 #endif
 
@@ -97,6 +136,11 @@ static void extract_hdr10_sidedata(Decoder *d, const AVStream *st)
         d->cll_max = c->MaxCLL;
         d->cll_avg = c->MaxFALL;
     }
+
+#if HDRPLAY_HAVE_AMVE && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 39, 100)
+    if (sd_amve)
+        absorb_amve(d, sd_amve->data, sd_amve->size);
+#endif
 }
 
 /* Per-frame upgrade of the HDR10 static metadata.
@@ -109,6 +153,8 @@ static void extract_hdr10_sidedata(Decoder *d, const AVStream *st)
 void decoder_absorb_frame_side_data(Decoder *d)
 {
     if (!d || !d->frame) return;
+
+    bool had_ambient_viewing = d->has_ambient_viewing;
 
     const AVFrameSideData *sd = av_frame_get_side_data(d->frame,
         AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
@@ -130,6 +176,19 @@ void decoder_absorb_frame_side_data(Decoder *d)
             d->mdcv_max_luma = av_q2d(m->max_luminance);
         }
     }
+
+#if HDRPLAY_HAVE_AMVE
+    sd = av_frame_get_side_data(d->frame,
+        AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT);
+    if (sd) absorb_amve(d, sd->data, sd->size);
+    if (!had_ambient_viewing && d->has_ambient_viewing)
+        LOG("META", "ambient viewing environment: %.1f lux, white=(%.5f,%.5f) "
+                    "(from decoded frame)",
+            d->ambient_illuminance_lux,
+            d->ambient_light_x, d->ambient_light_y);
+#else
+    (void)had_ambient_viewing;
+#endif
 }
 
 /* --range, applied to every input. A file-static rather than a
@@ -313,7 +372,7 @@ bool decoder_open(Decoder *d, const char *path)
     const AVPixFmtDescriptor *pd = av_pix_fmt_desc_get(d->pix_fmt);
     d->bit_depth = pd ? pd->comp[0].depth : 8;
 
-    extract_hdr10_sidedata(d, st);
+    extract_stream_sidedata(d, st);
     log_metadata(d);
     if (g_range_override != AVCOL_RANGE_UNSPECIFIED)
         LOG("META", "range forced to %s by --range", rng_name(g_range_override));

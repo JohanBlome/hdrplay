@@ -4,12 +4,14 @@
 #include "probe.h"
 #include "stats.h"
 #include "source.h"
+#include "ambient.h"
 
 #include <math.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 #include <libavutil/frame.h>
+#include <libavutil/pixdesc.h>
 #include <libplacebo/shaders/custom.h>
 
 /* ------------------------------------------------------------------ */
@@ -86,6 +88,24 @@ void renderer_update_display_state(Renderer *r)
     r->display_hdr_capable  = hdr;
     r->display_sdr_white    = white;
     r->display_hdr_headroom = head;
+}
+
+static void renderer_update_ambient_sensor(Renderer *r)
+{
+    if (r->ambient_lux_override > 0.0f) {
+        r->ambient_lux_current = r->ambient_lux_override;
+        r->ambient_sensor_available = false;
+        return;
+    }
+
+    uint64_t now = SDL_GetTicks();
+    if (now < r->ambient_next_poll_ms) return;
+    r->ambient_next_poll_ms = now + 1000;
+
+    float lux = 0.0f;
+    r->ambient_sensor_available = ambient_sensor_read_lux(&lux);
+    if (r->ambient_sensor_available)
+        r->ambient_lux_current = lux;
 }
 
 /* ------------------------------------------------------------------ */
@@ -326,6 +346,8 @@ bool renderer_init(Renderer *r, int width, int height, const char *title, int di
      * renderer. Keep every intermediate on this one. */
     r->renderer_inter = pl_renderer_create(r->pl_log, r->vulkan->gpu);
     if (!r->renderer_inter) { LOG("GPU", "ERROR: pl_renderer_create (inter)"); return false; }
+    r->renderer_hlg = pl_renderer_create(r->pl_log, r->vulkan->gpu);
+    if (!r->renderer_hlg) { LOG("GPU", "ERROR: pl_renderer_create (HLG)"); return false; }
     r->dispatch_diff = pl_dispatch_create(r->pl_log, r->vulkan->gpu);
     if (!r->dispatch_diff) { LOG("GPU", "ERROR: pl_dispatch_create (diff)"); return false; }
 
@@ -366,6 +388,166 @@ static bool rect_same(struct pl_rect2df a, struct pl_rect2df b)
 {
     return fabsf(a.x0 - b.x0) < 0.51f && fabsf(a.y0 - b.y0) < 0.51f &&
            fabsf(a.x1 - b.x1) < 0.51f && fabsf(a.y1 - b.y1) < 0.51f;
+}
+
+static struct pl_hook_res ambient_contrast_hook(
+    void *priv, const struct pl_hook_params *params)
+{
+    Renderer *r = priv;
+    int width = (int)roundf(fabsf(params->rect.x1 - params->rect.x0));
+    int height = (int)roundf(fabsf(params->rect.y1 - params->rect.y0));
+    struct pl_shader_var vars[] = {
+        {
+            .var = pl_var_float("ambient_exponent"),
+            .data = &r->ambient_shader_exponent,
+            .dynamic = true,
+        }, {
+            .var = pl_var_float("ambient_peak_norm"),
+            .data = &r->ambient_shader_peak_norm,
+            .dynamic = true,
+        },
+    };
+    static const char *header =
+        "vec3 ambient_pq_eotf(vec3 e) {\n"
+        "    const float m1 = 0.1593017578125;\n"
+        "    const float m2 = 78.84375;\n"
+        "    const float c1 = 0.8359375;\n"
+        "    const float c2 = 18.8515625;\n"
+        "    const float c3 = 18.6875;\n"
+        "    vec3 p = pow(clamp(e, 0.0, 1.0), vec3(1.0 / m2));\n"
+        "    return pow(max(p - c1, 0.0) / (c2 - c3 * p), vec3(1.0 / m1));\n"
+        "}\n"
+        "vec3 ambient_pq_oetf(vec3 l) {\n"
+        "    const float m1 = 0.1593017578125;\n"
+        "    const float m2 = 78.84375;\n"
+        "    const float c1 = 0.8359375;\n"
+        "    const float c2 = 18.8515625;\n"
+        "    const float c3 = 18.6875;\n"
+        "    vec3 p = pow(clamp(l, 0.0, 1.0), vec3(m1));\n"
+        "    return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));\n"
+        "}\n";
+    static const char *body =
+        "vec3 linear = ambient_pq_eotf(color.rgb);\n"
+        "float y = max(dot(linear, vec3(0.2627, 0.6780, 0.0593)), 0.0);\n"
+        "float relative_y = clamp(y / max(ambient_peak_norm, 1e-6), 0.0, 1.0);\n"
+        "float scale = y > 1e-9\n"
+        "    ? pow(max(relative_y, 1e-6), ambient_exponent - 1.0) : 0.0;\n"
+        "color.rgb = ambient_pq_oetf(max(linear * scale, 0.0));\n";
+    bool ok = pl_shader_custom(params->sh, &(struct pl_custom_shader){
+        .header = header,
+        .description = "hdrplay ambient contrast policy (non-standard)",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+        .variables = vars,
+        .num_variables = 2,
+        .output_w = width,
+        .output_h = height,
+    });
+    return (struct pl_hook_res){
+        .failed = !ok,
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = params->sh,
+        .repr = params->repr,
+        .color = params->color,
+        .components = params->components,
+        .rect = params->rect,
+    };
+}
+
+/* Freeze a selected HLG OOTF into an absolute PQ texture.
+ *
+ * pl_color_space_infer_map() intentionally tunes an HLG source to an HDR
+ * destination by replacing source max_luma with destination max_luma. That
+ * is the right automatic policy, but it also means changing only the source
+ * metadata has no visible effect. This first pass makes the requested L_W
+ * the destination of the HLG conversion. The second, normal render sees PQ
+ * rather than HLG, so it can tone-map those absolute values to either the
+ * real HDR target or the selected SDR target without rewriting L_W. */
+static bool prepare_hlg_policy(Renderer *r, int si, float peak,
+                               float ambient_exponent)
+{
+    typeof(r->slot[0]) *sl = &r->slot[si];
+    struct pl_frame *src = &sl->image;
+    sl->render_image = *src;
+    sl->hlg_peak_effective = 0.0f;
+
+    bool ambient_active = fabsf(ambient_exponent - 1.0f) > 0.001f;
+    if (src->color.transfer != PL_COLOR_TRC_HLG ||
+        (r->hlg_peak_override <= 0.0f && !ambient_active))
+        return true;
+
+    int w = (int)fabsf(src->crop.x1 - src->crop.x0);
+    int h = (int)fabsf(src->crop.y1 - src->crop.y0);
+    if (w <= 0 || h <= 0) return false;
+
+    if (!sl->hlg_tex || sl->hlg_w != w || sl->hlg_h != h) {
+        if (sl->hlg_tex) pl_tex_destroy(r->vulkan->gpu, &sl->hlg_tex);
+        pl_fmt fmt = pl_find_named_fmt(r->vulkan->gpu, "rgba16hf");
+        if (!fmt) {
+            LOG("REND", "no RGBA16F format for HLG peak conversion");
+            return false;
+        }
+        sl->hlg_tex = pl_tex_create(r->vulkan->gpu, pl_tex_params(
+            .w          = w,
+            .h          = h,
+            .format     = fmt,
+            .sampleable = true,
+            .renderable = true,
+            .blit_dst   = true,
+        ));
+        if (!sl->hlg_tex) {
+            LOG("REND", "HLG peak texture allocation failed");
+            return false;
+        }
+        sl->hlg_w = w;
+        sl->hlg_h = h;
+    }
+
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes = {{
+            .texture           = sl->hlg_tex,
+            .components        = 4,
+            .component_mapping = { 0, 1, 2, 3 },
+        }},
+        .crop = { 0, 0, w, h },
+        .repr = pl_color_repr_rgb,
+        .color = pl_color_space_hdr10,
+    };
+    target.repr.alpha = PL_ALPHA_NONE;
+    target.color.primaries = src->color.primaries;
+    target.color.hdr.max_luma = peak;
+    target.color.hdr.min_luma = PL_COLOR_HDR_BLACK;
+
+    struct pl_render_params rp = pl_render_default_params;
+    struct pl_hook ambient_hook = {
+        .stages = PL_HOOK_PRE_OUTPUT,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = r,
+        .hook = ambient_contrast_hook,
+        .signature = UINT64_C(0x686472706c617578),
+    };
+    const struct pl_hook *ambient_hook_ptr = &ambient_hook;
+    if (ambient_active) {
+        r->ambient_shader_exponent = ambient_exponent;
+        r->ambient_shader_peak_norm = peak / 10000.0f;
+        rp.hooks = &ambient_hook_ptr;
+        rp.num_hooks = 1;
+    }
+    if (!pl_render_image(r->renderer_hlg, src, &target, &rp)) {
+        LOG("REND", "HLG peak conversion failed for source %d", si);
+        return false;
+    }
+
+    sl->render_image = target;
+    sl->hlg_peak_effective = peak;
+    if (!r->hlg_peak_logged[si]) {
+        LOG("REND", "source %d HLG playback converted at %.0f nits",
+            si, peak);
+        r->hlg_peak_logged[si] = true;
+    }
+    return true;
 }
 
 /* `dst` is the window-space rect the image will actually occupy. Alpha
@@ -675,6 +857,38 @@ static void make_inter_overlay(
     }
 }
 
+/* Present the forced-L_W conversion as absolute PQ. Sending this texture
+ * through the swapchain's ordinary image path lets that path normalize it
+ * back to the swapchain peak, erasing the requested 500-vs-1000 nit
+ * distinction. Overlay composition preserves the encoded absolute light,
+ * just as it does for the SDR comparison intermediate. SRC_FRAME coordinates
+ * make it follow the base image's crop, scale and rotation. */
+static void make_hlg_override_overlay(
+    const Renderer *r,
+    int si,
+    struct pl_overlay *out_overlay,
+    struct pl_overlay_part *out_part)
+{
+    const typeof(r->slot[0]) *sl = &r->slot[si];
+    *out_part = (struct pl_overlay_part){
+        .src = { 0, 0, (float)sl->hlg_w, (float)sl->hlg_h },
+        .dst = { 0, 0, (float)sl->hlg_w, (float)sl->hlg_h },
+    };
+    *out_overlay = (struct pl_overlay){
+        .tex    = sl->hlg_tex,
+        .mode   = PL_OVERLAY_NORMAL,
+        .coords = PL_OVERLAY_COORDS_SRC_FRAME,
+        .parts  = out_part,
+        .num_parts = 1,
+        .repr   = pl_color_repr_rgb,
+        .color  = pl_color_space_hdr10,
+    };
+    out_overlay->repr.alpha = PL_ALPHA_NONE;
+    out_overlay->color.primaries = sl->image.color.primaries;
+    out_overlay->color.hdr.max_luma = sl->hlg_peak_effective;
+    out_overlay->color.hdr.min_luma = PL_COLOR_HDR_BLACK;
+}
+
 /* ------------------------------------------------------------------ */
 /* GPU frame difference (A/B or current/previous).                    */
 /*                                                                    */
@@ -876,6 +1090,50 @@ static struct pl_hook_res plane_hook(void *priv,
     };
 }
 
+static struct pl_hook_res clipping_hook(void *priv,
+                                        const struct pl_hook_params *params)
+{
+    Renderer *r = priv;
+    int width = (int)roundf(fabsf(params->rect.x1 - params->rect.x0));
+    int height = (int)roundf(fabsf(params->rect.y1 - params->rect.y0));
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_float("clip_low"),
+          .data = &r->clip_low_active, .dynamic = true },
+        { .var = pl_var_float("clip_high"),
+          .data = &r->clip_high_active, .dynamic = true },
+        { .var = pl_var_float("clip_epsilon"),
+          .data = &r->clip_epsilon_active, .dynamic = true },
+    };
+    static const char *body =
+        "float y = color.r;\n"
+        "float gray = clamp((y - clip_low) / max(clip_high - clip_low, 1e-6), 0.0, 1.0);\n"
+        "color.rgb = vec3(gray);\n"
+        "if (y >= clip_high - clip_epsilon) color.rgb = vec3(1.0, 0.0, 0.0);\n"
+        "else if (y <= clip_low + clip_epsilon) color.rgb = vec3(0.0, 0.0, 1.0);\n";
+    bool ok = pl_shader_custom(params->sh, &(struct pl_custom_shader){
+        .description = "exact decoded-luma clipping view",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+        .variables = vars,
+        .num_variables = 3,
+        .output_w = width,
+        .output_h = height,
+    });
+
+    struct pl_color_repr repr = pl_color_repr_rgb;
+    repr.alpha = PL_ALPHA_NONE;
+    return (struct pl_hook_res){
+        .failed = !ok,
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = params->sh,
+        .repr = repr,
+        .color = params->color,
+        .components = 3,
+        .rect = params->rect,
+    };
+}
+
 /* At NATIVE, libplacebo has already aligned and combined the decoded Y, Cb
  * and Cr textures but has not converted them to RGB. Replicating the selected
  * native component here gives true grayscale without copying a plane or
@@ -904,6 +1162,14 @@ static const struct pl_hook plane_hooks[3] = {
     },
 };
 
+static void select_clip_thresholds(Renderer *r, int si)
+{
+    bool legal = r->plane_view == HDRPLAY_PLANE_LEGAL;
+    r->clip_low_active = legal ? r->legal_low[si] : r->clip_low[si];
+    r->clip_high_active = legal ? r->legal_high[si] : r->clip_high[si];
+    r->clip_epsilon_active = r->clip_epsilon[si];
+}
+
 /* Which source the HUD, probe and statistics should describe. In a
  * two-file comparison that is the left/top pane; when soloed it is
  * whichever file is on screen. */
@@ -919,6 +1185,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     if (n < 1) return false;
     if (n > 2) n = 2;
     renderer_update_display_state(r);
+    renderer_update_ambient_sensor(r);
 
     struct pl_swapchain_frame sf;
     if (!pl_swapchain_start_frame(r->swapchain, &sf)) {
@@ -958,12 +1225,104 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             continue;
         }
         r->slot[i].mapped = true;
-        /* Set here, not per-pass: intermediates render straight from the
-         * slot (SDR mode, and source B in a DIAG wipe), so a pass-local
-         * assignment would rotate the direct path and leave those two
-         * upright. */
-        r->slot[i].image.rotation =
+
+        /* Native-plane values have already been normalized for storage bit
+         * shift by the time PL_HOOK_NATIVE runs. Reproduce libplacebo's
+         * normalization here so the false-color thresholds select exactly
+         * the legal luma codes, rather than an arbitrary near-white band. */
+        struct pl_bit_encoding bits = r->slot[i].image.repr.bits;
+        const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(slot_frame[i]->format);
+        int color_bits = bits.color_depth;
+        if (!color_bits && pixdesc) color_bits = pixdesc->comp[0].depth;
+        if (!color_bits) color_bits = 8;
+        int sample_bits = bits.sample_depth ? bits.sample_depth : color_bits;
+        int bit_shift = bits.bit_shift > 0 ? bits.bit_shift : 0;
+        double tex_max = ldexp(1.0, sample_bits) - 1.0;
+        double scale = 1.0 / ldexp(1.0, bit_shift);
+        bool full_range = pl_color_levels_guess(&r->slot[i].image.repr) ==
+                          PL_COLOR_LEVELS_FULL;
+        if (full_range)
+            scale *= tex_max / (ldexp(1.0, color_bits) - 1.0);
+        else
+            scale *= ldexp(1.0, sample_bits - color_bits);
+        double code_step = ldexp(1.0, bit_shift) / tex_max * scale;
+        int code_scale = 1 << (color_bits > 8 ? color_bits - 8 : 0);
+        r->clip_low[i] = 0.0f;
+        r->clip_high[i] =
+            (float)((ldexp(1.0, color_bits) - 1.0) * code_step);
+        r->legal_low[i] = full_range ? r->clip_low[i]
+                                     : (float)(16 * code_scale * code_step);
+        r->legal_high[i] = full_range ? r->clip_high[i]
+                                      : (float)(235 * code_scale * code_step);
+        r->clip_epsilon[i] = (float)(0.25 * code_step);
+
+        int source_index = temporal_diff && i == 1 ? 0 : i;
+        const Decoder *dec = &sources[source_index].dec;
+        const char *reference_source = "none";
+        float reference_lux = 0.0f;
+        if (r->ambient_reference_override > 0.0f) {
+            reference_lux = r->ambient_reference_override;
+            reference_source = "CLI";
+        } else if (dec->has_ambient_viewing) {
+            reference_lux = (float)dec->ambient_illuminance_lux;
+            reference_source = "AMVE";
+        } else if (r->ambient_lux_override > 0.0f) {
+            /* An explicit viewing level must remain useful for untagged HLG.
+             * 314 lux is Apple's documented default HLG capture environment,
+             * not a value required by H.274 or BT.2100. Automatic sensor-only
+             * adaptation stays disabled when neither AMVE nor a reference
+             * override exists. */
+            reference_lux = 314.0f;
+            reference_source = "314 default";
+        }
+        float viewing_lux = r->ambient_lux_current;
+        float ambient_exponent = ambient_contrast_exponent(reference_lux,
+                                                            viewing_lux);
+        float previous_ref = r->ambient_reference_effective[i];
+        float previous_exp = r->ambient_exponent[i];
+        r->ambient_reference_effective[i] = reference_lux;
+        r->ambient_exponent[i] = ambient_exponent;
+
+        if (reference_lux > 0.0f && viewing_lux > 0.0f &&
+            (!r->ambient_logged[i] || fabsf(previous_ref - reference_lux) > 0.5f ||
+             fabsf(previous_exp - ambient_exponent) > 0.01f))
+        {
+            LOG("AMBIENT", "source %d reference=%.0f lux (%s), viewing=%.0f lux (%s), exponent=%.3f [hdrplay policy, not standardized]",
+                i, reference_lux,
+                reference_source,
+                viewing_lux,
+                r->ambient_lux_override > 0.0f ? "CLI" : "sensor",
+                ambient_exponent);
+            r->ambient_logged[i] = true;
+        } else if (reference_lux > 0.0f && viewing_lux <= 0.0f &&
+                   !r->ambient_unavailable_logged) {
+            LOG("AMBIENT", "reference %.0f lux available, but no ambient sensor reading; use --ambient-lux",
+                reference_lux);
+            r->ambient_unavailable_logged = true;
+        }
+
+        /* HLG is scene-referred. Its conversion to display light depends
+         * on the nominal display peak L_W. The actual conversion is done
+         * below, after all AVFrames have been mapped. */
+        float hlg_peak = r->hlg_peak_override > 0.0f
+                       ? r->hlg_peak_override
+                       : r->slot[i].image.color.hdr.max_luma > 0.0f
+                           ? r->slot[i].image.color.hdr.max_luma
+                           : PL_COLOR_HLG_PEAK;
+        if (r->hlg_peak_override > 0.0f &&
+            r->slot[i].image.color.transfer == PL_COLOR_TRC_HLG)
+            r->slot[i].image.color.hdr.max_luma = r->hlg_peak_override;
+
+        if (!prepare_hlg_policy(r, i, hlg_peak, ambient_exponent))
+            LOG("REND", "using automatic HLG mapping for source %d", i);
+
+        /* Set on the image actually consumed downstream. HLG conversion is
+         * deliberately unrotated and source-sized; view rotation belongs to
+         * the ordinary presentation pass. */
+        pl_rotation rotation =
             pl_rotation_normalize(slot_rotation[i] / 90);
+        r->slot[i].image.rotation = rotation;
+        r->slot[i].render_image.rotation = rotation;
     }
 
     int focus = renderer_focus_source(r);
@@ -997,9 +1356,19 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     struct pl_render_params rp = pl_render_default_params;
     rp.info_callback = pl_info_cb;
     rp.info_priv     = r;
+    struct pl_hook clip_hook = {
+        .stages = PL_HOOK_NATIVE,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = r,
+        .hook = clipping_hook,
+        .signature = UINT64_C(0x687064636c697000),
+    };
     const struct pl_hook *plane_hook_ptr = NULL;
     if (r->plane_view != HDRPLAY_PLANE_COLOR) {
-        plane_hook_ptr = &plane_hooks[r->plane_view - HDRPLAY_PLANE_Y];
+        plane_hook_ptr = (r->plane_view == HDRPLAY_PLANE_LEGAL ||
+                          r->plane_view == HDRPLAY_PLANE_CLIP)
+                       ? &clip_hook
+                       : &plane_hooks[r->plane_view - HDRPLAY_PLANE_Y];
         rp.hooks = &plane_hook_ptr;
         rp.num_hooks = 1;
         /* Preserve individual 4:2:0/4:2:2 chroma samples when zooming rather
@@ -1126,7 +1495,12 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         /* Same crop the corresponding pass uses, or the intermediate
          * would draw the whole frame into a rect sized for a cropped
          * one — i.e. stretch by exactly the zoom factor. */
-        struct pl_frame img = r->slot[si].image;
+        struct pl_frame img = r->plane_view == HDRPLAY_PLANE_COLOR
+                            ? r->slot[si].render_image
+                            : r->slot[si].image;
+        if (r->plane_view == HDRPLAY_PLANE_LEGAL ||
+            r->plane_view == HDRPLAY_PLANE_CLIP)
+            select_clip_thresholds(r, si);
         if (!rect_is_zero(plan.inter[i].image_crop))
             img.crop = to_pl_rect(plan.inter[i].image_crop);
         if (!render_to_intermediate(r, si, &img, win_w, win_h,
@@ -1175,6 +1549,9 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         if (lp->src < 0 || lp->src >= slot_count || !r->slot[lp->src].mapped) continue;
 
         struct pl_frame image  = r->slot[lp->src].image;
+        if (r->plane_view == HDRPLAY_PLANE_LEGAL ||
+            r->plane_view == HDRPLAY_PLANE_CLIP)
+            select_clip_thresholds(r, lp->src);
         struct pl_frame target = base_target;
         target.crop = to_pl_rect(lp->target_crop);
         if (r->display_hdr_capable)
@@ -1189,6 +1566,15 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             image.crop = to_pl_rect(lp->image_crop);
 
         int n_ov = 0;
+        if (r->plane_view == HDRPLAY_PLANE_COLOR &&
+            r->slot[lp->src].hlg_tex &&
+            r->slot[lp->src].hlg_peak_effective > 0.0f &&
+            r->slot[lp->src].image.color.transfer == PL_COLOR_TRC_HLG)
+        {
+            make_hlg_override_overlay(r, lp->src,
+                                      &ov_store[n_ov], &ov_parts[n_ov]);
+            n_ov++;
+        }
         for (int oi = 0; oi < lp->n_ov && n_ov < LAYOUT_MAX_OVERLAYS; oi++) {
             const LayoutOverlay *ov = &lp->ov[oi];
             switch (ov->kind) {
@@ -1263,6 +1649,8 @@ void renderer_close(Renderer *r)
                     pl_tex_destroy(r->vulkan->gpu, &r->slot[s].plane_tex[i]);
             if (r->slot[s].inter_tex)
                 pl_tex_destroy(r->vulkan->gpu, &r->slot[s].inter_tex);
+            if (r->slot[s].hlg_tex)
+                pl_tex_destroy(r->vulkan->gpu, &r->slot[s].hlg_tex);
         }
         if (r->diff_tex)
             pl_tex_destroy(r->vulkan->gpu, &r->diff_tex);
@@ -1270,6 +1658,7 @@ void renderer_close(Renderer *r)
     }
     if (r->renderer)     pl_renderer_destroy(&r->renderer);
     if (r->renderer_inter) pl_renderer_destroy(&r->renderer_inter);
+    if (r->renderer_hlg) pl_renderer_destroy(&r->renderer_hlg);
     if (r->dispatch_diff) pl_dispatch_destroy(&r->dispatch_diff);
     if (r->swapchain) pl_swapchain_destroy(&r->swapchain);
     if (r->vulkan)    pl_vulkan_destroy(&r->vulkan);

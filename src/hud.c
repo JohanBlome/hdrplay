@@ -245,7 +245,9 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
     const char *plane_str =
         r->plane_view == HDRPLAY_PLANE_Y  ? " PLANE Y" :
         r->plane_view == HDRPLAY_PLANE_CB ? " PLANE CB" :
-        r->plane_view == HDRPLAY_PLANE_CR ? " PLANE CR" : "";
+        r->plane_view == HDRPLAY_PLANE_CR ? " PLANE CR" :
+        r->plane_view == HDRPLAY_PLANE_LEGAL ? " LEGAL RANGE" :
+        r->plane_view == HDRPLAY_PLANE_CLIP ? " CLIP LITERAL" : "";
     snprintf(line, sizeof(line), "MODE %s%s", mode_str, plane_str);
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
 
@@ -260,6 +262,26 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
     else
         draw_text(buf, W, H, 6, y, hud_scale, line);
     y += FONT_H * hud_scale + 8;
+
+    int ambient_source = renderer_focus_source(r);
+    if (r->frame_stats_valid &&
+        r->frame_stats.reference == LUM_HLG_OOTF &&
+        r->ambient_reference_effective[ambient_source] > 0.0f)
+    {
+        if (r->ambient_lux_current > 0.0f) {
+            snprintf(line, sizeof(line),
+                     "AMBIENT %.0fLUX REF %.0fLUX EXP %.2f NONSTD",
+                     r->ambient_lux_current,
+                     r->ambient_reference_effective[ambient_source],
+                     r->ambient_exponent[ambient_source]);
+        } else {
+            snprintf(line, sizeof(line),
+                     "AMBIENT UNAVAILABLE REF %.0fLUX",
+                     r->ambient_reference_effective[ambient_source]);
+        }
+        draw_text_color(buf, W, H, 6, y, hud_scale, line, 255, 200, 80);
+        y += FONT_H * hud_scale + 8;
+    }
 
     if (excessive_headroom) {
         draw_text_color(buf, W, H, 6, y, hud_scale,
@@ -669,15 +691,21 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                     r->diff_view ? "DIFF" :
                     r->plane_view == HDRPLAY_PLANE_Y  ? "Y" :
                     r->plane_view == HDRPLAY_PLANE_CB ? "CB" :
-                    r->plane_view == HDRPLAY_PLANE_CR ? "CR" : "COLOR";
+                    r->plane_view == HDRPLAY_PLANE_CR ? "CR" :
+                    r->plane_view == HDRPLAY_PLANE_LEGAL ? "LEGAL" :
+                    r->plane_view == HDRPLAY_PLANE_CLIP ? "CLIP" : "COLOR";
                 const char *sub =
                     r->diff_view
                         ? (r->plane_view == HDRPLAY_PLANE_Y  ? "ABS Y 4X" :
                            r->plane_view == HDRPLAY_PLANE_CB ? "ABS CB 4X" :
                            r->plane_view == HDRPLAY_PLANE_CR ? "ABS CR 4X" :
+                           r->plane_view == HDRPLAY_PLANE_LEGAL ? "RED NOM MAX BLUE NOM MIN" :
+                           r->plane_view == HDRPLAY_PLANE_CLIP ? "RED HIGH BLUE BLACK" :
                                                               "ABS LINEAR 4X") :
                     r->plane_view == HDRPLAY_PLANE_Y ? "LUMA PLANE" :
                     r->plane_view == HDRPLAY_PLANE_COLOR ? "COMPOSITE" :
+                    r->plane_view == HDRPLAY_PLANE_LEGAL ? "RED LEGAL WHITE BLUE BLACK" :
+                    r->plane_view == HDRPLAY_PLANE_CLIP ? "RED CODE MAX BLUE CODE ZERO" :
                                                            "CHROMA PLANE";
                 if (build_label_badge(SLOT_PLANE_LABEL, gpu, big, sub,
                                       ov->dst) == 0) {
@@ -698,11 +726,12 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                      * the FILE. Which is what you need to know when the
                      * two panes look different. */
                     upper6(big, sizeof(big), sources[is_a ? ia : ib].label);
-                    snprintf(sub, sizeof(sub), "%s %.0fNITS",
-                             r->mode == HDRPLAY_MODE_SDR ? "SDR" : "HDR",
-                             r->mode == HDRPLAY_MODE_SDR
-                               ? r->sdr_peak_effective
-                               : 203.0f * r->display_hdr_headroom);
+                    const Decoder *dec = &sources[is_a ? ia : ib].dec;
+                    if (dec->has_ambient_viewing)
+                        snprintf(sub, sizeof(sub), "AMVE %.0fLUX",
+                                 dec->ambient_illuminance_lux);
+                    else
+                        snprintf(sub, sizeof(sub), "NO AMVE");
                 } else {
                     /* Single file: the panes differ by TREATMENT. */
                     snprintf(big, sizeof(big), "%s", is_a ? "HDR" : "SDR");
