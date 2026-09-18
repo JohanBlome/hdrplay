@@ -33,7 +33,7 @@ typedef struct Renderer {
     pl_swapchain        swapchain;
     pl_renderer         renderer;       /* swapchain passes, always      */
     pl_renderer         renderer_inter; /* intermediates, always         */
-    pl_dispatch         dispatch_diff;  /* absolute A/B difference       */
+    pl_dispatch         dispatch_diff;  /* absolute frame difference     */
     pl_tex              diff_tex;
     int                 diff_w, diff_h;
 
@@ -85,7 +85,7 @@ typedef struct Renderer {
     int    n_sources;
     int    solo;            /* -1 = compare both, else source index    */
     bool   swapped;         /* B on the left                           */
-    bool   diff_view;       /* full-frame absolute A/B difference      */
+    bool   diff_view;       /* A/B, or current/previous with one input */
     float  zoom;            /* <= 0 = fit, 1.0 = 1:1 source pixels     */
     float  pan_x, pan_y;    /* normalized centre of the visible region */
 

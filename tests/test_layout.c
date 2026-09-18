@@ -329,6 +329,22 @@ static void test_pair_diff(void)
           "DIFF is inert while a source is soloed");
 }
 
+static void test_temporal_diff(void)
+{
+    puts("one source, current/previous difference");
+    LayoutInput in = base_input();
+    in.diff_view = true;
+    LayoutPlan pl;
+    layout_plan(&in, &pl);
+
+    CHECK(pl.n_pass == 1 && pl.n_inter == 2,
+          "temporal DIFF uses one base pass and two intermediates");
+    CHECK(pl.inter[0].src == 0 && pl.inter[1].src == 1,
+          "temporal DIFF compares current and previous slots");
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_DIFF) == 1,
+          "temporal DIFF attaches the result once");
+}
+
 static void test_orientation_cycle(void)
 {
     puts("split orientation cycle includes pair wipes only in compare mode");
@@ -843,6 +859,7 @@ int main(void)
     test_pair_diag();
     test_pair_rect_wipes();
     test_pair_diff();
+    test_temporal_diff();
     test_orientation_cycle();
     test_split_key_semantics();
     test_overlay_routing_is_exclusive();

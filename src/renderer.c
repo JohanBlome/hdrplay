@@ -661,7 +661,7 @@ static void make_inter_overlay(
 }
 
 /* ------------------------------------------------------------------ */
-/* GPU A/B difference.                                                */
+/* GPU frame difference (A/B or current/previous).                    */
 /*                                                                    */
 /* The two inputs are already display-referred BT.2020/BT.709 PQ in   */
 /* window-sized intermediates. Decode PQ, subtract in linear display  */
@@ -764,7 +764,7 @@ static bool render_diff_texture(Renderer *r, int w, int h)
     }
     if (!pl_shader_custom(sh, &(struct pl_custom_shader){
             .header = header,
-            .description = "4x absolute linear-light A/B difference",
+            .description = "4x absolute linear-light frame difference",
             .body = body,
             .input = PL_SHADER_SIG_NONE,
             .output = PL_SHADER_SIG_COLOR,
@@ -911,15 +911,33 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         return true; /* not fatal — try next frame */
     }
 
+    /* In one-file diff playback, slot 1 is a virtual source containing
+     * the previous frame. Reusing the A/B slots here keeps color treatment,
+     * plane views, zoom and the actual subtract shader exactly identical
+     * between spatial and temporal comparisons. */
+    bool temporal_diff = r->diff_view && n == 1 && sources[0].previous;
+    bool ab_diff = r->diff_view && n > 1 && r->solo < 0;
+    bool active_diff = temporal_diff || ab_diff;
+    AVFrame *slot_frame[2] = { sources[0].shown, NULL };
+    int slot_rotation[2] = { r->rotation[0], r->rotation[1] };
+    int slot_count = n;
+    if (n > 1) {
+        slot_frame[1] = sources[1].shown;
+    } else if (temporal_diff) {
+        slot_frame[1] = sources[0].previous;
+        slot_rotation[1] = r->rotation[0];
+        slot_count = 2;
+    }
+
     /* Map every source once up front. A pass and an intermediate can
      * both reference the same source, and DIAG maps both sources in one
      * swapchain frame, so per-pass mapping would either double-map or
      * unmap something still queued. */
-    for (int i = 0; i < n; i++) {
-        r->slot[i].mapped = false;
-        if (!sources[i].shown) continue;
+    for (int i = 0; i < 2; i++) r->slot[i].mapped = false;
+    for (int i = 0; i < slot_count; i++) {
+        if (!slot_frame[i]) continue;
         if (!pl_map_avframe_ex(r->vulkan->gpu, &r->slot[i].image,
-                pl_avframe_params(.frame = sources[i].shown,
+                pl_avframe_params(.frame = slot_frame[i],
                                   .tex   = r->slot[i].plane_tex))) {
             LOG("REND", "pl_map_avframe_ex failed for source %d", i);
             continue;
@@ -930,14 +948,14 @@ bool renderer_render(Renderer *r, Source *sources, int n)
          * assignment would rotate the direct path and leave those two
          * upright. */
         r->slot[i].image.rotation =
-            pl_rotation_normalize(r->rotation[i] / 90);
+            pl_rotation_normalize(slot_rotation[i] / 90);
     }
 
     int focus = renderer_focus_source(r);
     if (!r->slot[focus].mapped) {
         /* Nothing to draw from the focused source; still present so the
          * window does not freeze. */
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < slot_count; i++)
             if (r->slot[i].mapped)
                 pl_unmap_avframe(r->vulkan->gpu, &r->slot[i].image);
         pl_swapchain_submit_frame(r->swapchain);
@@ -986,8 +1004,9 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     /* Every compositing decision comes from here — see layout.c. */
     LayoutInput li = {
         .mode = r->mode, .orient = r->split_orient,
-        .n_sources = n, .solo = r->solo, .swapped = r->swapped,
-        .diff_view = r->diff_view,
+        .n_sources = n,
+        .solo = r->solo, .swapped = r->swapped,
+        .diff_view = active_diff,
         .win_w = win_w, .win_h = win_h,
         /* Filled in below: rotation swaps the axes, and layout has to see
          * the frame as displayed. */
@@ -997,10 +1016,10 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         .hud_hidden = r->hud_hidden,
         .session_panel = r->session_panel,
     };
-    for (int i = 0; i < 2; i++) {
-        if (i >= n || !sources[i].shown) continue;
-        layout_rotated_dims(r->rotation[i],
-                            sources[i].shown->width, sources[i].shown->height,
+    for (int i = 0; i < slot_count; i++) {
+        if (!slot_frame[i]) continue;
+        layout_rotated_dims(slot_rotation[i],
+                            slot_frame[i]->width, slot_frame[i]->height,
                             &li.src_w[i], &li.src_h[i]);
     }
 
@@ -1088,7 +1107,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     /* 1. Intermediates first — they are inputs to the passes below. */
     for (int i = 0; i < plan.n_inter; i++) {
         int si = plan.inter[i].src;
-        if (si < 0 || si >= n || !r->slot[si].mapped) continue;
+        if (si < 0 || si >= slot_count || !r->slot[si].mapped) continue;
         /* Same crop the corresponding pass uses, or the intermediate
          * would draw the whole frame into a rect sized for a cropped
          * one — i.e. stretch by exactly the zoom factor. */
@@ -1109,7 +1128,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     }
 
     bool diff_ready = false;
-    if (r->diff_view && n > 1 && r->solo < 0) {
+    if (active_diff) {
         diff_ready = r->slot[0].mapped && r->slot[1].mapped &&
                      render_diff_texture(r, win_w, win_h);
         if (!diff_ready)
@@ -1138,7 +1157,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
 
     for (int pi = 0; pi < plan.n_pass; pi++) {
         const LayoutPass *lp = &plan.pass[pi];
-        if (lp->src < 0 || lp->src >= n || !r->slot[lp->src].mapped) continue;
+        if (lp->src < 0 || lp->src >= slot_count || !r->slot[lp->src].mapped) continue;
 
         struct pl_frame image  = r->slot[lp->src].image;
         struct pl_frame target = base_target;
@@ -1157,7 +1176,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             switch (ov->kind) {
             case LAYOUT_OV_INTERMEDIATE: {
                 int si = ov->src;
-                if (si < 0 || si >= n || !r->slot[si].inter_tex) break;
+                if (si < 0 || si >= slot_count || !r->slot[si].inter_tex) break;
                 bool sdr = false;
                 for (int k = 0; k < plan.n_inter; k++)
                     if (plan.inter[k].src == si) sdr = plan.inter[k].sdr;
@@ -1198,7 +1217,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             LOG("REND", "pl_render_image (%s pass %d) failed", plan.name, pi);
     }
 
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < slot_count; i++)
         if (r->slot[i].mapped)
             pl_unmap_avframe(r->vulkan->gpu, &r->slot[i].image);
 

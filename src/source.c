@@ -114,6 +114,7 @@ bool source_open(Source *s, const char *path, int ring_cap)
 void source_close(Source *s)
 {
     av_frame_free(&s->shown);
+    av_frame_free(&s->previous);
     av_frame_free(&s->pending);
     ring_free(&s->ring);
     decoder_close(&s->dec);
@@ -127,10 +128,39 @@ double source_shown_sec(const Source *s)
 void source_flush(Source *s)
 {
     av_frame_free(&s->shown);
+    av_frame_free(&s->previous);
     av_frame_free(&s->pending);
     ring_clear(&s->ring);
     s->eof = false;
     s->frame_stats_valid = false;
+}
+
+/* Select a retained frame and, when temporal differencing is enabled,
+ * select its immediate predecessor as well. Keeping this in one helper is
+ * important for backward stepping: `shown`'s previous value is then the
+ * frame we just stepped FROM, not the frame that precedes it. */
+static void show_ring_current(Source *s)
+{
+    int idx = s->ring.len - 1 - s->ring.back;
+    AVFrame *cur = ring_current(&s->ring);
+    AVFrame *prev = idx > 0 ? s->ring.buf[idx - 1] : NULL;
+
+    av_frame_free(&s->shown);
+    av_frame_free(&s->previous);
+    s->shown = cur ? av_frame_clone(cur) : NULL;
+    if (s->keep_previous && prev)
+        s->previous = av_frame_clone(prev);
+}
+
+void source_keep_previous(Source *s, bool enable)
+{
+    s->keep_previous = enable;
+    av_frame_free(&s->previous);
+    if (!enable) return;
+
+    int idx = s->ring.len - 1 - s->ring.back;
+    if (idx > 0)
+        s->previous = av_frame_clone(s->ring.buf[idx - 1]);
 }
 
 /* Pull one frame into `pending` if there isn't one already. */
@@ -177,14 +207,16 @@ static void promote(Source *s)
 
     s->frame_no++;
 
-    if (s->ring.cap > 0) {
+    if (s->ring.cap > 0)
         ring_push(&s->ring, av_frame_clone(f));
-        av_frame_free(&s->shown);
-        s->shown = f;
+
+    if (s->keep_previous) {
+        av_frame_free(&s->previous);
+        s->previous = s->shown;
     } else {
         av_frame_free(&s->shown);
-        s->shown = f;
     }
+    s->shown = f;
 }
 
 bool source_advance_to(Source *s, double t)
@@ -203,9 +235,7 @@ bool source_advance_to(Source *s, double t)
         }
         if (best >= 0) {
             s->ring.back = s->ring.len - 1 - best;
-            AVFrame *cur = ring_current(&s->ring);
-            av_frame_free(&s->shown);
-            s->shown = av_frame_clone(cur);
+            show_ring_current(s);
             s->eof = false;
             changed = true;
         } else {
@@ -224,11 +254,7 @@ bool source_advance_to(Source *s, double t)
         double next = pts_to_sec(s, s->ring.buf[idx]);
         if (!isnan(next) && next > t + 1e-9) break;
         ring_step_fwd(&s->ring);
-        AVFrame *cur = ring_current(&s->ring);
-        if (cur) {
-            av_frame_free(&s->shown);
-            s->shown = av_frame_clone(cur);
-        }
+        show_ring_current(s);
         changed = true;
     }
 
@@ -266,10 +292,8 @@ double source_step_forward(Source *s)
 {
     /* Walk back toward live before decoding anything new. */
     if (ring_step_fwd(&s->ring)) {
-        AVFrame *cur = ring_current(&s->ring);
-        if (cur) {
-            av_frame_free(&s->shown);
-            s->shown = av_frame_clone(cur);
+        if (ring_current(&s->ring)) {
+            show_ring_current(s);
             return pts_to_sec(s, s->shown);
         }
     }
@@ -282,10 +306,8 @@ double source_step_back(Source *s)
 {
     if (ring_step_back(&s->ring)) {
         s->eof = false;
-        AVFrame *cur = ring_current(&s->ring);
-        if (cur) {
-            av_frame_free(&s->shown);
-            s->shown = av_frame_clone(cur);
+        if (ring_current(&s->ring)) {
+            show_ring_current(s);
             return pts_to_sec(s, s->shown);
         }
     }

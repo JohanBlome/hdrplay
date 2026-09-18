@@ -468,7 +468,8 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
     }
 }
 
-/* Full-frame A/B difference. Both sources are first rendered through the
+/* Full-frame difference. The slots contain either A/B or, for one-file
+ * playback, the current/previous frame. Both are first rendered through the
  * same HDR or SDR display pipeline into aligned, window-sized intermediates;
  * the renderer then subtracts those textures in linear display light. */
 static void plan_diff(const LayoutInput *in, LayoutPlan *out)
@@ -521,17 +522,17 @@ void layout_plan(const LayoutInput *in, LayoutPlan *out)
 {
     memset(out, 0, sizeof(*out));
 
-    /* Solo, or only one file open, is the single-source path verbatim —
-     * including the HDR-vs-SDR split, which is the whole reason solo
-     * exists. */
+    /* In temporal-diff mode the renderer supplies the previous frame as
+     * virtual slot 1, so the same tested plan can serve both kinds of diff. */
+    if (in->diff_view && in->solo < 0) {
+        plan_diff(in, out);
+        return;
+    }
+    /* Solo, or only one file open, is otherwise the single-source path. */
     if (in->n_sources < 2 || in->solo >= 0) {
         int src = (in->n_sources < 2) ? 0
                 : (in->solo >= 0 ? in->solo : 0);
         plan_single(in, out, src);
-        return;
-    }
-    if (in->diff_view) {
-        plan_diff(in, out);
         return;
     }
     plan_pair(in, out);

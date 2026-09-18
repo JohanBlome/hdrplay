@@ -130,6 +130,35 @@ static void test_ring_disabled(void)
     ring_free(&r);
 }
 
+static void test_temporal_previous(void)
+{
+    puts("source: temporal difference follows the displayed predecessor");
+    Source s = {0};
+    s.tb_sec = 1.0;
+    ring_init(&s.ring, 8);
+    for (int i = 0; i < 4; i++) ring_push(&s.ring, mkf(i));
+    s.shown = av_frame_clone(ring_current(&s.ring));
+
+    source_keep_previous(&s, true);
+    CHECK(s.previous && s.previous->pts == 2,
+          "enabling diff seeds previous from retained history");
+
+    CHECK(!isnan(source_step_back(&s)), "step back succeeds");
+    CHECK(s.shown && s.shown->pts == 2, "shown frame moves to pts 2");
+    CHECK(s.previous && s.previous->pts == 1,
+          "previous moves to the predecessor, not the frame stepped from");
+
+    CHECK(!isnan(source_step_forward(&s)), "step forward succeeds");
+    CHECK(s.shown && s.shown->pts == 3, "shown frame returns to pts 3");
+    CHECK(s.previous && s.previous->pts == 2,
+          "previous follows forward ring navigation");
+
+    source_keep_previous(&s, false);
+    CHECK(s.previous == NULL, "disabling diff releases the retained predecessor");
+    av_frame_free(&s.shown);
+    ring_free(&s.ring);
+}
+
 static void test_source_clock_alignment_in_history(void)
 {
     puts("source: backward clock alignment keeps hidden panes synchronized");
@@ -206,6 +235,7 @@ int main(void)
     test_ring_step_roundtrip();
     test_ring_push_while_parked();
     test_ring_disabled();
+    test_temporal_previous();
     test_source_clock_alignment_in_history();
     test_sync_rule();
 

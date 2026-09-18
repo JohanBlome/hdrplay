@@ -52,7 +52,9 @@ typedef struct Source {
     double   duration_sec;     /* <= 0 when unknown                    */
 
     struct AVFrame *shown;     /* frame currently on screen (owned)    */
+    struct AVFrame *previous;  /* predecessor for temporal diff (owned)*/
     struct AVFrame *pending;   /* decoded but not yet due (owned)      */
+    bool     keep_previous;    /* retain predecessor for diff playback */
     bool     eof;
     int      frame_no;         /* index of `shown`, for the HUD        */
 
@@ -94,5 +96,10 @@ double source_step_back(Source *s);
 
 /* Drop decoded and displayed state after a seek. */
 void source_flush(Source *s);
+
+/* Enable/disable retention of the frame immediately preceding `shown`.
+ * Enabling seeds it from the step-back ring when possible; otherwise the
+ * current frame acts as the first (non-diffed) frame until playback advances. */
+void source_keep_previous(Source *s, bool enable);
 
 #endif
