@@ -348,6 +348,11 @@ bool renderer_init(Renderer *r, int width, int height, const char *title, int di
     if (!r->renderer_inter) { LOG("GPU", "ERROR: pl_renderer_create (inter)"); return false; }
     r->renderer_hlg = pl_renderer_create(r->pl_log, r->vulkan->gpu);
     if (!r->renderer_hlg) { LOG("GPU", "ERROR: pl_renderer_create (HLG)"); return false; }
+    r->renderer_hlg_out = pl_renderer_create(r->pl_log, r->vulkan->gpu);
+    if (!r->renderer_hlg_out) {
+        LOG("GPU", "ERROR: pl_renderer_create (HLG output)");
+        return false;
+    }
     r->dispatch_diff = pl_dispatch_create(r->pl_log, r->vulkan->gpu);
     if (!r->dispatch_diff) { LOG("GPU", "ERROR: pl_dispatch_create (diff)"); return false; }
 
@@ -460,12 +465,13 @@ static struct pl_hook_res ambient_contrast_hook(
  * pl_color_space_infer_map() intentionally tunes an HLG source to an HDR
  * destination by replacing source max_luma with destination max_luma. That
  * is the right automatic policy, but it also means changing only the source
- * metadata has no visible effect. This first pass makes the requested L_W
- * the destination of the HLG conversion. The second, normal render sees PQ
- * rather than HLG, so it can tone-map those absolute values to either the
- * real HDR target or the selected SDR target without rewriting L_W. */
+ * metadata has no visible effect. The first pass makes the requested L_W the
+ * destination of the HLG conversion. A second texture pass fits that absolute
+ * PQ result to the current output peak before overlay composition. */
+static float compute_sdr_peak(const Renderer *r);
+
 static bool prepare_hlg_policy(Renderer *r, int si, float peak,
-                               float ambient_exponent)
+                               float output_peak, float ambient_exponent)
 {
     typeof(r->slot[0]) *sl = &r->slot[si];
     struct pl_frame *src = &sl->image;
@@ -481,8 +487,11 @@ static bool prepare_hlg_policy(Renderer *r, int si, float peak,
     int h = (int)fabsf(src->crop.y1 - src->crop.y0);
     if (w <= 0 || h <= 0) return false;
 
-    if (!sl->hlg_tex || sl->hlg_w != w || sl->hlg_h != h) {
+    if (!sl->hlg_tex || !sl->hlg_out_tex ||
+        sl->hlg_w != w || sl->hlg_h != h) {
         if (sl->hlg_tex) pl_tex_destroy(r->vulkan->gpu, &sl->hlg_tex);
+        if (sl->hlg_out_tex)
+            pl_tex_destroy(r->vulkan->gpu, &sl->hlg_out_tex);
         pl_fmt fmt = pl_find_named_fmt(r->vulkan->gpu, "rgba16hf");
         if (!fmt) {
             LOG("REND", "no RGBA16F format for HLG peak conversion");
@@ -496,7 +505,15 @@ static bool prepare_hlg_policy(Renderer *r, int si, float peak,
             .renderable = true,
             .blit_dst   = true,
         ));
-        if (!sl->hlg_tex) {
+        sl->hlg_out_tex = pl_tex_create(r->vulkan->gpu, pl_tex_params(
+            .w          = w,
+            .h          = h,
+            .format     = fmt,
+            .sampleable = true,
+            .renderable = true,
+            .blit_dst   = true,
+        ));
+        if (!sl->hlg_tex || !sl->hlg_out_tex) {
             LOG("REND", "HLG peak texture allocation failed");
             return false;
         }
@@ -540,11 +557,36 @@ static bool prepare_hlg_policy(Renderer *r, int si, float peak,
         return false;
     }
 
-    sl->render_image = target;
+    /* Freeze L_W first, then fit that absolute-PQ result to the physical
+     * output. The old direct overlay skipped this second operation, so PQ
+     * values above the current EDR ceiling were left for the panel to clip. */
+    struct pl_frame output = {
+        .num_planes = 1,
+        .planes = {{
+            .texture           = sl->hlg_out_tex,
+            .components        = 4,
+            .component_mapping = { 0, 1, 2, 3 },
+        }},
+        .crop = { 0, 0, w, h },
+        .repr = pl_color_repr_rgb,
+        .color = pl_color_space_hdr10,
+    };
+    output.repr.alpha = PL_ALPHA_NONE;
+    output.color.primaries = src->color.primaries;
+    output.color.hdr.max_luma = output_peak;
+    output.color.hdr.min_luma = PL_COLOR_HDR_BLACK;
+
+    struct pl_render_params output_rp = pl_render_default_params;
+    if (!pl_render_image(r->renderer_hlg_out, &target, &output, &output_rp)) {
+        LOG("REND", "HLG display fit failed for source %d", si);
+        return false;
+    }
+    sl->render_image = output;
     sl->hlg_peak_effective = peak;
+    sl->hlg_output_peak = output_peak;
     if (!r->hlg_peak_logged[si]) {
-        LOG("REND", "source %d HLG playback converted at %.0f nits",
-            si, peak);
+        LOG("REND", "source %d HLG playback converted at %.0f nits, fitted to %.0f nits",
+            si, peak, output_peak);
         r->hlg_peak_logged[si] = true;
     }
     return true;
@@ -857,12 +899,12 @@ static void make_inter_overlay(
     }
 }
 
-/* Present the forced-L_W conversion as absolute PQ. Sending this texture
- * through the swapchain's ordinary image path lets that path normalize it
- * back to the swapchain peak, erasing the requested 500-vs-1000 nit
- * distinction. Overlay composition preserves the encoded absolute light,
- * just as it does for the SDR comparison intermediate. SRC_FRAME coordinates
- * make it follow the base image's crop, scale and rotation. */
+/* Present the display-fitted HLG conversion as absolute PQ. Sending this
+ * texture through the swapchain's ordinary image path would normalize it
+ * again and erase the requested 500-vs-1000 nit distinction. Overlay
+ * composition preserves the absolute light already established by the two
+ * texture passes. SRC_FRAME coordinates make it follow the base image's crop,
+ * scale and rotation. */
 static void make_hlg_override_overlay(
     const Renderer *r,
     int si,
@@ -875,7 +917,7 @@ static void make_hlg_override_overlay(
         .dst = { 0, 0, (float)sl->hlg_w, (float)sl->hlg_h },
     };
     *out_overlay = (struct pl_overlay){
-        .tex    = sl->hlg_tex,
+        .tex    = sl->hlg_out_tex,
         .mode   = PL_OVERLAY_NORMAL,
         .coords = PL_OVERLAY_COORDS_SRC_FRAME,
         .parts  = out_part,
@@ -885,7 +927,7 @@ static void make_hlg_override_overlay(
     };
     out_overlay->repr.alpha = PL_ALPHA_NONE;
     out_overlay->color.primaries = sl->image.color.primaries;
-    out_overlay->color.hdr.max_luma = sl->hlg_peak_effective;
+    out_overlay->color.hdr.max_luma = sl->hlg_output_peak;
     out_overlay->color.hdr.min_luma = PL_COLOR_HDR_BLACK;
 }
 
@@ -1134,6 +1176,55 @@ static struct pl_hook_res clipping_hook(void *priv,
     };
 }
 
+static struct pl_hook_res plateau_hook(void *priv,
+                                       const struct pl_hook_params *params)
+{
+    Renderer *r = priv;
+    int width = (int)roundf(fabsf(params->rect.x1 - params->rect.x0));
+    int height = (int)roundf(fabsf(params->rect.y1 - params->rect.y0));
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_float("plateau_low"),
+          .data = &r->plateau_low_active, .dynamic = true },
+        { .var = pl_var_float("plateau_high"),
+          .data = &r->plateau_high_active, .dynamic = true },
+        { .var = pl_var_float("plateau_delta"),
+          .data = &r->plateau_delta_active, .dynamic = true },
+    };
+    /* Derivatives compare the four neighboring fragments in a 2x2 quad.
+     * Requiring the near-endpoint value and a small local slope avoids
+     * flagging isolated hot pixels while still tolerating codec noise around
+     * a plateau which was clipped before a later rescale or encode. */
+    static const char *body =
+        "float y = color.r;\n"
+        "float local_delta = max(abs(dFdx(y)), abs(dFdy(y)));\n"
+        "float gray = clamp(y, 0.0, 1.0);\n"
+        "color.rgb = vec3(gray);\n"
+        "if (y >= plateau_high && local_delta <= plateau_delta) color.rgb = vec3(1.0, 0.0, 0.0);\n"
+        "else if (y <= plateau_low && local_delta <= plateau_delta) color.rgb = vec3(0.0, 0.0, 1.0);\n";
+    bool ok = pl_shader_custom(params->sh, &(struct pl_custom_shader){
+        .description = "near-endpoint luma plateau view",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+        .variables = vars,
+        .num_variables = 3,
+        .output_w = width,
+        .output_h = height,
+    });
+
+    struct pl_color_repr repr = pl_color_repr_rgb;
+    repr.alpha = PL_ALPHA_NONE;
+    return (struct pl_hook_res){
+        .failed = !ok,
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = params->sh,
+        .repr = repr,
+        .color = params->color,
+        .components = 3,
+        .rect = params->rect,
+    };
+}
+
 /* At NATIVE, libplacebo has already aligned and combined the decoded Y, Cb
  * and Cr textures but has not converted them to RGB. Replicating the selected
  * native component here gives true grayscale without copying a plane or
@@ -1168,6 +1259,13 @@ static void select_clip_thresholds(Renderer *r, int si)
     r->clip_low_active = legal ? r->legal_low[si] : r->clip_low[si];
     r->clip_high_active = legal ? r->legal_high[si] : r->clip_high[si];
     r->clip_epsilon_active = r->clip_epsilon[si];
+}
+
+static void select_plateau_thresholds(Renderer *r, int si)
+{
+    r->plateau_low_active = r->plateau_low[si];
+    r->plateau_high_active = r->plateau_high[si];
+    r->plateau_delta_active = r->plateau_delta[si];
 }
 
 /* Which source the HUD, probe and statistics should describe. In a
@@ -1255,6 +1353,16 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         r->legal_high[i] = full_range ? r->clip_high[i]
                                       : (float)(235 * code_scale * code_step);
         r->clip_epsilon[i] = (float)(0.25 * code_step);
+        /* Search the outer 10% of the usable interval. For limited-range
+         * input that means the legal interval; for full-range input it means
+         * the complete code interval. Eight code values tolerate the small
+         * ripples introduced when an already-clipped image is compressed. */
+        float usable_low = full_range ? r->clip_low[i] : r->legal_low[i];
+        float usable_high = full_range ? r->clip_high[i] : r->legal_high[i];
+        float usable_span = usable_high - usable_low;
+        r->plateau_low[i] = usable_low + 0.10f * usable_span;
+        r->plateau_high[i] = usable_low + 0.90f * usable_span;
+        r->plateau_delta[i] = (float)(8.0 * code_step);
 
         int source_index = temporal_diff && i == 1 ? 0 : i;
         const Decoder *dec = &sources[source_index].dec;
@@ -1313,7 +1421,11 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             r->slot[i].image.color.transfer == PL_COLOR_TRC_HLG)
             r->slot[i].image.color.hdr.max_luma = r->hlg_peak_override;
 
-        if (!prepare_hlg_policy(r, i, hlg_peak, ambient_exponent))
+        float output_peak = r->display_hdr_capable
+                          ? 203.0f * r->display_hdr_headroom
+                          : compute_sdr_peak(r);
+        if (!prepare_hlg_policy(r, i, hlg_peak, output_peak,
+                                ambient_exponent))
             LOG("REND", "using automatic HLG mapping for source %d", i);
 
         /* Set on the image actually consumed downstream. HLG conversion is
@@ -1363,12 +1475,22 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         .hook = clipping_hook,
         .signature = UINT64_C(0x687064636c697000),
     };
+    struct pl_hook plateau_hook_desc = {
+        .stages = PL_HOOK_NATIVE,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = r,
+        .hook = plateau_hook,
+        .signature = UINT64_C(0x687064706c617400),
+    };
     const struct pl_hook *plane_hook_ptr = NULL;
     if (r->plane_view != HDRPLAY_PLANE_COLOR) {
-        plane_hook_ptr = (r->plane_view == HDRPLAY_PLANE_LEGAL ||
-                          r->plane_view == HDRPLAY_PLANE_CLIP)
-                       ? &clip_hook
-                       : &plane_hooks[r->plane_view - HDRPLAY_PLANE_Y];
+        if (r->plane_view == HDRPLAY_PLANE_PLATEAU)
+            plane_hook_ptr = &plateau_hook_desc;
+        else if (r->plane_view == HDRPLAY_PLANE_LEGAL ||
+                 r->plane_view == HDRPLAY_PLANE_CLIP)
+            plane_hook_ptr = &clip_hook;
+        else
+            plane_hook_ptr = &plane_hooks[r->plane_view - HDRPLAY_PLANE_Y];
         rp.hooks = &plane_hook_ptr;
         rp.num_hooks = 1;
         /* Preserve individual 4:2:0/4:2:2 chroma samples when zooming rather
@@ -1501,6 +1623,8 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         if (r->plane_view == HDRPLAY_PLANE_LEGAL ||
             r->plane_view == HDRPLAY_PLANE_CLIP)
             select_clip_thresholds(r, si);
+        else if (r->plane_view == HDRPLAY_PLANE_PLATEAU)
+            select_plateau_thresholds(r, si);
         if (!rect_is_zero(plan.inter[i].image_crop))
             img.crop = to_pl_rect(plan.inter[i].image_crop);
         if (!render_to_intermediate(r, si, &img, win_w, win_h,
@@ -1552,6 +1676,8 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         if (r->plane_view == HDRPLAY_PLANE_LEGAL ||
             r->plane_view == HDRPLAY_PLANE_CLIP)
             select_clip_thresholds(r, lp->src);
+        else if (r->plane_view == HDRPLAY_PLANE_PLATEAU)
+            select_plateau_thresholds(r, lp->src);
         struct pl_frame target = base_target;
         target.crop = to_pl_rect(lp->target_crop);
         if (r->display_hdr_capable)
@@ -1568,6 +1694,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         int n_ov = 0;
         if (r->plane_view == HDRPLAY_PLANE_COLOR &&
             r->slot[lp->src].hlg_tex &&
+            r->slot[lp->src].hlg_out_tex &&
             r->slot[lp->src].hlg_peak_effective > 0.0f &&
             r->slot[lp->src].image.color.transfer == PL_COLOR_TRC_HLG)
         {
@@ -1651,6 +1778,8 @@ void renderer_close(Renderer *r)
                 pl_tex_destroy(r->vulkan->gpu, &r->slot[s].inter_tex);
             if (r->slot[s].hlg_tex)
                 pl_tex_destroy(r->vulkan->gpu, &r->slot[s].hlg_tex);
+            if (r->slot[s].hlg_out_tex)
+                pl_tex_destroy(r->vulkan->gpu, &r->slot[s].hlg_out_tex);
         }
         if (r->diff_tex)
             pl_tex_destroy(r->vulkan->gpu, &r->diff_tex);
@@ -1659,6 +1788,7 @@ void renderer_close(Renderer *r)
     if (r->renderer)     pl_renderer_destroy(&r->renderer);
     if (r->renderer_inter) pl_renderer_destroy(&r->renderer_inter);
     if (r->renderer_hlg) pl_renderer_destroy(&r->renderer_hlg);
+    if (r->renderer_hlg_out) pl_renderer_destroy(&r->renderer_hlg_out);
     if (r->dispatch_diff) pl_dispatch_destroy(&r->dispatch_diff);
     if (r->swapchain) pl_swapchain_destroy(&r->swapchain);
     if (r->vulkan)    pl_vulkan_destroy(&r->vulkan);

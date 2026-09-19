@@ -241,9 +241,10 @@ static void usage(void)
         "  -d INDEX              place the window on display INDEX\n"
         "                        (0-based; see --list-displays)\n"
         "  --start-sdr           start in SDR-fallback rendering mode\n"
-        "  --plane MODE          color/y/cb/cr/legal/clip. LEGAL marks the\n"
+        "  --plane MODE          color/y/cb/cr/legal/clip/plateau. LEGAL marks\n"
         "                        nominal video-range limits; CLIP marks only\n"
-        "                        literal storage endpoints (e.g. 0/1023).\n"
+        "                        literal storage endpoints; PLATEAU marks\n"
+        "                        locally flat areas near either endpoint.\n"
         "  --split               start in split-screen (HDR left, SDR right)\n"
         "  --split-tb            split top/bottom instead of left/right\n"
         "  --split-diag          diagonal split: HDR upper-left, SDR lower-right\n"
@@ -514,6 +515,8 @@ int main(int argc, char **argv)
                 start_plane = HDRPLAY_PLANE_LEGAL;
             else if (!strcmp(p, "clip") || !strcmp(p, "clipping"))
                 start_plane = HDRPLAY_PLANE_CLIP;
+            else if (!strcmp(p, "plateau") || !strcmp(p, "flat"))
+                start_plane = HDRPLAY_PLANE_PLATEAU;
             else {
                 fprintf(stderr, "unknown --plane mode: %s\n", p);
                 usage();
@@ -771,6 +774,7 @@ int main(int argc, char **argv)
                         rend.plane_view == HDRPLAY_PLANE_CR ? "Cr (grayscale)" :
                         rend.plane_view == HDRPLAY_PLANE_LEGAL ? "legal range (red=white blue=black)" :
                         rend.plane_view == HDRPLAY_PLANE_CLIP ? "literal clipping (red=max blue=zero)" :
+                        rend.plane_view == HDRPLAY_PLANE_PLATEAU ? "possible clipping plateaus (red=high blue=low)" :
                                                              "color");
                 }
                 if (e.key.key == SDLK_D) {

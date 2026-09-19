@@ -73,12 +73,16 @@ Per-layer responsibilities:
 HLG is scene-referred, so it needs a nominal display peak `L_W` before it
 has an absolute display-light meaning. With `--hlg-peak NITS`, hdrplay first
 renders HLG into a source-sized, absolute-PQ intermediate whose peak is the
-selected `L_W`. All HDR, SDR, split and comparison paths consume that PQ
-result. This two-stage conversion is necessary because libplacebo's normal
-one-pass policy deliberately replaces an HLG source peak with the HDR
-destination peak. The luminance probe uses the same override, keeping the
-displayed image and reported nits on one interpretation. PQ, Dolby Vision and
-SDR sources are unaffected.
+selected `L_W`. It then renders that PQ result into a second intermediate at
+the currently available output peak. This second pass provides highlight
+roll-off when `L_W` exceeds the display headroom; compositing the first
+intermediate directly would send unadapted absolute PQ values to the display
+and clip them there. All HDR, SDR, split and comparison paths consume the
+display-fitted result. Separating these operations is necessary because
+libplacebo's normal one-pass policy deliberately replaces an HLG source peak
+with the HDR destination peak. The luminance probe uses the same `L_W`
+override, keeping measurement tied to the reference interpretation. PQ,
+Dolby Vision and SDR sources are unaffected.
 
 ### hdrplay's ambient contrast policy (deliberately non-standard)
 

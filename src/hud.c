@@ -247,7 +247,8 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         r->plane_view == HDRPLAY_PLANE_CB ? " PLANE CB" :
         r->plane_view == HDRPLAY_PLANE_CR ? " PLANE CR" :
         r->plane_view == HDRPLAY_PLANE_LEGAL ? " LEGAL RANGE" :
-        r->plane_view == HDRPLAY_PLANE_CLIP ? " CLIP LITERAL" : "";
+        r->plane_view == HDRPLAY_PLANE_CLIP ? " CLIP LITERAL" :
+        r->plane_view == HDRPLAY_PLANE_PLATEAU ? " CLIP PLATEAU" : "";
     snprintf(line, sizeof(line), "MODE %s%s", mode_str, plane_str);
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
 
@@ -693,7 +694,8 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                     r->plane_view == HDRPLAY_PLANE_CB ? "CB" :
                     r->plane_view == HDRPLAY_PLANE_CR ? "CR" :
                     r->plane_view == HDRPLAY_PLANE_LEGAL ? "LEGAL" :
-                    r->plane_view == HDRPLAY_PLANE_CLIP ? "CLIP" : "COLOR";
+                    r->plane_view == HDRPLAY_PLANE_CLIP ? "CLIP" :
+                    r->plane_view == HDRPLAY_PLANE_PLATEAU ? "PLATEAU" : "COLOR";
                 const char *sub =
                     r->diff_view
                         ? (r->plane_view == HDRPLAY_PLANE_Y  ? "ABS Y 4X" :
@@ -701,11 +703,13 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                            r->plane_view == HDRPLAY_PLANE_CR ? "ABS CR 4X" :
                            r->plane_view == HDRPLAY_PLANE_LEGAL ? "RED NOM MAX BLUE NOM MIN" :
                            r->plane_view == HDRPLAY_PLANE_CLIP ? "RED HIGH BLUE BLACK" :
+                           r->plane_view == HDRPLAY_PLANE_PLATEAU ? "RED/BLUE FLAT END REGIONS" :
                                                               "ABS LINEAR 4X") :
                     r->plane_view == HDRPLAY_PLANE_Y ? "LUMA PLANE" :
                     r->plane_view == HDRPLAY_PLANE_COLOR ? "COMPOSITE" :
                     r->plane_view == HDRPLAY_PLANE_LEGAL ? "RED LEGAL WHITE BLUE BLACK" :
                     r->plane_view == HDRPLAY_PLANE_CLIP ? "RED CODE MAX BLUE CODE ZERO" :
+                    r->plane_view == HDRPLAY_PLANE_PLATEAU ? "POSSIBLE CLIP: HIGH/LOW + FLAT" :
                                                            "CHROMA PLANE";
                 if (build_label_badge(SLOT_PLANE_LABEL, gpu, big, sub,
                                       ov->dst) == 0) {

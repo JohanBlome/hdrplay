@@ -2,6 +2,7 @@
 #include "log.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <libavutil/frame.h>
@@ -89,6 +90,20 @@ static double pts_to_sec(const Source *s, const AVFrame *f)
     return (double)f->best_effort_timestamp * s->tb_sec;
 }
 
+/* The HUD counter describes the frame currently displayed, not how many
+ * frames this decoder instance has processed. A decode counter cannot move
+ * backward and becomes meaningless after a seek. Deriving it from PTS makes
+ * ring navigation, seeks and separate runs of the same file agree. */
+static int displayed_frame_no(const Source *s, const AVFrame *f, int fallback)
+{
+    double t = pts_to_sec(s, f);
+    if (isnan(t) || !(s->fps > 0.0)) return fallback;
+    double n = (t - s->start_sec) * s->fps;
+    if (n < 0.0) n = 0.0;
+    if (n > INT_MAX) return INT_MAX;
+    return (int)llround(n);
+}
+
 bool source_open(Source *s, const char *path, int ring_cap)
 {
     memset(s, 0, sizeof(*s));
@@ -99,6 +114,10 @@ bool source_open(Source *s, const char *path, int ring_cap)
 
     AVStream *st = s->dec.fmt->streams[s->dec.stream_idx];
     s->tb_sec = av_q2d(st->time_base);
+    AVRational rate = av_guess_frame_rate(s->dec.fmt, st, NULL);
+    s->fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
+    s->start_sec = st->start_time != AV_NOPTS_VALUE
+                 ? (double)st->start_time * s->tb_sec : 0.0;
     if (st->duration > 0 && st->duration != AV_NOPTS_VALUE)
         s->duration_sec = (double)st->duration * s->tb_sec;
     else if (s->dec.fmt->duration > 0 && s->dec.fmt->duration != AV_NOPTS_VALUE)
@@ -148,6 +167,8 @@ static void show_ring_current(Source *s)
     av_frame_free(&s->shown);
     av_frame_free(&s->previous);
     s->shown = cur ? av_frame_clone(cur) : NULL;
+    if (s->shown)
+        s->frame_no = displayed_frame_no(s, s->shown, s->frame_no);
     if (s->keep_previous && prev)
         s->previous = av_frame_clone(prev);
 }
@@ -205,7 +226,7 @@ static void promote(Source *s)
     else
         session_stats_note_unsupported(&s->session);
 
-    s->frame_no++;
+    s->frame_no = displayed_frame_no(s, f, s->frame_no + 1);
 
     if (s->ring.cap > 0)
         ring_push(&s->ring, av_frame_clone(f));

@@ -138,9 +138,11 @@ static void test_temporal_previous(void)
     puts("source: temporal difference follows the displayed predecessor");
     Source s = {0};
     s.tb_sec = 1.0;
+    s.fps = 1.0;
     ring_init(&s.ring, 8);
     for (int i = 0; i < 4; i++) ring_push(&s.ring, mkf(i));
     s.shown = av_frame_clone(ring_current(&s.ring));
+    s.frame_no = 3;
 
     source_keep_previous(&s, true);
     CHECK(s.previous && s.previous->pts == 2,
@@ -148,11 +150,13 @@ static void test_temporal_previous(void)
 
     CHECK(!isnan(source_step_back(&s)), "step back succeeds");
     CHECK(s.shown && s.shown->pts == 2, "shown frame moves to pts 2");
+    CHECK(s.frame_no == 2, "counter moves backward to frame 2");
     CHECK(s.previous && s.previous->pts == 1,
           "previous moves to the predecessor, not the frame stepped from");
 
     CHECK(!isnan(source_step_forward(&s)), "step forward succeeds");
     CHECK(s.shown && s.shown->pts == 3, "shown frame returns to pts 3");
+    CHECK(s.frame_no == 3, "counter moves forward to frame 3");
     CHECK(s.previous && s.previous->pts == 2,
           "previous follows forward ring navigation");
 
@@ -167,19 +171,23 @@ static void test_source_clock_alignment_in_history(void)
     puts("source: backward clock alignment keeps hidden panes synchronized");
     Source s = {0};
     s.tb_sec = 1.0;
+    s.fps = 1.0;
     ring_init(&s.ring, 8);
     for (int i = 0; i < 5; i++) ring_push(&s.ring, mkf(i));
     s.shown = av_frame_clone(ring_current(&s.ring));
+    s.frame_no = 4;
     s.eof = true; /* Rewinding from EOF must make retained frames playable. */
 
     CHECK(source_advance_to(&s, 1.5), "backward clock move changes the shown frame");
     CHECK(s.shown && s.shown->pts == 1, "t=1.5 selects retained pts 1");
+    CHECK(s.frame_no == 1, "backward clock alignment updates frame counter");
     CHECK(!s.eof, "moving into retained history clears presentation EOF");
     CHECK(NEAR(source_peek_next_sec(&s), 2.0, 1e-9),
           "next timestamp comes from retained history, not decoder pending");
 
     CHECK(source_advance_to(&s, 3.2), "forward clock walks retained frames");
     CHECK(s.shown && s.shown->pts == 3, "t=3.2 selects retained pts 3");
+    CHECK(s.frame_no == 3, "forward history walk updates frame counter");
     CHECK(NEAR(source_peek_next_sec(&s), 4.0, 1e-9),
           "pacing continues with the next retained frame");
 

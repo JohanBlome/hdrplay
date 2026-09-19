@@ -49,6 +49,8 @@ typedef struct Source {
     Decoder  dec;
     char     label[64];        /* basename, for the pane badge         */
     double   tb_sec;           /* stream timebase in seconds           */
+    double   fps;              /* nominal rate for PTS -> frame number */
+    double   start_sec;        /* stream timeline origin               */
     double   duration_sec;     /* <= 0 when unknown                    */
 
     struct AVFrame *shown;     /* frame currently on screen (owned)    */

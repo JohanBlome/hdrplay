@@ -159,7 +159,7 @@ hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
 # F toggles fullscreen, Q/Esc quits.
 # I toggles the status HUD, A the accumulated-statistics panel.
 # . and , step one frame forward / back.
-# C cycles color, Y, Cb, Cr, legal-range and literal-clipping views.
+# C cycles color, Y, Cb, Cr, legal-range, literal-clipping and plateau views.
 # D toggles a full-frame current/previous difference with one file,
 # or an A/B difference when two files are open.
 # T rotates the focused pane 90° clockwise.
@@ -167,7 +167,8 @@ hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
 
 ### Plane inspection
 
-Press `C` to cycle through normal color, Y, Cb, Cr, `LEGAL` and `CLIP`. Each selected
+Press `C` to cycle through normal color, Y, Cb, Cr, `LEGAL`, `CLIP` and
+`PLATEAU`. Each selected
 component is repeated into RGB and shown as grayscale, making quantization
 steps in the color-difference planes much easier to see. Chroma is sampled
 nearest-neighbor when enlarged so the viewer does not hide boundaries by
@@ -181,11 +182,16 @@ and blue (1023/0 in 10-bit), regardless of nominal range. Everything else is
 grayscale. Both tests inspect the delivered source before HLG, tone mapping
 or display processing. Endpoint contact proves saturation of the delivered
 code value, but cannot identify whether the camera, grade or encoder caused
-it, or whether it was intentional.
+it, or whether it was intentional. `PLATEAU` finds a different signature:
+locally flat luma in the outer 10% of the usable range. High candidates are
+red and low candidates blue. Local changes up to eight source code values are
+treated as flat so that compression noise around an earlier clipping plateau
+does not hide it. This is evidence, not proof: naturally uniform bright or
+dark areas can also be marked.
 
 Start directly in a component view with `--plane y`, `--plane cb` or
-`--plane cr`; `--plane legal` and `--plane clip` start the two false-color
-views, and `u` and `v` are accepted aliases.
+`--plane cr`; `--plane legal`, `--plane clip` and `--plane plateau` start the
+false-color views, and `u`, `v` and `flat` are accepted aliases.
 
 ### Rotation
 

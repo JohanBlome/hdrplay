@@ -24,6 +24,7 @@ typedef enum {
     HDRPLAY_PLANE_CR,
     HDRPLAY_PLANE_LEGAL,
     HDRPLAY_PLANE_CLIP,
+    HDRPLAY_PLANE_PLATEAU,
     HDRPLAY_PLANE_COUNT,
 } HdrplayPlaneView;
 
@@ -37,6 +38,7 @@ typedef struct Renderer {
     pl_renderer         renderer;       /* swapchain passes, always      */
     pl_renderer         renderer_inter; /* intermediates, always         */
     pl_renderer         renderer_hlg;   /* forced-L_W HLG -> absolute PQ */
+    pl_renderer         renderer_hlg_out; /* absolute PQ -> display PQ    */
     pl_dispatch         dispatch_diff;  /* absolute frame difference     */
     pl_tex              diff_tex;
     int                 diff_w, diff_h;
@@ -54,13 +56,14 @@ typedef struct Renderer {
          * so pl_unmap_avframe doesn't have to destroy them. */
         pl_tex plane_tex[4];
 
-        /* When --hlg-peak is set, libplacebo's normal one-pass policy
-         * would replace that value with the destination peak. Render HLG
-         * once into this source-sized absolute-PQ texture so the selected
-         * L_W survives subsequent HDR or SDR output mapping. */
+        /* The first texture freezes the selected HLG L_W into absolute PQ.
+         * The second tone-maps that result to the current display peak before
+         * overlay composition, which otherwise bypasses output tone mapping. */
         pl_tex hlg_tex;
+        pl_tex hlg_out_tex;
         int    hlg_w, hlg_h;
         float  hlg_peak_effective;
+        float  hlg_output_peak;
         struct pl_frame render_image;
 
         /* Overlay intermediate. The pass renders into this RGBA texture
@@ -118,6 +121,11 @@ typedef struct Renderer {
     float legal_low[2], legal_high[2];
     float clip_low[2], clip_high[2], clip_epsilon[2];
     float clip_low_active, clip_high_active, clip_epsilon_active;
+    /* PLATEAU is a deliberately conservative heuristic for clipping that
+     * happened before encoding: look near either end of the usable luma
+     * interval for locally flat (within a few code values) regions. */
+    float plateau_low[2], plateau_high[2], plateau_delta[2];
+    float plateau_low_active, plateau_high_active, plateau_delta_active;
 
     /* Output mode and split orientation. Defined in layout.h, which
      * owns every decision that depends on them. */
