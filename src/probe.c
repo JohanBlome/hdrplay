@@ -1,4 +1,5 @@
 #include "probe.h"
+#include "clamp.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -677,9 +678,9 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
     double R = Y + 2.0 * (1.0 - m.kr) * Cr;
     double B = Y + 2.0 * (1.0 - m.kb) * Cb;
     double G = (Y - m.kr * R - m.kb * B) / m.kg;
-    if (R < 0) R = 0; if (R > 1) R = 1;
-    if (G < 0) G = 0; if (G > 1) G = 1;
-    if (B < 0) B = 0; if (B > 1) B = 1;
+    R = dclamp01(R);
+    G = dclamp01(G);
+    B = dclamp01(B);
     out->r_norm = R;
     out->g_norm = G;
     out->b_norm = B;
@@ -817,14 +818,14 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
                 Cb = (double)(u_raw - c_mid) / (c_hi - c_lo);
                 Cr = (double)(v_raw - c_mid) / (c_hi - c_lo);
             }
-            if (Yn < 0) Yn = 0; if (Yn > 1) Yn = 1;
+            Yn = dclamp01(Yn);
 
             double R = Yn + 2.0 * (1.0 - m.kr) * Cr;
             double B = Yn + 2.0 * (1.0 - m.kb) * Cb;
             double G = (Yn - m.kr * R - m.kb * B) / m.kg;
-            if (R < 0) R = 0; if (R > 1) R = 1;
-            if (G < 0) G = 0; if (G > 1) G = 1;
-            if (B < 0) B = 0; if (B > 1) B = 1;
+            R = dclamp01(R);
+            G = dclamp01(G);
+            B = dclamp01(B);
 
             double rl = sig_lut_eval(S, R);
             double gl = sig_lut_eval(S, G);

@@ -24,6 +24,7 @@
 #include "stats.h"
 #include "source.h"
 #include "checks.h"
+#include "clamp.h"
 #include "log.h"
 
 #include <stdio.h>
@@ -59,7 +60,13 @@ int g_verbose = 0;
  * Only one key is recognized today (vulkan_icd) — this is deliberately
  * the seam for playback settings when we grow them.
  *
- * Returns 1 and fills `out` if the key is present and non-empty. */
+ * Returns 1 and fills `out` if the key is present and non-empty.
+ *
+ * Only ensure_moltenvk_icd() calls this today, so on non-Apple builds it
+ * has no callers at all. Kept rather than #ifdef'd: nothing in here is
+ * platform-specific, and wrapping it would have to be undone by the
+ * first playback setting that wants a home. */
+__attribute__((unused))
 static int config_get(const char *key, char *out, size_t n)
 {
     char path[PATH_MAX];
@@ -965,8 +972,8 @@ int main(int argc, char **argv)
                     if (e.key.key == SDLK_RIGHT) rend.pan_x += d;
                     if (e.key.key == SDLK_UP)    rend.pan_y -= d;
                     if (e.key.key == SDLK_DOWN)  rend.pan_y += d;
-                    if (rend.pan_x < 0) rend.pan_x = 0; if (rend.pan_x > 1) rend.pan_x = 1;
-                    if (rend.pan_y < 0) rend.pan_y = 0; if (rend.pan_y > 1) rend.pan_y = 1;
+                    rend.pan_x = fclamp01(rend.pan_x);
+                    rend.pan_y = fclamp01(rend.pan_y);
                 }
             }
 
@@ -986,8 +993,8 @@ int main(int argc, char **argv)
                      * screen — otherwise it accelerates with zoom. */
                     rend.pan_x -= (float)e.motion.xrel / (w > 0 ? w : 1) / rend.zoom;
                     rend.pan_y -= (float)e.motion.yrel / (h > 0 ? h : 1) / rend.zoom;
-                    if (rend.pan_x < 0) rend.pan_x = 0; if (rend.pan_x > 1) rend.pan_x = 1;
-                    if (rend.pan_y < 0) rend.pan_y = 0; if (rend.pan_y > 1) rend.pan_y = 1;
+                    rend.pan_x = fclamp01(rend.pan_x);
+                    rend.pan_y = fclamp01(rend.pan_y);
                 } else {
                     rend.probe_x = (int)(e.motion.x * sx);
                     rend.probe_y = (int)(e.motion.y * sy);
