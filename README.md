@@ -1,8 +1,9 @@
 # hdrplay
 
-A ~900-line CLI HDR video player built for **insight, not features**.
-Companion to `vca.py`: where `vca` answers "is this file really HDR?",
-`hdrplay` answers "did the HDR pipeline actually reach the display?"
+A command-line HDR video player for inspecting source signals and verifying
+that HDR reaches the display. It combines color-managed playback with
+comparison views, source-level diagnostics, an RGB waveform and headless
+content analysis.
 
 ## The pipeline, in one diagram
 
@@ -57,13 +58,20 @@ cmake --build build
 ./build/hdrplay path/to/hdr10.mp4 -v
 ```
 
-To put it on your `PATH`, use the install target rather than copying
-the binary by hand — it drops the MoltenVK ICD and dylib next to the
-executable so the installed copy is self-contained:
+To put it on your `PATH`, use the install target rather than copying the
+binary by hand. The install also places the MoltenVK ICD and dylib beside the
+executable:
 
 ```bash
-cmake --install build --prefix ~     # → ~/bin/hdrplay + MoltenVK_icd.json + libMoltenVK.dylib
+# User-local installation:
+cmake --install build --prefix "$HOME/.local"
+
+# Or system-wide under /usr/local (quote the resolved Homebrew path because
+# sudo may not inherit your shell's PATH):
+sudo "$(command -v cmake)" --install build --prefix /usr/local
 ```
+
+For the user-local option, ensure `$HOME/.local/bin` is on `PATH`.
 
 At runtime the binary locates a MoltenVK ICD manifest and points the
 Vulkan loader at it (setting `VK_DRIVER_FILES` / `VK_ICD_FILENAMES`).
@@ -141,6 +149,7 @@ cmake --build build
 ```
 
 If apt's SDL3 is missing (< 24.04), build from source:
+
 ```bash
 git clone --depth 1 https://github.com/libsdl-org/SDL && \
   cmake -S SDL -B SDL/build -DCMAKE_BUILD_TYPE=Release && \
@@ -150,22 +159,37 @@ git clone --depth 1 https://github.com/libsdl-org/SDL && \
 ## Use
 
 ```bash
-hdrplay video.mp4                  # plain run
-hdrplay video.mp4 -v               # verbose per-frame logging
-hdrplay video.mp4 -f               # start fullscreen (recommended for true HDR)
-hdrplay video.mp4 --waveform       # start with the RGB waveform visible
-
-hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
-
-# F toggles fullscreen, Q/Esc quits.
-# I toggles the status HUD, A the accumulated-statistics panel.
-# V toggles the RGB signal waveform.
-# . and , step one frame forward / back.
-# C cycles color, Y, Cb, Cr, legal-range, literal-clipping and plateau views.
-# D toggles a full-frame current/previous difference with one file,
-# or an A/B difference when two files are open.
-# T rotates the focused pane 90° clockwise.
+hdrplay video.mp4
+hdrplay -f video.mp4                  # fullscreen HDR playback
+hdrplay --waveform video.mp4          # start with the RGB waveform
+hdrplay first.mov second.mov          # synchronized comparison
 ```
+
+### Runtime controls
+
+| Key | Action |
+|---|---|
+| `F` | toggle fullscreen |
+| `H` / `S` | select HDR or SDR treatment |
+| `P` | HDR/SDR split for one file; comparison for two files |
+| `O` | cycle split orientation and comparison wipes |
+| `C` | cycle color, Y, Cb, Cr, legal, clip and plateau views |
+| `V` | toggle RGB waveform |
+| `D` | toggle current/previous or A/B difference |
+| `Space` | pause or resume |
+| `.` / `,` | step one frame forward or backward |
+| `←` / `→` | seek backward or forward 10 seconds |
+| `Z`, `+`, `-` | fit/1:1 and zoom controls |
+| drag or `Shift`+arrows | pan while zoomed |
+| `M` | toggle the mouse luminance probe |
+| `I` | toggle the status HUD |
+| `A` / `Shift-A` | toggle or reset accumulated statistics |
+| `T` | rotate the focused source 90° clockwise |
+| `W` | resize the window for exact 1:1 display |
+| `0`, `1`, `2` | compare both files or solo the first/second |
+| `X` | swap comparison sides |
+| `L` / `R` | toggle looping or restart |
+| `Q` / `Esc` | quit |
 
 ### Plane inspection
 
@@ -217,27 +241,11 @@ input; `--rotate 1:90` applies to the second file only. The flag is
 repeatable, so `--rotate 0:90 --rotate 1:270` sets each file separately.
 `T` rotates the focused pane live.
 
-Inputs are numbered **from 0**, following ffmpeg's stream specifiers and
-matching `-d`, which is already 0-based. The `1`/`2` solo keys are
-1-based and do not line up — `--rotate 1:90` rotates the file that `2`
-solos.
-
-Rotation is applied by libplacebo during sampling, so there is no
-re-encode and no extra pass. Everything downstream follows: the pane
-aspect, the zoom reference, the portrait→top-bottom split default, and
-the luminance probe all reason about the frame as displayed rather than
-as stored.
-
-**Container rotation metadata is not read.** A file whose display matrix
-says "portrait" still plays as stored — `--rotate` is the only source of
-rotation. This is deliberate: it keeps one visible, explicit answer to
-"why is this sideways", rather than two that have to be composed.
+Command-line input indices are 0-based, while the `1` and `2` solo keys are
+user-facing and therefore 1-based. Container rotation metadata is not read;
+use `--rotate` when a file needs correction.
 
 ### Comparing two files
-
-```bash
-hdrplay a.mov b.mov        # synchronized, side by side, one window
-```
 
 A single **PTS master clock** drives both files: each shows the frame in
 effect at that instant. Two files at different frame rates therefore
@@ -258,20 +266,6 @@ with B, which is especially useful for gradients and banding tests.
 Varying content and treatment at once would leave any difference you see
 with two possible causes. Press `1` or `2` to solo a file; `P` or `0`
 returns to the two-file comparison.
-
-| Key | |
-|---|---|
-| `.` `,` | step one frame forward / back (pauses) |
-| `0` `1` `2` | compare A\|B / solo A / solo B |
-| `D` | toggle current/previous (one file) or A/B (two files) difference |
-| `X` | swap sides |
-| `Z` | toggle fit / 1:1 |
-| `+` `-` | zoom steps |
-| drag, `shift`+arrows | pan, locked across panes |
-| `P` `O` | return to A/B comparison / cycle pane LR, pane TB, diagonal, LR wipe, TB wipe |
-| `C` | cycle color / Y / Cb / Cr / legal range / literal clipping |
-| `T` | rotate the focused pane 90° clockwise |
-| `W` | resize the window for exact 1:1, no letterbox |
 
 **Stepping backward** is the awkward direction — video decodes one way,
 so frame N−1 normally means seeking to the preceding keyframe and
@@ -299,45 +293,15 @@ select Y, Cb or Cr before the difference, and zoom/pan remain locked.
 
 ### Aspect ratio and 1:1
 
-The drawn image always has the source's aspect ratio. Not "usually", and
-not "if the window is the right shape" — the target rect and the visible
-source region are the same rectangle scaled by one number, so a
-distorted frame is not a state the layout can express. Whatever is left
-over in the pane is black.
+The source aspect ratio is always preserved; unused pane space is black. In
+two-pane layouts, images are aligned toward the seam. Wipe modes instead
+align both complete images and replace part of one with the other.
 
-In a two-pane split each image is justified **toward the seam**: under
-left/right the left pane sits hard right and the right pane hard left,
-so the pair meets in the middle and all the slack goes to the outside
-edges. Centring each image in its own half instead puts the sum of both
-inner margins between them — a wide black gutter running exactly between
-the two things you are trying to compare. Top/bottom does the same
-vertically. A single pane stays centred; there is no seam to meet.
-
-The wipe modes are different: both sources use the full viewport and
-the second is composited over half of the first. Use
-`--split-wipe-lr` or `--split-wipe-tb` to start there directly; `O`
-cycles through them along with the pane layouts and diagonal wipe.
-
-`Z` toggles fit and 1:1; `+`/`-` step through 2x zoom levels. **1:1 means
-one source pixel per framebuffer pixel**, which on a HiDPI display is
-half the physical size you might expect. That is the only definition
-worth having here: at any other scale a resampler sits between you and
-the file, and you end up judging the resampler.
-
-The status HUD reports the scale in force (`SCALE 1:1 EXACT`,
-`SCALE 0.25X FIT`), because whether you are actually at 1:1 is not
-something you can tell by looking.
-
-`W` resizes the window so the focused source lands at exactly 1:1 with
-no letterbox and nothing cropped — doubling the width or height first if
-two panes are showing. Zoom alone cannot get you there: at 1:1 the image
-is whatever size the source is and the pane is whatever size you dragged
-the window to, so you are always either cropped or bordered.
-
-Files of different resolutions are fine. Zoom is expressed against the
-larger of the two, so both panes always cover the same region of the
-scene rather than the same pixel count — otherwise at 1:1 a 1080p pane
-would show four times the area of a 4K one.
+`Z` toggles fit and 1:1, while `+` and `-` change zoom. Here 1:1 means one
+source pixel per framebuffer pixel. The HUD reports the active scale, and `W`
+resizes the window so the focused source fits at exactly 1:1 without cropping
+or letterboxing. Pan and zoom remain spatially aligned when comparing files
+of different resolutions.
 
 ### Content analysis
 
@@ -358,31 +322,12 @@ works over SSH:
 hdrplay --analyze clip.mov
 ```
 
-```
-content checks  clip.mov
-  PASS  coverage                          72 frames, 100% of duration
-  INFO  luminance reference               PQ absolute
-  PASS  content exceeds SDR range         p99.9 = 3520N
-  FAIL  MaxCLL vs declared                declares 400N but pixels reach 10000N
-                                          under-declared: tone mappers trust this value
-  PASS  dynamic range                     14.4 stops (p99.9/p1) of 27.5
-                                          possible at 10-bit limited range
-  INFO  spread                            4.24 spatial / 0.01 temporal stops
+The report covers luminance distribution, dynamic range, MaxCLL/MaxFALL
+consistency, gamut usage and scan coverage. The exit code is the number of
+failed content checks; values of 64 or greater indicate a tool error such as
+an unreadable file or unsupported pixel format.
 
-summary: 1 FAIL, 0 WARN
-```
-
-Exit code is the FAIL count, so batch triage works directly:
-
-```bash
-for f in *.mov; do hdrplay --analyze "$f" || echo "$f suspect"; done
-```
-
-Exit codes **>= 64** are tool errors (unreadable file, unsupported pixel
-format), not content verdicts — otherwise a missing file is
-indistinguishable from "1 FAIL".
-
-Five things worth understanding about the numbers:
+Interpretation notes:
 
 - **Measurements are one-sided lower bounds.** Sampling stride, luma vs
   the spec's `max(R,G,B)`, and Jensen's inequality on a convex EOTF all
@@ -404,10 +349,12 @@ Five things worth understanding about the numbers:
   `--ambient-lux` selects a clearly labelled 314-lux fallback reference, so
   the control remains useful without metadata. `--ambient-lux` supplies the
   current room level; on supported MacBooks hdrplay reads the built-in sensor
-  when a source reference exists and that option is omitted. Darker-than-reference playback lowers midtones
-  while fixing black and the HLG peak, exposing more of the display's
-  contrast without making diffuse levels needlessly bright. Neither H.274
-  AMVE nor BT.2100 specifies this mapping.
+  when a source reference exists and that option is omitted. The sensor is
+  polled about once per second during playback; polling pauses with playback.
+  Darker-than-reference playback lowers midtones while fixing black and the
+  HLG peak, exposing more of the display's contrast without making diffuse
+  levels needlessly bright. Neither H.274 AMVE nor BT.2100 specifies this
+  mapping.
 - **SDR gets no absolute figures at all.** A measured MaxCLL for an SDR
   file cannot exceed 100 nits by construction, so those checks are
   suppressed rather than printed with a caveat. Ratio statistics
@@ -437,9 +384,9 @@ Five things worth understanding about the numbers:
   pools that excursion over the first frames and says what it decided
   and on what evidence. Force it with `--range limited|full`.
 
-`--json` writes a machine-readable summary to stdout (checks stay on
-stderr, so `| jq` works). `--stats-file out.ndjson` writes a per-frame
-series plus session histograms for plotting in `vca.py`.
+`--json` writes a machine-readable summary to stdout while checks remain on
+stderr. `--stats-file out.ndjson` writes per-frame measurements and session
+histograms for external analysis.
 
 ### Config
 
@@ -459,8 +406,7 @@ value expands to `$HOME`.
 vulkan_icd = ~/code/hdrplay/third_party/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json
 ```
 
-Unrecognized keys are ignored, so this is the place to add future
-playback settings.
+Unrecognized keys are ignored.
 
 ### Reading the logs
 
@@ -486,18 +432,8 @@ Three signals, in order of trustworthiness:
    display `HDR10` / `HLG` / `Dolby Vision` when the signal lands.
    This is ground truth; software can lie, panels rarely do.
 
-## Caveats / known fixups
+## Troubleshooting
 
-This scaffold is structurally complete but the author hasn't built it
-on your machine. Expect small fixups on first compile:
-
-- **SDL3 property names.** `SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN` and
-  friends were renamed during SDL 3.0 → 3.2. If clang errors on those
-  symbols, grep `SDL_video.h` in your install for `HDR` to find the
-  current name and substitute in `renderer.c:renderer_update_display_state`.
-- **libplacebo 6 vs 7.** `pl_map_avframe_ex` and `pl_avframe_params`
-  exist in libplacebo ≥ 6.x. On 7.x they're identical in shape.
-  If you're on an older release, the equivalent is `pl_upload_avframe`.
 - **macOS Vulkan.** Two separate pieces, and it's easy to have one
   without the other. The **loader** comes from `brew install
   vulkan-loader` or the LunarG SDK; the **driver** (MoltenVK) comes
@@ -512,24 +448,17 @@ on your machine. Expect small fixups on first compile:
   silently degrades to SDR; the `[HDR]` log will show `hdr=off` and
   libplacebo will tone-map for you. Still useful — just not "real" HDR.
 
-## What this is not
+## Limitations
 
-- Not an A/V sync'd media player. No audio, no seek, no subtitles.
-- Not production code. No error recovery from mid-stream format changes.
-- Not a benchmark — it sleeps for nothing; FPS is whatever the swapchain
-  pacing allows.
+- Video only: no audio or subtitles.
+- No recovery from mid-stream format changes.
+- Container rotation metadata is not applied automatically.
 
-For all of those, use mpv. This is a teaching tool.
-
-## Architecture & gotchas
+## Developer documentation
 
 **Read [`RENDERING.md`](./RENDERING.md) before changing anything in
-`renderer.c`.** It explains why the SDR path looks weirdly indirect (it
-has to be — there's a non-obvious asymmetry in how libplacebo handles
-`target.color.hdr.max_luma` between swapchain targets and texture
-targets), documents every libplacebo gotcha we hit, and answers the
-recurring "why is SDR brighter than I expect / dimmer than ffplay"
-questions.
+`renderer.c`.** It documents the color pipeline, intermediate textures,
+libplacebo behavior and HDR/SDR brightness handling.
 
 ## Files
 
@@ -537,16 +466,16 @@ questions.
 |---|---|
 | `src/main.c`        | arg parse, event loop, frame pump, key handling |
 | `src/decoder.c`     | ffmpeg demux + decode, HDR side-data extraction |
-| `src/renderer.c`    | SDL3 + Vulkan + libplacebo init, per-frame render, SDR-via-overlay composition |
-| `src/hud.c`         | embedded bitmap font, on-screen status panel + split badges |
+| `src/renderer.c`    | SDL3, Vulkan and libplacebo initialization and rendering |
+| `src/hud.c`         | status panels, labels and RGB waveform overlay |
 | `src/diagnose.c`    | `--diagnose` HDR sanity checks (per-display PASS/WARN/FAIL) |
 | `src/brightness.c`  | `--set-brightness` via IOKit / `brightness` CLI / m1ddc |
-| `src/probe.c`       | luminance probe + per-frame histograms: YUV → linear nits, source-side ground truth |
+| `src/probe.c`       | source-signal probes, RGB waveform and luminance statistics |
 | `src/stats.c`       | session accumulation: PTS-deduped histograms, percentiles, spread decomposition |
 | `src/layout.c`      | pure render planning: passes, crops, masks, overlay routing (GPU-free, so it can be tested) |
 | `src/source.c`      | one input: decode, frame ring for step-back, clock following |
 | `src/analyze.c`     | `--analyze` headless whole-file scan, `--json`, `--stats-file` |
 | `src/checks.c`      | shared PASS/WARN/FAIL reporting for `--diagnose` and `--analyze` |
 | `tests/`            | probe, accumulator, layout and source tests (`ctest --test-dir build`) |
-| `RENDERING.md`      | **Architecture doc — read first if changing rendering** |
+| `RENDERING.md`      | rendering and color-pipeline design notes |
 | `CMakeLists.txt`    | pkg-config find + link |
