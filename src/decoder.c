@@ -384,6 +384,52 @@ bool decoder_open(Decoder *d, const char *path)
     return d->pkt && d->frame && (!d->hw_requested || d->hw_frame);
 }
 
+/* ------------------------------------------------------------------ */
+/* Seeking                                                             */
+/*                                                                     */
+/* Elementary streams — Annex-B .h264/.h265, raw .mpeg2video and the   */
+/* like — carry neither timestamps nor an index, and FFmpeg marks them */
+/* AVFMT_NOTIMESTAMPS. Asking av_seek_frame() for a timestamp on one   */
+/* is actively destructive: with no read_seek and no index entries it  */
+/* falls through to the generic search, which rewinds to the data      */
+/* offset and reads forward hunting for a DTS past the target. Every   */
+/* DTS is AV_NOPTS_VALUE, so nothing ever matches — it consumes the    */
+/* whole file, returns -1, and leaves the demuxer parked at EOF with   */
+/* the stream unusable for the rest of the run. Byte seeking is the    */
+/* one operation these formats do support, and for "back to the        */
+/* start" it is exact.                                                 */
+/* ------------------------------------------------------------------ */
+static bool untimestamped(const Decoder *d)
+{
+    return d->fmt && d->fmt->iformat &&
+           (d->fmt->iformat->flags & AVFMT_NOTIMESTAMPS);
+}
+
+static bool can_byte_seek(const Decoder *d)
+{
+    if (!d->fmt || !d->fmt->iformat) return false;
+    if (d->fmt->iformat->flags & AVFMT_NO_BYTE_SEEK) return false;
+    return d->fmt->pb && d->fmt->pb->seekable;
+}
+
+/* Whether the head of the stream is reachable again. Checked BEFORE
+ * anything consumes frames speculatively. */
+static bool can_rewind(const Decoder *d)
+{
+    if (!d->fmt || !d->fmt->pb || !d->fmt->pb->seekable) return false;
+    return untimestamped(d) ? can_byte_seek(d) : true;
+}
+
+static bool seek_bytes(Decoder *d, int64_t pos)
+{
+    if (!can_byte_seek(d)) return false;
+    if (av_seek_frame(d->fmt, d->stream_idx, pos,
+                      AVSEEK_FLAG_BYTE | AVSEEK_FLAG_BACKWARD) < 0)
+        return false;
+    avcodec_flush_buffers(d->cc);
+    return true;
+}
+
 /* See decoder.h. The pixels are the only evidence left once the
  * container declined to say, and getting it wrong is not cosmetic:
  * decoding full-range shadows as limited pushes codes 1..15 into the
@@ -396,7 +442,7 @@ bool decoder_resolve_color_range(Decoder *d, int max_frames)
     if (max_frames < 1) max_frames = 1;
 
     /* Consuming frames is only acceptable if they can be put back. */
-    if (!d->fmt || !d->fmt->pb || !d->fmt->pb->seekable) {
+    if (!can_rewind(d)) {
         LOG("META", "range unspecified and input not seekable — reading as limited");
         return false;
     }
@@ -418,7 +464,7 @@ bool decoder_resolve_color_range(Decoder *d, int max_frames)
     }
     if (!rewound)
         LOG("DEC", "WARNING: could not rewind after the range probe; "
-                   "the first %d frames are lost", n);
+                   "the stream is left wherever the failed seek put it");
 
     /* Pooled over frames, not voted: a single fade-in or title card
      * carries no excursions and would otherwise outvote the content. */
@@ -469,6 +515,7 @@ int decoder_next_frame(Decoder *d)
              * keeps them from disagreeing. */
             if (d->range_effective != AVCOL_RANGE_UNSPECIFIED)
                 d->frame->color_range = d->range_effective;
+            if (d->frame_index >= 0) d->frame_index++;
             return 1;
         }
         if (r == AVERROR_EOF) return 0;
@@ -492,25 +539,68 @@ bool decoder_seek_start(Decoder *d)
 {
     /* Seek to the very beginning, then flush the decoder so any buffered
      * frames from the previous pass don't leak into the next. */
+    if (untimestamped(d)) {
+        if (!seek_bytes(d, 0)) {
+            LOG("DEC", "rewind failed: %s carries no timestamps and the "
+                       "input cannot be byte-seeked", d->fmt->iformat->name);
+            return false;
+        }
+        d->frame_index = 0;
+        return true;
+    }
+
     int r = av_seek_frame(d->fmt, d->stream_idx, 0, AVSEEK_FLAG_BACKWARD);
-    if (r < 0) { LOG("DEC", "seek to start failed: %d", r); return false; }
+    if (r < 0) {
+        /* A failed generic seek can leave the demuxer at EOF. A byte seek
+         * both rewinds and repairs that, so try it before giving up. */
+        if (seek_bytes(d, 0)) { d->frame_index = 0; return true; }
+        LOG("DEC", "seek to start failed: %d", r);
+        return false;
+    }
     avcodec_flush_buffers(d->cc);
+    d->frame_index = 0;
     return true;
 }
 
 bool decoder_seek_to(Decoder *d, double seconds)
 {
+    if (seconds < 0.0) seconds = 0.0;
+
+    /* No timebase to seek against: position is counted in frames, and a
+     * seek is "rewind if the target is behind us, then decode forward".
+     * Linear in the distance moved, which is the price of a format that
+     * ships no index — but it is exact, and it never leaves the demuxer
+     * somewhere the next read cannot recover from. */
+    if (untimestamped(d)) {
+        AVRational fr = av_guess_frame_rate(d->fmt,
+                                            d->fmt->streams[d->stream_idx], NULL);
+        double fps = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 0.0;
+        int64_t target = (fps > 0.0) ? (int64_t)(seconds * fps + 0.5) : 0;
+
+        if (d->frame_index < 0 || target < d->frame_index) {
+            if (!decoder_seek_start(d)) return false;
+        }
+        while (d->frame_index < target) {
+            int r = decoder_next_frame(d);
+            /* EOF is a legitimate landing place — the caller asked to go
+             * past the end. An actual decode error is not. */
+            if (r < 0) return false;
+            if (r == 0) break;
+        }
+        return true;
+    }
+
     /* Seek to an absolute timestamp. AVSEEK_FLAG_BACKWARD lands on a
      * keyframe at or before the target — required to start decoding
      * from a clean reference. The next decoded frame may therefore
      * come from slightly before `seconds`; that's fine for ±10s
      * stepping where the user doesn't expect frame-precise landing. */
-    if (seconds < 0.0) seconds = 0.0;
     AVRational tb = d->fmt->streams[d->stream_idx]->time_base;
     int64_t target = (int64_t)(seconds * tb.den / tb.num);
     int r = av_seek_frame(d->fmt, d->stream_idx, target, AVSEEK_FLAG_BACKWARD);
     if (r < 0) { LOG("DEC", "seek to %.2fs failed: %d", seconds, r); return false; }
     avcodec_flush_buffers(d->cc);
+    d->frame_index = -1;   /* unknown; only the untimestamped path reads it */
     return true;
 }
 

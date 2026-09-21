@@ -19,6 +19,11 @@ typedef struct Decoder {
     AVFormatContext *fmt;
     AVCodecContext  *cc;
     int              stream_idx;
+    /* Frames returned since the last rewind, i.e. the index of the frame
+     * decoder_next_frame() will hand back next; -1 when a timestamp seek
+     * has made it meaningless. The position of record for elementary
+     * streams, which have no timestamps to hold one. */
+    int64_t          frame_index;
     AVPacket        *pkt;
     AVFrame         *frame;       /* software frame exposed to consumers */
     AVFrame         *hw_frame;    /* decoder-owned hardware surface       */
@@ -90,8 +95,16 @@ int   decoder_next_frame(Decoder *d);   /* >0 got frame, 0 EOF, <0 error */
 /* Fold per-frame HDR/AMVE side data into the cached stream metadata.
  * Encoders and demuxers do not expose all metadata at the same level. */
 void  decoder_absorb_frame_side_data(Decoder *d);
-bool  decoder_seek_start(Decoder *d);   /* rewind for --loop; false on err */
-bool  decoder_seek_to(Decoder *d, double seconds);   /* seek to absolute time; clamps to >= 0 */
+/* Rewind to the first frame. Elementary streams (AVFMT_NOTIMESTAMPS:
+ * Annex-B .h264/.h265 and friends) are byte-seeked, because asking them
+ * for a timestamp makes FFmpeg scan the entire file and then park the
+ * demuxer at EOF. False on error. */
+bool  decoder_seek_start(Decoder *d);
+/* Seek to an absolute time, clamped to >= 0. On elementary streams the
+ * time is converted to a frame index and reached by decoding forward
+ * from the nearest earlier position, so the cost is linear in the
+ * distance moved. */
+bool  decoder_seek_to(Decoder *d, double seconds);
 double decoder_frame_seconds(const Decoder *d);      /* current frame's PTS in seconds (NaN if none) */
 void  decoder_close(Decoder *d);
 
