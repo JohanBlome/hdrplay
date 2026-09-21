@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "clamp.h"
 #include "hud.h"
 #include "log.h"
 #include "probe.h"
@@ -381,8 +382,7 @@ static inline float alpha_for_mask(int mask_mode, float nx, float ny, float aa)
     case ALPHA_MASK_TB:   return ny < 0.5f ? 0.0f : 1.0f;
     case ALPHA_MASK_DIAG: {
         float d = nx + ny - 1.0f;
-        float t = (d + aa) / (2.0f * aa);
-        if (t < 0) t = 0; if (t > 1) t = 1;
+        float t = fclamp01((d + aa) / (2.0f * aa));
         return t * t * (3.0f - 2.0f * t);   /* smoothstep */
     }
     default: return 0.0f;
