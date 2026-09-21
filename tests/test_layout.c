@@ -149,6 +149,21 @@ static void test_single_file_unchanged(void)
     layout_plan(&in, &pl);
     CHECK(count_ov_plan(&pl, LAYOUT_OV_WAVEFORM) == 1,
           "RGB waveform attached exactly once");
+    const LayoutOverlay *w = NULL;
+    for (int i = 0; i < pl.pass[0].n_ov; i++)
+        if (pl.pass[0].ov[i].kind == LAYOUT_OV_WAVEFORM)
+            w = &pl.pass[0].ov[i];
+    CHECK(w && rect_eq(w->dst, 1136, 632, 1904, 1064),
+          "waveform occupies 40%% of a 1920x1080 framebuffer");
+
+    in.win_w = 800; in.win_h = 600;
+    layout_plan(&in, &pl);
+    w = NULL;
+    for (int i = 0; i < pl.pass[0].n_ov; i++)
+        if (pl.pass[0].ov[i].kind == LAYOUT_OV_WAVEFORM)
+            w = &pl.pass[0].ov[i];
+    CHECK(w && rect_eq(w->dst, 144, 224, 784, 584),
+          "waveform retains its 640x360 minimum when space permits");
 }
 
 /* Solo must be indistinguishable from opening that file alone — that is

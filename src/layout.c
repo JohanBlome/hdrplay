@@ -225,8 +225,15 @@ static LayoutRect waveform_rect(const LayoutInput *in, bool two_pane)
 
     float avail_w = x1 - x0 - 2.0f * MARGIN;
     float avail_h = y1 - y0 - 2.0f * MARGIN;
-    float w = avail_w < 640.0f ? avail_w : 640.0f;
-    float h = avail_h < 360.0f ? avail_h : 360.0f;
+    /* Size in framebuffer pixels so Retina/HiDPI displays receive the same
+     * visual proportion as ordinary-density displays. Keep the old fixed
+     * size as a floor for smaller windows, then clamp to the owning pane. */
+    float w = in->win_w * 0.40f;
+    float h = in->win_h * 0.40f;
+    if (w < 640.0f) w = 640.0f;
+    if (h < 360.0f) h = 360.0f;
+    if (w > avail_w) w = avail_w;
+    if (h > avail_h) h = avail_h;
     if (w < 0.0f) w = 0.0f;
     if (h < 0.0f) h = 0.0f;
 

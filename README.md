@@ -230,8 +230,9 @@ traces are density-weighted and add to white where the channels coincide.
 The grid marks nominal 0%, 25%, 50%, 75% and 100%, with -10% and 110% guard
 bands retained above and below. Those guard bands make range excursions and
 capture-processing overshoot visible instead of clipping them at the edge of
-the graph. In two-file comparison, the waveform follows the focused (first
-visible) source.
+the graph. The scope occupies 40% of the framebuffer in each dimension, with
+a 640x360-pixel minimum where space permits. In two-file comparison, it stays
+inside one pane and follows the focused (first visible) source.
 
 ### Rotation
 
