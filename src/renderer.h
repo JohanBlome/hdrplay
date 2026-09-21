@@ -241,6 +241,7 @@ typedef struct Renderer {
      * the HUD and feeds each frame in. NULL when unavailable. */
     struct SessionStats *session;
     bool   session_panel;       /* 'A' toggles the accumulated panel   */
+    bool   waveform_visible;    /* 'V' toggles RGB source waveform     */
 
     /* HDR10 static metadata the container DECLARES, copied from the
      * decoder so the HUD can print measured-vs-declared side by side.

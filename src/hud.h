@@ -17,7 +17,9 @@ typedef struct {
     struct pl_overlay label_b;    /* badge for the second pane            */
     struct pl_overlay plane;      /* persistent COLOR/Y/Cb/Cr badge       */
     struct pl_overlay session;    /* accumulated statistics panel         */
+    struct pl_overlay waveform;   /* RGB source-signal waveform            */
     bool has_status, has_label_a, has_label_b, has_plane, has_session;
+    bool has_waveform;
     int  win_w, win_h;
 } HudOverlays;
 

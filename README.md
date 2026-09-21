@@ -153,11 +153,13 @@ git clone --depth 1 https://github.com/libsdl-org/SDL && \
 hdrplay video.mp4                  # plain run
 hdrplay video.mp4 -v               # verbose per-frame logging
 hdrplay video.mp4 -f               # start fullscreen (recommended for true HDR)
+hdrplay video.mp4 --waveform       # start with the RGB waveform visible
 
 hdrplay video.mp4 --rotate 90      # rotate 90° clockwise before display
 
 # F toggles fullscreen, Q/Esc quits.
 # I toggles the status HUD, A the accumulated-statistics panel.
+# V toggles the RGB signal waveform.
 # . and , step one frame forward / back.
 # C cycles color, Y, Cb, Cr, legal-range, literal-clipping and plateau views.
 # D toggles a full-frame current/previous difference with one file,
@@ -192,6 +194,20 @@ dark areas can also be marked.
 Start directly in a component view with `--plane y`, `--plane cb` or
 `--plane cr`; `--plane legal`, `--plane clip` and `--plane plateau` start the
 false-color views, and `u`, `v` and `flat` are accepted aliases.
+
+### RGB waveform
+
+Press `V` to toggle a channel-overlaid RGB waveform, or start with it visible
+using `--waveform`. Horizontal position follows the source image; vertical
+position is the encoded R'G'B' signal level before transfer conversion, HLG
+processing, tone mapping or display color management. Red, green and blue
+traces are density-weighted and add to white where the channels coincide.
+
+The grid marks nominal 0%, 25%, 50%, 75% and 100%, with -10% and 110% guard
+bands retained above and below. Those guard bands make range excursions and
+capture-processing overshoot visible instead of clipping them at the edge of
+the graph. In two-file comparison, the waveform follows the focused (first
+visible) source.
 
 ### Rotation
 

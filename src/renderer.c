@@ -1521,6 +1521,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         .zoom = r->zoom, .pan_x = r->pan_x, .pan_y = r->pan_y,
         .hud_hidden = r->hud_hidden,
         .session_panel = r->session_panel,
+        .waveform_visible = r->waveform_visible,
     };
     for (int i = 0; i < slot_count; i++) {
         if (!slot_frame[i]) continue;
@@ -1728,6 +1729,9 @@ bool renderer_render(Renderer *r, Source *sources, int n)
                 break;
             case LAYOUT_OV_SESSION:
                 if (hud_ov.has_session) ov_store[n_ov++] = hud_ov.session;
+                break;
+            case LAYOUT_OV_WAVEFORM:
+                if (hud_ov.has_waveform) ov_store[n_ov++] = hud_ov.waveform;
                 break;
             case LAYOUT_OV_PLANE:
                 if (hud_ov.has_plane)   ov_store[n_ov++] = hud_ov.plane;

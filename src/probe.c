@@ -526,6 +526,85 @@ static bool chroma_planes_supported(const AVPixFmtDescriptor *desc)
     return true;
 }
 
+bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
+                        int vertical_stride, uint32_t *bins,
+                        uint32_t peak_count[3], int *out_samples)
+{
+    if (peak_count) memset(peak_count, 0, 3 * sizeof(*peak_count));
+    if (out_samples) *out_samples = 0;
+    if (!frame || !frame->data[0] || !bins || width <= 0 || height <= 0)
+        return false;
+    if (vertical_stride < 1) vertical_stride = 1;
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    int depth = 0;
+    if (!luma_plane_supported(desc, &depth) ||
+        !chroma_planes_supported(desc))
+        return false;
+    for (int c = 0; c < 3; c++)
+        if (!frame->data[desc->comp[c].plane]) return false;
+
+    size_t plane_size = (size_t)width * (size_t)height;
+    memset(bins, 0, 3 * plane_size * sizeof(*bins));
+
+    bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
+    int max_raw = (1 << depth) - 1;
+    int y_lo = 16 << (depth - 8), y_hi = 235 << (depth - 8);
+    int c_lo = 16 << (depth - 8), c_hi = 240 << (depth - 8);
+    int c_mid = (c_lo + c_hi) / 2;
+    Matrix m = matrix_for(frame->colorspace);
+    const double signal_span = PROBE_WAVEFORM_MAX_SIGNAL -
+                               PROBE_WAVEFORM_MIN_SIGNAL;
+    uint32_t local_peak[3] = {0};
+    int samples = 0;
+
+    /* Iterate over graph columns rather than sparse source X values. This
+     * guarantees a continuous scope even when a low-resolution input is
+     * displayed in a wide waveform panel. */
+    for (int bx = 0; bx < width; bx++) {
+        int x = (int)(((int64_t)bx * 2 + 1) * frame->width /
+                      ((int64_t)width * 2));
+        if (x >= frame->width) x = frame->width - 1;
+        for (int y = 0; y < frame->height; y += vertical_stride) {
+            int y_raw = read_component(frame, desc, 0, x, y);
+            int u_raw = read_component(frame, desc, 1, x, y);
+            int v_raw = read_component(frame, desc, 2, x, y);
+
+            double Yn, Cb, Cr;
+            if (full_range) {
+                Yn = (double)y_raw / max_raw;
+                Cb = (double)u_raw / max_raw - 0.5;
+                Cr = (double)v_raw / max_raw - 0.5;
+            } else {
+                Yn = (double)(y_raw - y_lo) / (y_hi - y_lo);
+                Cb = (double)(u_raw - c_mid) / (c_hi - c_lo);
+                Cr = (double)(v_raw - c_mid) / (c_hi - c_lo);
+            }
+
+            double rgb[3];
+            rgb[0] = Yn + 2.0 * (1.0 - m.kr) * Cr;
+            rgb[2] = Yn + 2.0 * (1.0 - m.kb) * Cb;
+            rgb[1] = (Yn - m.kr * rgb[0] - m.kb * rgb[2]) / m.kg;
+
+            for (int c = 0; c < 3; c++) {
+                double t = (rgb[c] - PROBE_WAVEFORM_MIN_SIGNAL) /
+                           signal_span;
+                if (t < 0.0) t = 0.0;
+                if (t > 1.0) t = 1.0;
+                int row = height - 1 - (int)llround(t * (height - 1));
+                size_t idx = ((size_t)c * height + row) * width + bx;
+                uint32_t count = ++bins[idx];
+                if (count > local_peak[c]) local_peak[c] = count;
+            }
+            samples++;
+        }
+    }
+
+    if (peak_count) memcpy(peak_count, local_peak, sizeof(local_peak));
+    if (out_samples) *out_samples = samples;
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* BT.2020 -> BT.709 linear conversion, used only to decide whether a  */
 /* pixel's chromaticity falls outside the 709 gamut. Negative output   */

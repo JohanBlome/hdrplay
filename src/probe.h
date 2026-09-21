@@ -242,4 +242,23 @@ typedef struct {
 bool probe_frame_stats(const AVFrame *frame, int sample_stride,
                        ProbeMode mode, FrameStats *out);
 
+/* ------------------------------------------------------------------ */
+/* RGB waveform.                                                       */
+/*                                                                     */
+/* Builds a channel-overlaid waveform from source-domain R'G'B' signal */
+/* values, before transfer linearization or display tone mapping. The  */
+/* horizontal axis follows the source image; the vertical axis spans   */
+/* -10%..110%, retaining nominal-range undershoot and overshoot.        */
+/*                                                                     */
+/* `bins` is channel-major and must hold 3 * width * height uint32_t:   */
+/* bins[(channel * height + row) * width + column]. The function clears */
+/* it before use. `vertical_stride` limits CPU cost; every waveform     */
+/* column is still sampled independently from the corresponding source */
+/* X position. Returns false for unsupported source formats.            */
+#define PROBE_WAVEFORM_MIN_SIGNAL (-0.10)
+#define PROBE_WAVEFORM_MAX_SIGNAL ( 1.10)
+bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
+                        int vertical_stride, uint32_t *bins,
+                        uint32_t peak_count[3], int *out_samples);
+
 #endif

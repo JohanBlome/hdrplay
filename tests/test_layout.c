@@ -34,6 +34,7 @@ static LayoutInput base_input(void)
         .zoom = 0.0f, .pan_x = 0.5f, .pan_y = 0.5f,
         .hud_hidden = false,
         .session_panel = false,
+        .waveform_visible = false,
     };
 }
 
@@ -141,6 +142,13 @@ static void test_single_file_unchanged(void)
     CHECK(s && rect_eq(s->dst, WIN_W - 16 - 440, WIN_H - 16 - 200,
                        WIN_W - 16, WIN_H - 16),
           "session panel bottom-right");
+
+    /* RGB waveform is an independent diagnostic overlay. */
+    in = base_input();
+    in.waveform_visible = true;
+    layout_plan(&in, &pl);
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_WAVEFORM) == 1,
+          "RGB waveform attached exactly once");
 }
 
 /* Solo must be indistinguishable from opening that file alone — that is
@@ -400,7 +408,8 @@ static void test_overlay_routing_is_exclusive(void)
     puts("every overlay lands in exactly one pass");
     LayoutOverlayKind kinds[] = {
         LAYOUT_OV_STATUS, LAYOUT_OV_SESSION,
-        LAYOUT_OV_PLANE, LAYOUT_OV_LABEL_A, LAYOUT_OV_LABEL_B,
+        LAYOUT_OV_WAVEFORM, LAYOUT_OV_PLANE,
+        LAYOUT_OV_LABEL_A, LAYOUT_OV_LABEL_B,
     };
     HdrplaySplitOrient orients[] = {
         HDRPLAY_SPLIT_LR, HDRPLAY_SPLIT_TB, HDRPLAY_SPLIT_DIAG,
@@ -411,16 +420,20 @@ static void test_overlay_routing_is_exclusive(void)
             LayoutInput in = base_input();
             in.n_sources = 2;
             in.session_panel = true;
+            in.waveform_visible = true;
             in.orient = orients[o];
             in.mode = (HdrplayMode)m;
             LayoutPlan pl; layout_plan(&in, &pl);
-            for (int k = 0; k < 5; k++) {
+            for (int k = 0; k < 6; k++) {
                 int n = count_ov_plan(&pl, kinds[k]);
                 CHECK(n <= 1, "orient %d mode %d: overlay %d appears %dx",
                       (int)o, m, kinds[k], n);
             }
             CHECK(count_ov_plan(&pl, LAYOUT_OV_PLANE) == 1,
                   "orient %d mode %d: plane badge appears once",
+                  (int)o, m);
+            CHECK(count_ov_plan(&pl, LAYOUT_OV_WAVEFORM) == 1,
+                  "orient %d mode %d: waveform appears once",
                   (int)o, m);
         }
     }

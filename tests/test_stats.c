@@ -526,6 +526,34 @@ static void test_maxrgb(void)
     av_frame_free(&f);
 }
 
+static void test_rgb_waveform(void)
+{
+    puts("RGB waveform");
+    AVFrame *f = mkframe(AV_PIX_FMT_P010LE, 16, 16,
+                         AVCOL_TRC_ARIB_STD_B67, 64);
+    enum { W = 8, H = 121 };
+    uint32_t bins[3 * W * H];
+    uint32_t peak[3];
+    int samples = 0;
+
+    CHECK(probe_rgb_waveform(f, W, H, 2, bins, peak, &samples),
+          "P010 source produces an RGB waveform");
+    CHECK(samples == W * 8, "sample count %d (expect %d)", samples, W * 8);
+
+    /* Limited-range neutral code 64 in 10-bit is nominal 0%, which maps
+     * to row 10 in a 121-row -10%..110% graph. All channels coincide. */
+    int zero_row = 110;
+    bool neutral = true;
+    for (int c = 0; c < 3; c++)
+        for (int x = 0; x < W; x++)
+            neutral &= bins[(c * H + zero_row) * W + x] == 8;
+    CHECK(neutral, "nominal black aligns R, G and B at 0%%");
+    CHECK(peak[0] == 8 && peak[1] == 8 && peak[2] == 8,
+          "per-channel density peaks preserved");
+
+    av_frame_free(&f);
+}
+
 int main(void)
 {
     test_lut_equivalence();
@@ -540,6 +568,7 @@ int main(void)
     test_session_dedupe();
     test_variance_decomposition();
     test_maxrgb();
+    test_rgb_waveform();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

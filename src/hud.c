@@ -36,6 +36,7 @@ static const Glyph FONT[] = {
     G('/', 0x04,0x08,0x08,0x10,0x10,0x20,0x20,0x40),
     G('-', 0x00,0x00,0x00,0x7C,0x00,0x00,0x00,0x00),
     G('+', 0x00,0x10,0x10,0x7C,0x10,0x10,0x00,0x00),
+    G('%', 0xC4,0xC8,0x10,0x20,0x40,0x98,0x18,0x00),
     G('=', 0x00,0x00,0x7C,0x00,0x7C,0x00,0x00,0x00),
     G('(', 0x18,0x20,0x40,0x40,0x40,0x40,0x20,0x18),
     G(')', 0x60,0x10,0x08,0x08,0x08,0x08,0x10,0x60),
@@ -133,6 +134,7 @@ enum {
     SLOT_SDR_LABEL,
     SLOT_PLANE_LABEL,
     SLOT_SESSION,
+    SLOT_WAVEFORM,
     SLOT_COUNT,
 };
 
@@ -140,6 +142,9 @@ typedef struct { pl_tex tex; int W, H; } HudSlot;
 
 static HudSlot      slots[SLOT_COUNT];
 static int          hud_scale = 2;
+static int          waveform_cache_src = -1;
+static int          waveform_cache_frame = -1;
+static int          waveform_cache_w = 0, waveform_cache_h = 0;
 
 /* Storage for overlay descriptors passed to libplacebo each frame.
  * Sized once, mutated per-frame. */
@@ -152,6 +157,8 @@ void hud_close(pl_gpu gpu)
         if (slots[s].tex) pl_tex_destroy(gpu, &slots[s].tex);
         slots[s].W = slots[s].H = 0;
     }
+    waveform_cache_src = waveform_cache_frame = -1;
+    waveform_cache_w = waveform_cache_h = 0;
 }
 
 static void ensure_slot(int s, pl_gpu gpu, int W, int H)
@@ -185,13 +192,8 @@ static uint8_t *make_panel(int W, int H, uint8_t alpha)
 
 /* Upload `buf` into a slot's texture and configure overlay_arr[s] +
  * overlay_parts[s] so that the slot renders at the given dst rect. */
-static void commit_slot(int s, pl_gpu gpu, uint8_t *buf,
-                        int dst_x, int dst_y)
+static void position_slot(int s, int dst_x, int dst_y)
 {
-    pl_tex_upload(gpu, pl_tex_transfer_params(
-        .tex = slots[s].tex,
-        .ptr = buf,
-    ));
     overlay_parts[s] = (struct pl_overlay_part){
         .src = { 0, 0, slots[s].W, slots[s].H },
         .dst = { dst_x, dst_y, dst_x + slots[s].W, dst_y + slots[s].H },
@@ -204,6 +206,144 @@ static void commit_slot(int s, pl_gpu gpu, uint8_t *buf,
         .repr     = pl_color_repr_rgb,
         .color    = pl_color_space_srgb,
     };
+}
+
+static void commit_slot(int s, pl_gpu gpu, uint8_t *buf,
+                        int dst_x, int dst_y)
+{
+    pl_tex_upload(gpu, pl_tex_transfer_params(
+        .tex = slots[s].tex,
+        .ptr = buf,
+    ));
+    position_slot(s, dst_x, dst_y);
+}
+
+static void scope_pixel(uint8_t *buf, int W, int H, int x, int y,
+                        int channel, uint8_t value)
+{
+    if (x < 0 || x >= W || y < 0 || y >= H) return;
+    uint8_t *p = &buf[(y * W + x) * 4];
+    if (value > p[channel]) p[channel] = value;
+    if (p[3] < 235) p[3] = 235;
+}
+
+static int waveform_level_y(int top, int bottom, double level)
+{
+    double t = (level - PROBE_WAVEFORM_MIN_SIGNAL) /
+               (PROBE_WAVEFORM_MAX_SIGNAL - PROBE_WAVEFORM_MIN_SIGNAL);
+    return bottom - (int)llround(t * (bottom - top));
+}
+
+static int build_waveform_panel(Renderer *r, Source *sources, int n,
+                                int src, pl_gpu gpu, LayoutRect dst)
+{
+    (void)r;
+    if (src < 0 || src >= n || !sources[src].shown) return -1;
+
+    int W = (int)lroundf(dst.x1 - dst.x0);
+    int H = (int)lroundf(dst.y1 - dst.y0);
+    if (W < 180 || H < 120) return -1;
+    bool resized = slots[SLOT_WAVEFORM].W != W ||
+                   slots[SLOT_WAVEFORM].H != H;
+    ensure_slot(SLOT_WAVEFORM, gpu, W, H);
+    if (!slots[SLOT_WAVEFORM].tex) return -1;
+
+    bool rebuild = resized || waveform_cache_src != src ||
+                   waveform_cache_frame != sources[src].frame_no ||
+                   waveform_cache_w != W || waveform_cache_h != H;
+    if (!rebuild) {
+        position_slot(SLOT_WAVEFORM, (int)lroundf(dst.x0),
+                      (int)lroundf(dst.y0));
+        return 0;
+    }
+
+    uint8_t *buf = make_panel(W, H, 225);
+    if (!buf) return -1;
+    const int left = 46, right = W - 12, top = 28, bottom = H - 24;
+    int plot_w = right - left + 1;
+    int plot_h = bottom - top + 1;
+    size_t plane_size = (size_t)plot_w * (size_t)plot_h;
+    uint32_t *bins = calloc(3 * plane_size, sizeof(*bins));
+    if (!bins) { free(buf); return -1; }
+
+    /* Border and 0/25/50/75/100% grid. The plot itself includes ten
+     * percent guard bands at top and bottom for illegal excursions. */
+    for (int x = left; x <= right; x++) {
+        for (int edge = 0; edge < 2; edge++) {
+            int y = edge ? bottom : top;
+            uint8_t *p = &buf[(y * W + x) * 4];
+            p[0] = p[1] = p[2] = 70; p[3] = 235;
+        }
+    }
+    for (int y = top; y <= bottom; y++) {
+        for (int edge = 0; edge < 2; edge++) {
+            int x = edge ? right : left;
+            uint8_t *p = &buf[(y * W + x) * 4];
+            p[0] = p[1] = p[2] = 70; p[3] = 235;
+        }
+    }
+    for (int level = 0; level <= 100; level += 25) {
+        int y = waveform_level_y(top, bottom, level / 100.0);
+        for (int x = left; x <= right; x++) {
+            uint8_t *p = &buf[(y * W + x) * 4];
+            uint8_t grid = level == 0 || level == 100 ? 80 : 42;
+            p[0] = p[1] = p[2] = grid; p[3] = 235;
+        }
+        char label[8];
+        snprintf(label, sizeof(label), "%d", level);
+        draw_text_color(buf, W, H, 4, y - 4, 1, label,
+                        175, 175, 175);
+    }
+
+    draw_text_color(buf, W, H, 8, 7, 2, "R", 255, 80, 80);
+    draw_text_color(buf, W, H, 22, 7, 2, "G", 80, 255, 80);
+    draw_text_color(buf, W, H, 36, 7, 2, "B", 80, 120, 255);
+    draw_text_color(buf, W, H, 50, 7, 2, " WAVEFORM", 235, 235, 235);
+    draw_text_color(buf, W, H, W - 92, 7, 1, "-10..110%", 150, 150, 150);
+    char source_label[40];
+    snprintf(source_label, sizeof(source_label), "SOURCE %.28s",
+             sources[src].label);
+    draw_text_color(buf, W, H, left, H - 14, 1, source_label,
+                    150, 150, 150);
+
+    uint32_t peaks[3];
+    int samples = 0;
+    bool ok = probe_rgb_waveform(sources[src].shown, plot_w, plot_h, 4,
+                                 bins, peaks, &samples);
+    if (ok) {
+        for (int c = 0; c < 3; c++) {
+            for (int y = 0; y < plot_h; y++) {
+                for (int x = 0; x < plot_w; x++) {
+                    uint32_t count = bins[((size_t)c * plot_h + y) *
+                                          plot_w + x];
+                    if (!count) continue;
+                    int intensity = (int)lroundf(36.0f * sqrtf((float)count));
+                    if (intensity > 255) intensity = 255;
+                    scope_pixel(buf, W, H, left + x, top + y,
+                                c, (uint8_t)intensity);
+                    /* A faint neighbor keeps single-sample traces visible
+                     * on high-DPI displays without smearing the density. */
+                    uint8_t halo = (uint8_t)(intensity / 3);
+                    scope_pixel(buf, W, H, left + x, top + y - 1, c, halo);
+                    scope_pixel(buf, W, H, left + x, top + y + 1, c, halo);
+                }
+            }
+        }
+    } else {
+        draw_text_color(buf, W, H, left + 12, top + 12, 1,
+                        "WAVEFORM UNAVAILABLE FOR PIXEL FORMAT",
+                        255, 120, 80);
+    }
+    free(bins);
+
+    commit_slot(SLOT_WAVEFORM, gpu, buf,
+                (int)lroundf(dst.x0), (int)lroundf(dst.y0));
+    free(buf);
+    waveform_cache_src = src;
+    waveform_cache_frame = sources[src].frame_no;
+    waveform_cache_w = W;
+    waveform_cache_h = H;
+    return 0;
 }
 
 /* Build the multi-line status panel at top-left. */
@@ -686,6 +826,14 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                 }
                 break;
             }
+
+            case LAYOUT_OV_WAVEFORM:
+                if (build_waveform_panel(r, sources, n, ov->src,
+                                         gpu, ov->dst) == 0) {
+                    out->waveform = overlay_arr[SLOT_WAVEFORM];
+                    out->has_waveform = true;
+                }
+                break;
 
             case LAYOUT_OV_PLANE: {
                 const char *big =

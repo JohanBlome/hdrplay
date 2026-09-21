@@ -245,6 +245,7 @@ static void usage(void)
         "                        nominal video-range limits; CLIP marks only\n"
         "                        literal storage endpoints; PLATEAU marks\n"
         "                        locally flat areas near either endpoint.\n"
+        "  --waveform            start with the RGB signal waveform visible\n"
         "  --split               start in split-screen (HDR left, SDR right)\n"
         "  --split-tb            split top/bottom instead of left/right\n"
         "  --split-diag          diagonal split: HDR upper-left, SDR lower-right\n"
@@ -305,6 +306,7 @@ static void usage(void)
         "                        M=toggle luminance probe (mouse → nits)\n"
         "                        I=show/hide top-left status HUD\n"
         "                        A=show/hide accumulated stats panel\n"
+        "                        V=show/hide RGB signal waveform\n"
         "                        shift-A=reset accumulated stats\n"
         "                        ←/→=seek -10s/+10s\n"
         "                        . / , =step one frame fwd/back\n"
@@ -455,6 +457,7 @@ int main(int argc, char **argv)
     int  start_orient = HDRPLAY_SPLIT_LR;
     bool split_explicit = false;   /* user picked an orientation */
     bool loop_at_eof = false;
+    bool start_waveform = false;
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
     float sdr_saturation    = 1.0f;   /* 1.0 = libplacebo native; >1 shifts saturated reds toward orange */
     const struct pl_gamut_map_function *sdr_gamut_map = &pl_gamut_map_perceptual;
@@ -478,6 +481,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--list-displays")) list_displays_only = true;
         else if (!strcmp(argv[i], "--diagnose")) diagnose_only = true;
         else if (!strcmp(argv[i], "--analyze"))  analyze_only = true;
+        else if (!strcmp(argv[i], "--waveform")) start_waveform = true;
         else if (!strcmp(argv[i], "--json"))     analyze_json = true;
         else if (!strcmp(argv[i], "--stride") && i+1 < argc)
             analyze_stride = atoi(argv[++i]);
@@ -631,6 +635,7 @@ int main(int argc, char **argv)
     rend.split_orient = start_orient;
     rend.plane_view = start_plane;
     rend.loop_enabled = loop_at_eof;
+    rend.waveform_visible = start_waveform;
     rend.hlg_peak_override = (float)hlg_peak;
     rend.ambient_reference_override = ambient_reference;
     rend.ambient_lux_override = ambient_lux;
@@ -846,6 +851,11 @@ int main(int argc, char **argv)
                 if (e.key.key == SDLK_I) {
                     rend.hud_hidden = !rend.hud_hidden;
                     LOG("REND", "status HUD %s", rend.hud_hidden ? "HIDDEN" : "SHOWN");
+                }
+                if (e.key.key == SDLK_V) {
+                    rend.waveform_visible = !rend.waveform_visible;
+                    LOG("REND", "RGB waveform %s",
+                        rend.waveform_visible ? "ON" : "OFF");
                 }
                 /* W resizes the window so the focused source lands at
                  * exactly 1:1 with no letterbox.

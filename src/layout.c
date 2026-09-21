@@ -210,6 +210,32 @@ static LayoutRect session_rect(const LayoutInput *in, bool two_pane)
                 in->win_w - MARGIN, in->win_h - MARGIN);
 }
 
+static LayoutRect waveform_rect(const LayoutInput *in, bool two_pane)
+{
+    /* A scope must be wholly owned by one render pass. In LR/TB A/B
+     * layouts, constrain it to the lower/right-hand pane; single-pass
+     * layouts can use the full window. If the session panel is visible,
+     * put the waveform in the opposite corner where that is possible. */
+    float x0 = 0.0f, x1 = (float)in->win_w;
+    float y0 = 0.0f, y1 = (float)in->win_h;
+    if (two_pane && in->orient == HDRPLAY_SPLIT_LR)
+        x0 = in->win_w / 2.0f;
+    else if (two_pane && in->orient == HDRPLAY_SPLIT_TB)
+        y0 = in->win_h / 2.0f;
+
+    float avail_w = x1 - x0 - 2.0f * MARGIN;
+    float avail_h = y1 - y0 - 2.0f * MARGIN;
+    float w = avail_w < 640.0f ? avail_w : 640.0f;
+    float h = avail_h < 360.0f ? avail_h : 360.0f;
+    if (w < 0.0f) w = 0.0f;
+    if (h < 0.0f) h = 0.0f;
+
+    bool put_left = in->session_panel &&
+                    !(two_pane && in->orient == HDRPLAY_SPLIT_LR);
+    float left = put_left ? x0 + MARGIN : x1 - MARGIN - w;
+    return rect(left, y1 - MARGIN - h, left + w, y1 - MARGIN);
+}
+
 /* Badge positions, matching hud.c's existing placement. */
 static void label_rects(const LayoutInput *in, LayoutRect *a, LayoutRect *b)
 {
@@ -297,6 +323,9 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
         add_ov(p, LAYOUT_OV_INTERMEDIATE, src, full);
     }
 
+    if (in->waveform_visible)
+        add_ov(p, LAYOUT_OV_WAVEFORM, src, waveform_rect(in, false));
+
     if (!in->hud_hidden)
         add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
 
@@ -378,6 +407,9 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
             .dst = tb, .image_crop = ib_ };
         add_ov(p, LAYOUT_OV_INTERMEDIATE, b, full);
 
+        if (in->waveform_visible)
+            add_ov(p, LAYOUT_OV_WAVEFORM, a, waveform_rect(in, false));
+
         if (!in->hud_hidden)   add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
         add_ov(p, LAYOUT_OV_PLANE, -1, plane_rect(in));
         add_ov(p, LAYOUT_OV_LABEL_A, -1, la);
@@ -449,6 +481,12 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
         add_ov(pb, LAYOUT_OV_INTERMEDIATE, b, full);
     }
 
+    if (in->waveform_visible) {
+        LayoutRect wr = waveform_rect(in, true);
+        add_ov(rect_contains(ca, wr) ? pa : pb,
+               LAYOUT_OV_WAVEFORM, a, wr);
+    }
+
     /* Route each panel to the pass whose crop contains it. Panels are
      * positioned so this is unambiguous; the containment test is here
      * so a future move cannot silently put one in the wrong pass. */
@@ -508,6 +546,9 @@ static void plan_diff(const LayoutInput *in, LayoutPlan *out)
 
     /* The diff is opaque, so it must precede the diagnostic overlays. */
     add_ov(&out->pass[0], LAYOUT_OV_DIFF, -1, full);
+    if (in->waveform_visible)
+        add_ov(&out->pass[0], LAYOUT_OV_WAVEFORM,
+               layout_reference_source(in), waveform_rect(in, false));
     if (!in->hud_hidden)
         add_ov(&out->pass[0], LAYOUT_OV_STATUS, -1, status_rect());
     add_ov(&out->pass[0], LAYOUT_OV_PLANE, -1, plane_rect(in));
