@@ -134,7 +134,7 @@ enum {
     SLOT_SDR_LABEL,
     SLOT_PLANE_LABEL,
     SLOT_SESSION,
-    SLOT_WAVEFORM,
+    SLOT_SCOPE,
     SLOT_COUNT,
 };
 
@@ -142,9 +142,10 @@ typedef struct { pl_tex tex; int W, H; } HudSlot;
 
 static HudSlot      slots[SLOT_COUNT];
 static int          hud_scale = 2;
-static int          waveform_cache_src = -1;
-static int          waveform_cache_frame = -1;
-static int          waveform_cache_w = 0, waveform_cache_h = 0;
+static int          scope_cache_src = -1;
+static int          scope_cache_frame = -1;
+static int          scope_cache_w = 0, scope_cache_h = 0;
+static HdrplayScopeView scope_cache_view = HDRPLAY_SCOPE_OFF;
 
 /* Storage for overlay descriptors passed to libplacebo each frame.
  * Sized once, mutated per-frame. */
@@ -157,8 +158,9 @@ void hud_close(pl_gpu gpu)
         if (slots[s].tex) pl_tex_destroy(gpu, &slots[s].tex);
         slots[s].W = slots[s].H = 0;
     }
-    waveform_cache_src = waveform_cache_frame = -1;
-    waveform_cache_w = waveform_cache_h = 0;
+    scope_cache_src = scope_cache_frame = -1;
+    scope_cache_w = scope_cache_h = 0;
+    scope_cache_view = HDRPLAY_SCOPE_OFF;
 }
 
 static void ensure_slot(int s, pl_gpu gpu, int W, int H)
@@ -243,23 +245,28 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
     int W = (int)lroundf(dst.x1 - dst.x0);
     int H = (int)lroundf(dst.y1 - dst.y0);
     if (W < 180 || H < 120) return -1;
-    bool resized = slots[SLOT_WAVEFORM].W != W ||
-                   slots[SLOT_WAVEFORM].H != H;
-    ensure_slot(SLOT_WAVEFORM, gpu, W, H);
-    if (!slots[SLOT_WAVEFORM].tex) return -1;
+    bool resized = slots[SLOT_SCOPE].W != W || slots[SLOT_SCOPE].H != H;
+    ensure_slot(SLOT_SCOPE, gpu, W, H);
+    if (!slots[SLOT_SCOPE].tex) return -1;
 
-    bool rebuild = resized || waveform_cache_src != src ||
-                   waveform_cache_frame != sources[src].frame_no ||
-                   waveform_cache_w != W || waveform_cache_h != H;
+    bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_WAVEFORM ||
+                   scope_cache_src != src ||
+                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_w != W || scope_cache_h != H;
     if (!rebuild) {
-        position_slot(SLOT_WAVEFORM, (int)lroundf(dst.x0),
+        position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
                       (int)lroundf(dst.y0));
         return 0;
     }
 
     uint8_t *buf = make_panel(W, H, 225);
     if (!buf) return -1;
-    const int left = 46, right = W - 12, top = 28, bottom = H - 24;
+    int detail_scale = W >= 1000 && H >= 500 ? 2 : 1;
+    int title_scale = W >= 1000 && H >= 400 ? 3 : 2;
+    int left = detail_scale > 1 ? 52 : 46;
+    int right = W - 12;
+    int top = 12 + FONT_H * title_scale;
+    int bottom = H - 12 - FONT_H * detail_scale;
     int plot_w = right - left + 1;
     int plot_h = bottom - top + 1;
     size_t plane_size = (size_t)plot_w * (size_t)plot_h;
@@ -291,19 +298,26 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
         }
         char label[8];
         snprintf(label, sizeof(label), "%d", level);
-        draw_text_color(buf, W, H, 4, y - 4, 1, label,
+        draw_text_color(buf, W, H, 4, y - 4 * detail_scale,
+                        detail_scale, label,
                         175, 175, 175);
     }
 
-    draw_text_color(buf, W, H, 8, 7, 2, "R", 255, 80, 80);
-    draw_text_color(buf, W, H, 22, 7, 2, "G", 80, 255, 80);
-    draw_text_color(buf, W, H, 36, 7, 2, "B", 80, 120, 255);
-    draw_text_color(buf, W, H, 50, 7, 2, " WAVEFORM", 235, 235, 235);
-    draw_text_color(buf, W, H, W - 92, 7, 1, "-10..110%", 150, 150, 150);
+    int glyph_advance = (FONT_W + 1) * title_scale;
+    draw_text_color(buf, W, H, 8, 7, title_scale, "R", 255, 80, 80);
+    draw_text_color(buf, W, H, 8 + glyph_advance, 7, title_scale,
+                    "G", 80, 255, 80);
+    draw_text_color(buf, W, H, 8 + 2 * glyph_advance, 7, title_scale,
+                    "B", 80, 120, 255);
+    draw_text_color(buf, W, H, 8 + 3 * glyph_advance, 7, title_scale,
+                    " WAVEFORM", 235, 235, 235);
+    draw_text_color(buf, W, H, W - 8 - 9 * (FONT_W + 1) * detail_scale,
+                    7, detail_scale, "-10..110%", 150, 150, 150);
     char source_label[40];
     snprintf(source_label, sizeof(source_label), "SOURCE %.28s",
              sources[src].label);
-    draw_text_color(buf, W, H, left, H - 14, 1, source_label,
+    draw_text_color(buf, W, H, left, H - 6 - FONT_H * detail_scale,
+                    detail_scale, source_label,
                     150, 150, 150);
 
     uint32_t peaks[3];
@@ -336,13 +350,275 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
     }
     free(bins);
 
-    commit_slot(SLOT_WAVEFORM, gpu, buf,
+    commit_slot(SLOT_SCOPE, gpu, buf,
                 (int)lroundf(dst.x0), (int)lroundf(dst.y0));
     free(buf);
-    waveform_cache_src = src;
-    waveform_cache_frame = sources[src].frame_no;
-    waveform_cache_w = W;
-    waveform_cache_h = H;
+    scope_cache_src = src;
+    scope_cache_frame = sources[src].frame_no;
+    scope_cache_w = W;
+    scope_cache_h = H;
+    scope_cache_view = HDRPLAY_SCOPE_WAVEFORM;
+    return 0;
+}
+
+typedef struct { double x, y; } ScopeXY;
+
+static void gamut_to_pixel(double x, double y,
+                           int left, int top, int plot_w, int plot_h,
+                           int *px, int *py)
+{
+    *px = left + (int)lround(x / PROBE_GAMUT_X_MAX * (plot_w - 1));
+    *py = top + plot_h - 1 -
+          (int)lround(y / PROBE_GAMUT_Y_MAX * (plot_h - 1));
+}
+
+static void draw_scope_line(uint8_t *buf, int W, int H,
+                            int x0, int y0, int x1, int y1,
+                            uint8_t red, uint8_t green, uint8_t blue)
+{
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < W && y0 >= 0 && y0 < H) {
+            uint8_t *p = &buf[(y0 * W + x0) * 4];
+            if (red   > p[0]) p[0] = red;
+            if (green > p[1]) p[1] = green;
+            if (blue  > p[2]) p[2] = blue;
+            if (p[3] < 235) p[3] = 235;
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void draw_gamut_triangle(uint8_t *buf, int W, int H,
+                                int left, int top, int plot_w, int plot_h,
+                                const ScopeXY tri[3],
+                                uint8_t red, uint8_t green, uint8_t blue)
+{
+    for (int i = 0; i < 3; i++) {
+        int j = (i + 1) % 3;
+        int x0, y0, x1, y1;
+        gamut_to_pixel(tri[i].x, tri[i].y, left, top, plot_w, plot_h,
+                       &x0, &y0);
+        gamut_to_pixel(tri[j].x, tri[j].y, left, top, plot_w, plot_h,
+                       &x1, &y1);
+        draw_scope_line(buf, W, H, x0, y0, x1, y1, red, green, blue);
+    }
+}
+
+static void xy_display_rgb(double x, double y, uint8_t out[3])
+{
+    if (!(y > 1e-9)) { out[0] = out[1] = out[2] = 180; return; }
+    double X = x / y, Y = 1.0, Z = (1.0 - x - y) / y;
+    double rgb[3] = {
+         3.2406 * X - 1.5372 * Y - 0.4986 * Z,
+        -0.9689 * X + 1.8758 * Y + 0.0415 * Z,
+         0.0557 * X - 0.2040 * Y + 1.0570 * Z,
+    };
+    double hi = fmax(rgb[0], fmax(rgb[1], rgb[2]));
+    if (!(hi > 0.0)) hi = 1.0;
+    for (int c = 0; c < 3; c++) {
+        double v = rgb[c] / hi;
+        if (v < 0.0) v = 0.0;
+        if (v > 1.0) v = 1.0;
+        v = v <= 0.0031308 ? 12.92 * v
+                           : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+        out[c] = (uint8_t)lround(v * 255.0);
+    }
+}
+
+static int build_gamut_panel(Renderer *r, Source *sources, int n,
+                             int src, pl_gpu gpu, LayoutRect dst)
+{
+    (void)r;
+    if (src < 0 || src >= n || !sources[src].shown) return -1;
+
+    int W = (int)lroundf(dst.x1 - dst.x0);
+    int H = (int)lroundf(dst.y1 - dst.y0);
+    if (W < 240 || H < 180) return -1;
+    bool resized = slots[SLOT_SCOPE].W != W || slots[SLOT_SCOPE].H != H;
+    ensure_slot(SLOT_SCOPE, gpu, W, H);
+    if (!slots[SLOT_SCOPE].tex) return -1;
+    bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_GAMUT ||
+                   scope_cache_src != src ||
+                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_w != W || scope_cache_h != H;
+    if (!rebuild) {
+        position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
+                      (int)lroundf(dst.y0));
+        return 0;
+    }
+
+    uint8_t *buf = make_panel(W, H, 225);
+    if (!buf) return -1;
+    int detail_scale = W >= 1000 && H >= 500 ? 2 : 1;
+    int title_scale = W >= 1000 && H >= 400 ? 3 : 2;
+    int top = 12 + FONT_H * title_scale;
+    int bottom = H - 18;
+    int left = 46;
+    int available_w = W - left - 18;
+    int available_h = bottom - top + 1;
+    double scale = fmin(available_w / PROBE_GAMUT_X_MAX,
+                        available_h / PROBE_GAMUT_Y_MAX);
+    int plot_w = (int)floor(PROBE_GAMUT_X_MAX * scale);
+    int plot_h = (int)floor(PROBE_GAMUT_Y_MAX * scale);
+    int right = left + plot_w - 1;
+    int plot_bottom = top + plot_h - 1;
+
+    for (int tenth = 0; tenth <= 8; tenth++) {
+        int x, unused;
+        gamut_to_pixel(tenth / 10.0, 0.0, left, top, plot_w, plot_h,
+                       &x, &unused);
+        draw_scope_line(buf, W, H, x, top, x, plot_bottom, 34, 34, 34);
+    }
+    for (int tenth = 0; tenth <= 9; tenth++) {
+        int unused, y;
+        gamut_to_pixel(0.0, tenth / 10.0, left, top, plot_w, plot_h,
+                       &unused, &y);
+        draw_scope_line(buf, W, H, left, y, right, y, 34, 34, 34);
+    }
+
+    int bin_h = plot_h < 512 ? plot_h : 512;
+    int bin_w = (int)lround(bin_h * PROBE_GAMUT_X_MAX /
+                            PROBE_GAMUT_Y_MAX);
+    if (bin_w > plot_w) bin_w = plot_w;
+    size_t bin_count = (size_t)bin_w * (size_t)bin_h;
+    uint32_t *bins = calloc(bin_count, sizeof(*bins));
+    if (!bins) { free(buf); return -1; }
+    uint32_t peak = 0;
+    ProbeGamutStats stats;
+    bool ok = probe_xy_gamut(sources[src].shown, bin_w, bin_h, 8,
+                             bins, &peak, &stats);
+    if (ok) {
+        for (int by = 0; by < bin_h; by++) {
+            for (int bx = 0; bx < bin_w; bx++) {
+                uint32_t count = bins[(size_t)by * bin_w + bx];
+                if (!count) continue;
+                int intensity = (int)lroundf(48.0f * sqrtf((float)count));
+                if (intensity > 255) intensity = 255;
+                double x = ((double)bx + 0.5) / bin_w * PROBE_GAMUT_X_MAX;
+                double y = (1.0 - ((double)by + 0.5) / bin_h) *
+                           PROBE_GAMUT_Y_MAX;
+                uint8_t color[3];
+                xy_display_rgb(x, y, color);
+                int x0 = left + bx * plot_w / bin_w;
+                int x1 = left + (bx + 1) * plot_w / bin_w;
+                int y0 = top + by * plot_h / bin_h;
+                int y1 = top + (by + 1) * plot_h / bin_h;
+                if (x1 <= x0) x1 = x0 + 1;
+                if (y1 <= y0) y1 = y0 + 1;
+                for (int py = y0; py < y1; py++)
+                    for (int px = x0; px < x1; px++)
+                        for (int c = 0; c < 3; c++)
+                            scope_pixel(buf, W, H, px, py, c,
+                                (uint8_t)(color[c] * intensity / 255));
+            }
+        }
+    }
+    free(bins);
+
+    static const ScopeXY locus[] = {
+        { .1741, .0050 }, { .1733, .0048 }, { .1689, .0069 },
+        { .1440, .0297 }, { .0913, .1327 }, { .0454, .2950 },
+        { .0082, .5384 }, { .0139, .7502 }, { .0743, .8338 },
+        { .1547, .8059 }, { .2296, .7543 }, { .3016, .6923 },
+        { .3731, .6245 }, { .4441, .5547 }, { .5125, .4866 },
+        { .5752, .4242 }, { .6270, .3725 }, { .6658, .3340 },
+        { .6915, .3083 }, { .7079, .2920 }, { .7190, .2809 },
+        { .7347, .2653 },
+    };
+    for (size_t i = 1; i < sizeof(locus) / sizeof(locus[0]); i++) {
+        int x0, y0, x1, y1;
+        gamut_to_pixel(locus[i - 1].x, locus[i - 1].y,
+                       left, top, plot_w, plot_h, &x0, &y0);
+        gamut_to_pixel(locus[i].x, locus[i].y,
+                       left, top, plot_w, plot_h, &x1, &y1);
+        draw_scope_line(buf, W, H, x0, y0, x1, y1, 100, 100, 100);
+    }
+    int lx0, ly0, lx1, ly1;
+    gamut_to_pixel(locus[sizeof(locus) / sizeof(locus[0]) - 1].x,
+                   locus[sizeof(locus) / sizeof(locus[0]) - 1].y,
+                   left, top, plot_w, plot_h, &lx0, &ly0);
+    gamut_to_pixel(locus[0].x, locus[0].y,
+                   left, top, plot_w, plot_h, &lx1, &ly1);
+    draw_scope_line(buf, W, H, lx0, ly0, lx1, ly1, 100, 100, 100);
+
+    static const ScopeXY rec709[3] = {
+        { .640, .330 }, { .300, .600 }, { .150, .060 },
+    };
+    static const ScopeXY p3[3] = {
+        { .680, .320 }, { .265, .690 }, { .150, .060 },
+    };
+    static const ScopeXY rec2020[3] = {
+        { .708, .292 }, { .170, .797 }, { .131, .046 },
+    };
+    draw_gamut_triangle(buf, W, H, left, top, plot_w, plot_h,
+                        rec2020, 60, 190, 220);
+    draw_gamut_triangle(buf, W, H, left, top, plot_w, plot_h,
+                        p3, 220, 190, 60);
+    draw_gamut_triangle(buf, W, H, left, top, plot_w, plot_h,
+                        rec709, 210, 210, 210);
+    int wx, wy;
+    gamut_to_pixel(.3127, .3290, left, top, plot_w, plot_h, &wx, &wy);
+    draw_scope_line(buf, W, H, wx - 3, wy, wx + 3, wy, 255, 255, 255);
+    draw_scope_line(buf, W, H, wx, wy - 3, wx, wy + 3, 255, 255, 255);
+
+    draw_text_color(buf, W, H, 8, 7, title_scale,
+                    "CIE XY GAMUT", 235, 235, 235);
+    int info_x = right + 16;
+    if (info_x + 120 * detail_scale < W) {
+        char line[80];
+        int line_step = FONT_H * detail_scale + 8;
+        draw_text_color(buf, W, H, info_x, top, detail_scale,
+                        "PIXELS OUTSIDE", 190, 190, 190);
+        double outside709 = stats.samples
+            ? 100.0 * stats.outside_709 / stats.samples : 0.0;
+        double outsidep3 = stats.samples
+            ? 100.0 * stats.outside_p3 / stats.samples : 0.0;
+        snprintf(line, sizeof(line), "709  %.2f%%", outside709);
+        draw_text_color(buf, W, H, info_x, top + line_step,
+                        detail_scale, line,
+                        220, 220, 220);
+        snprintf(line, sizeof(line), "P3   %.2f%%", outsidep3);
+        draw_text_color(buf, W, H, info_x, top + 2 * line_step,
+                        detail_scale, line,
+                        235, 205, 70);
+        draw_text_color(buf, W, H, info_x, top + 4 * line_step,
+                        detail_scale,
+                        "TRIANGLES", 190, 190, 190);
+        draw_text_color(buf, W, H, info_x, top + 5 * line_step,
+                        detail_scale,
+                        "709", 220, 220, 220);
+        draw_text_color(buf, W, H, info_x, top + 6 * line_step,
+                        detail_scale,
+                        "P3", 235, 205, 70);
+        draw_text_color(buf, W, H, info_x, top + 7 * line_step,
+                        detail_scale,
+                        "2020", 60, 190, 220);
+        snprintf(line, sizeof(line), "TAG %s",
+                 av_color_primaries_name(sources[src].shown->color_primaries)
+                    ?: "UNSPECIFIED");
+        draw_text_color(buf, W, H, info_x, top + 9 * line_step,
+                        detail_scale, line,
+                        170, 170, 170);
+    }
+    if (!ok)
+        draw_text_color(buf, W, H, left + 12, top + 12, 1,
+                        "GAMUT UNAVAILABLE FOR PIXEL FORMAT",
+                        255, 120, 80);
+
+    commit_slot(SLOT_SCOPE, gpu, buf,
+                (int)lroundf(dst.x0), (int)lroundf(dst.y0));
+    free(buf);
+    scope_cache_src = src;
+    scope_cache_frame = sources[src].frame_no;
+    scope_cache_w = W;
+    scope_cache_h = H;
+    scope_cache_view = HDRPLAY_SCOPE_GAMUT;
     return 0;
 }
 
@@ -827,13 +1103,18 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                 break;
             }
 
-            case LAYOUT_OV_WAVEFORM:
-                if (build_waveform_panel(r, sources, n, ov->src,
-                                         gpu, ov->dst) == 0) {
-                    out->waveform = overlay_arr[SLOT_WAVEFORM];
-                    out->has_waveform = true;
+            case LAYOUT_OV_SCOPE: {
+                int rc = r->scope_view == HDRPLAY_SCOPE_GAMUT
+                       ? build_gamut_panel(r, sources, n, ov->src,
+                                           gpu, ov->dst)
+                       : build_waveform_panel(r, sources, n, ov->src,
+                                              gpu, ov->dst);
+                if (rc == 0) {
+                    out->scope = overlay_arr[SLOT_SCOPE];
+                    out->has_scope = true;
                 }
                 break;
+            }
 
             case LAYOUT_OV_PLANE: {
                 const char *big =

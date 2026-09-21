@@ -162,6 +162,7 @@ git clone --depth 1 https://github.com/libsdl-org/SDL && \
 hdrplay video.mp4
 hdrplay -f video.mp4                  # fullscreen HDR playback
 hdrplay --waveform video.mp4          # start with the RGB waveform
+hdrplay --gamut video.mp4             # start with the CIE gamut scope
 hdrplay first.mov second.mov          # synchronized comparison
 ```
 
@@ -174,7 +175,7 @@ hdrplay first.mov second.mov          # synchronized comparison
 | `P` | HDR/SDR split for one file; comparison for two files |
 | `O` | cycle split orientation and comparison wipes |
 | `C` | cycle color, Y, Cb, Cr, legal, clip and plateau views |
-| `V` | toggle RGB waveform |
+| `V` | cycle scopes: off, RGB waveform, CIE gamut |
 | `D` | toggle current/previous or A/B difference |
 | `Space` | pause or resume |
 | `.` / `,` | step one frame forward or backward |
@@ -219,10 +220,12 @@ Start directly in a component view with `--plane y`, `--plane cb` or
 `--plane cr`; `--plane legal`, `--plane clip` and `--plane plateau` start the
 false-color views, and `u`, `v` and `flat` are accepted aliases.
 
-### RGB waveform
+### Video scopes
 
-Press `V` to toggle a channel-overlaid RGB waveform, or start with it visible
-using `--waveform`. Horizontal position follows the source image; vertical
+Press `V` to cycle between no scope, a channel-overlaid RGB waveform and a CIE
+1931 xy gamut plot. `--waveform` and `--gamut` select either scope at startup.
+
+In the waveform, horizontal position follows the source image and vertical
 position is the encoded R'G'B' signal level before transfer conversion, HLG
 processing, tone mapping or display color management. Red, green and blue
 traces are density-weighted and add to white where the channels coincide.
@@ -231,8 +234,16 @@ The grid marks nominal 0%, 25%, 50%, 75% and 100%, with -10% and 110% guard
 bands retained above and below. Those guard bands make range excursions and
 capture-processing overshoot visible instead of clipping them at the edge of
 the graph. The scope occupies 40% of the framebuffer in each dimension, with
-a 640x360-pixel minimum where space permits. In two-file comparison, it stays
-inside one pane and follows the focused (first visible) source.
+a 640x360-pixel minimum where space permits.
+
+The gamut plot converts sampled source pixels to CIE xy chromaticity and draws
+Rec.709, Display-P3 and BT.2020 boundaries. It reports the percentage of
+non-black samples outside Rec.709 and Display-P3. This distinguishes declared
+primaries from actual gamut use: a BT.2020-tagged file can still contain only
+Rec.709 colors.
+
+In two-file comparison, the active scope stays inside one pane and follows the
+focused (first visible) source.
 
 ### Rotation
 
@@ -468,10 +479,10 @@ libplacebo behavior and HDR/SDR brightness handling.
 | `src/main.c`        | arg parse, event loop, frame pump, key handling |
 | `src/decoder.c`     | ffmpeg demux + decode, HDR side-data extraction |
 | `src/renderer.c`    | SDL3, Vulkan and libplacebo initialization and rendering |
-| `src/hud.c`         | status panels, labels and RGB waveform overlay |
+| `src/hud.c`         | status panels, labels, waveform and gamut scope overlays |
 | `src/diagnose.c`    | `--diagnose` HDR sanity checks (per-display PASS/WARN/FAIL) |
 | `src/brightness.c`  | `--set-brightness` via IOKit / `brightness` CLI / m1ddc |
-| `src/probe.c`       | source-signal probes, RGB waveform and luminance statistics |
+| `src/probe.c`       | source-signal probes, waveform/gamut data and luminance statistics |
 | `src/stats.c`       | session accumulation: PTS-deduped histograms, percentiles, spread decomposition |
 | `src/layout.c`      | pure render planning: passes, crops, masks, overlay routing (GPU-free, so it can be tested) |
 | `src/source.c`      | one input: decode, frame ring for step-back, clock following |

@@ -554,6 +554,37 @@ static void test_rgb_waveform(void)
     av_frame_free(&f);
 }
 
+static void test_xy_gamut(void)
+{
+    puts("CIE xy gamut scope");
+    CHECK(xy_in_triangle(.300, .600, .640, .330, .300, .600,
+                         .150, .060),
+          "Rec.709 green vertex is inside Rec.709");
+    CHECK(!xy_in_triangle(.680, .320, .640, .330, .300, .600,
+                          .150, .060),
+          "Display-P3 red extends outside Rec.709");
+    CHECK(xy_in_triangle(.680, .320, .680, .320, .265, .690,
+                         .150, .060),
+          "Display-P3 red is inside Display-P3");
+
+    AVFrame *f = mkframe(AV_PIX_FMT_P010LE, 16, 16,
+                         AVCOL_TRC_ARIB_STD_B67, 502);
+    enum { W = 64, H = 64 };
+    uint32_t bins[W * H];
+    uint32_t peak = 0;
+    ProbeGamutStats stats;
+    CHECK(probe_xy_gamut(f, W, H, 2, bins, &peak, &stats),
+          "P010 source produces a CIE gamut density plot");
+    uint64_t total = 0;
+    for (int i = 0; i < W * H; i++) total += bins[i];
+    CHECK(stats.samples == 64 && total == 64,
+          "all 64 non-black samples land in the plot");
+    CHECK(stats.outside_709 == 0 && stats.outside_p3 == 0,
+          "neutral samples remain inside Rec.709 and Display-P3");
+    CHECK(peak == 64, "coincident neutral samples retain density");
+    av_frame_free(&f);
+}
+
 int main(void)
 {
     test_lut_equivalence();
@@ -569,6 +600,7 @@ int main(void)
     test_variance_decomposition();
     test_maxrgb();
     test_rgb_waveform();
+    test_xy_gamut();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

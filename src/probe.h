@@ -261,4 +261,19 @@ bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
                         int vertical_stride, uint32_t *bins,
                         uint32_t peak_count[3], int *out_samples);
 
+/* CIE 1931 xy density plot of the source pixels. The plot covers
+ * x=0..0.8 and y=0..0.9. Near-black samples are omitted because their
+ * chromaticity is numerically unstable and visually meaningless. */
+#define PROBE_GAMUT_X_MAX 0.8
+#define PROBE_GAMUT_Y_MAX 0.9
+typedef struct {
+    uint64_t samples;
+    uint64_t outside_709;
+    uint64_t outside_p3;
+} ProbeGamutStats;
+
+bool probe_xy_gamut(const AVFrame *frame, int width, int height,
+                    int sample_stride, uint32_t *bins,
+                    uint32_t *peak_count, ProbeGamutStats *stats);
+
 #endif

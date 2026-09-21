@@ -210,7 +210,7 @@ static LayoutRect session_rect(const LayoutInput *in, bool two_pane)
                 in->win_w - MARGIN, in->win_h - MARGIN);
 }
 
-static LayoutRect waveform_rect(const LayoutInput *in, bool two_pane)
+static LayoutRect scope_rect(const LayoutInput *in, bool two_pane)
 {
     /* A scope must be wholly owned by one render pass. In LR/TB A/B
      * layouts, constrain it to the lower/right-hand pane; single-pass
@@ -330,8 +330,8 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
         add_ov(p, LAYOUT_OV_INTERMEDIATE, src, full);
     }
 
-    if (in->waveform_visible)
-        add_ov(p, LAYOUT_OV_WAVEFORM, src, waveform_rect(in, false));
+    if (in->scope_visible)
+        add_ov(p, LAYOUT_OV_SCOPE, src, scope_rect(in, false));
 
     if (!in->hud_hidden)
         add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
@@ -414,8 +414,8 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
             .dst = tb, .image_crop = ib_ };
         add_ov(p, LAYOUT_OV_INTERMEDIATE, b, full);
 
-        if (in->waveform_visible)
-            add_ov(p, LAYOUT_OV_WAVEFORM, a, waveform_rect(in, false));
+        if (in->scope_visible)
+            add_ov(p, LAYOUT_OV_SCOPE, a, scope_rect(in, false));
 
         if (!in->hud_hidden)   add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
         add_ov(p, LAYOUT_OV_PLANE, -1, plane_rect(in));
@@ -488,10 +488,10 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
         add_ov(pb, LAYOUT_OV_INTERMEDIATE, b, full);
     }
 
-    if (in->waveform_visible) {
-        LayoutRect wr = waveform_rect(in, true);
+    if (in->scope_visible) {
+        LayoutRect wr = scope_rect(in, true);
         add_ov(rect_contains(ca, wr) ? pa : pb,
-               LAYOUT_OV_WAVEFORM, a, wr);
+               LAYOUT_OV_SCOPE, a, wr);
     }
 
     /* Route each panel to the pass whose crop contains it. Panels are
@@ -553,9 +553,9 @@ static void plan_diff(const LayoutInput *in, LayoutPlan *out)
 
     /* The diff is opaque, so it must precede the diagnostic overlays. */
     add_ov(&out->pass[0], LAYOUT_OV_DIFF, -1, full);
-    if (in->waveform_visible)
-        add_ov(&out->pass[0], LAYOUT_OV_WAVEFORM,
-               layout_reference_source(in), waveform_rect(in, false));
+    if (in->scope_visible)
+        add_ov(&out->pass[0], LAYOUT_OV_SCOPE,
+               layout_reference_source(in), scope_rect(in, false));
     if (!in->hud_hidden)
         add_ov(&out->pass[0], LAYOUT_OV_STATUS, -1, status_rect());
     add_ov(&out->pass[0], LAYOUT_OV_PLANE, -1, plane_rect(in));

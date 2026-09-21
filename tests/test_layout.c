@@ -34,7 +34,7 @@ static LayoutInput base_input(void)
         .zoom = 0.0f, .pan_x = 0.5f, .pan_y = 0.5f,
         .hud_hidden = false,
         .session_panel = false,
-        .waveform_visible = false,
+        .scope_visible = false,
     };
 }
 
@@ -145,13 +145,13 @@ static void test_single_file_unchanged(void)
 
     /* RGB waveform is an independent diagnostic overlay. */
     in = base_input();
-    in.waveform_visible = true;
+    in.scope_visible = true;
     layout_plan(&in, &pl);
-    CHECK(count_ov_plan(&pl, LAYOUT_OV_WAVEFORM) == 1,
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_SCOPE) == 1,
           "RGB waveform attached exactly once");
     const LayoutOverlay *w = NULL;
     for (int i = 0; i < pl.pass[0].n_ov; i++)
-        if (pl.pass[0].ov[i].kind == LAYOUT_OV_WAVEFORM)
+        if (pl.pass[0].ov[i].kind == LAYOUT_OV_SCOPE)
             w = &pl.pass[0].ov[i];
     CHECK(w && rect_eq(w->dst, 1136, 632, 1904, 1064),
           "waveform occupies 40%% of a 1920x1080 framebuffer");
@@ -160,7 +160,7 @@ static void test_single_file_unchanged(void)
     layout_plan(&in, &pl);
     w = NULL;
     for (int i = 0; i < pl.pass[0].n_ov; i++)
-        if (pl.pass[0].ov[i].kind == LAYOUT_OV_WAVEFORM)
+        if (pl.pass[0].ov[i].kind == LAYOUT_OV_SCOPE)
             w = &pl.pass[0].ov[i];
     CHECK(w && rect_eq(w->dst, 144, 224, 784, 584),
           "waveform retains its 640x360 minimum when space permits");
@@ -423,7 +423,7 @@ static void test_overlay_routing_is_exclusive(void)
     puts("every overlay lands in exactly one pass");
     LayoutOverlayKind kinds[] = {
         LAYOUT_OV_STATUS, LAYOUT_OV_SESSION,
-        LAYOUT_OV_WAVEFORM, LAYOUT_OV_PLANE,
+        LAYOUT_OV_SCOPE, LAYOUT_OV_PLANE,
         LAYOUT_OV_LABEL_A, LAYOUT_OV_LABEL_B,
     };
     HdrplaySplitOrient orients[] = {
@@ -435,7 +435,7 @@ static void test_overlay_routing_is_exclusive(void)
             LayoutInput in = base_input();
             in.n_sources = 2;
             in.session_panel = true;
-            in.waveform_visible = true;
+            in.scope_visible = true;
             in.orient = orients[o];
             in.mode = (HdrplayMode)m;
             LayoutPlan pl; layout_plan(&in, &pl);
@@ -447,7 +447,7 @@ static void test_overlay_routing_is_exclusive(void)
             CHECK(count_ov_plan(&pl, LAYOUT_OV_PLANE) == 1,
                   "orient %d mode %d: plane badge appears once",
                   (int)o, m);
-            CHECK(count_ov_plan(&pl, LAYOUT_OV_WAVEFORM) == 1,
+            CHECK(count_ov_plan(&pl, LAYOUT_OV_SCOPE) == 1,
                   "orient %d mode %d: waveform appears once",
                   (int)o, m);
         }

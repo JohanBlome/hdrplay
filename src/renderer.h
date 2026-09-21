@@ -28,6 +28,13 @@ typedef enum {
     HDRPLAY_PLANE_COUNT,
 } HdrplayPlaneView;
 
+typedef enum {
+    HDRPLAY_SCOPE_OFF = 0,
+    HDRPLAY_SCOPE_WAVEFORM,
+    HDRPLAY_SCOPE_GAMUT,
+    HDRPLAY_SCOPE_COUNT,
+} HdrplayScopeView;
+
 typedef struct Renderer {
     struct SDL_Window *window;
 
@@ -241,7 +248,7 @@ typedef struct Renderer {
      * the HUD and feeds each frame in. NULL when unavailable. */
     struct SessionStats *session;
     bool   session_panel;       /* 'A' toggles the accumulated panel   */
-    bool   waveform_visible;    /* 'V' toggles RGB source waveform     */
+    HdrplayScopeView scope_view; /* 'V' cycles waveform/gamut/off       */
 
     /* HDR10 static metadata the container DECLARES, copied from the
      * decoder so the HUD can print measured-vs-declared side by side.

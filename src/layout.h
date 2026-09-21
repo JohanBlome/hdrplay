@@ -54,7 +54,7 @@ typedef enum {
     LAYOUT_OV_DIFF,          /* absolute frame-difference texture     */
     LAYOUT_OV_STATUS,        /* top-left status panel                 */
     LAYOUT_OV_SESSION,       /* accumulated-statistics panel          */
-    LAYOUT_OV_WAVEFORM,      /* RGB source-signal waveform            */
+    LAYOUT_OV_SCOPE,         /* waveform or gamut scope               */
     LAYOUT_OV_PLANE,         /* current COLOR/Y/Cb/Cr view badge      */
     LAYOUT_OV_LABEL_A,       /* badge for the first pane              */
     LAYOUT_OV_LABEL_B,       /* badge for the second pane             */
@@ -132,7 +132,7 @@ typedef struct {
 
     bool  hud_hidden;
     bool  session_panel;
-    bool  waveform_visible;
+    bool  scope_visible;
 } LayoutInput;
 
 /* Compute the plan. Pure: same inputs always give the same output, no

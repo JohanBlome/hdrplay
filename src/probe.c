@@ -606,6 +606,163 @@ bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
     return true;
 }
 
+typedef struct {
+    double m[3][3];
+} XyzMatrix;
+
+static XyzMatrix xyz_matrix_for(enum AVColorPrimaries primaries,
+                                enum AVColorSpace matrix)
+{
+    switch (primaries) {
+    case AVCOL_PRI_BT2020:
+        return (XyzMatrix){{
+            { 0.6369580, 0.1446169, 0.1688809 },
+            { 0.2627002, 0.6779981, 0.0593017 },
+            { 0.0000000, 0.0280727, 1.0609851 },
+        }};
+    case AVCOL_PRI_SMPTE432: /* Display P3, D65 */
+        return (XyzMatrix){{
+            { 0.4865710, 0.2656677, 0.1982173 },
+            { 0.2289746, 0.6917385, 0.0792869 },
+            { 0.0000000, 0.0451134, 1.0439444 },
+        }};
+    case AVCOL_PRI_SMPTE431: /* DCI-P3 */
+        return (XyzMatrix){{
+            { 0.4451698, 0.2771344, 0.1722827 },
+            { 0.2094917, 0.7215953, 0.0689131 },
+            { 0.0000000, 0.0470606, 0.9073554 },
+        }};
+    case AVCOL_PRI_BT709:
+        break;
+    default:
+        if (matrix == AVCOL_SPC_BT2020_NCL || matrix == AVCOL_SPC_BT2020_CL)
+            return xyz_matrix_for(AVCOL_PRI_BT2020, matrix);
+        break;
+    }
+    return (XyzMatrix){{
+        { 0.4123908, 0.3575843, 0.1804808 },
+        { 0.2126390, 0.7151687, 0.0721923 },
+        { 0.0193308, 0.1191948, 0.9505322 },
+    }};
+}
+
+static double triangle_sign(double px, double py,
+                            double ax, double ay, double bx, double by)
+{
+    return (px - bx) * (ay - by) - (ax - bx) * (py - by);
+}
+
+static bool xy_in_triangle(double x, double y,
+                           double ax, double ay,
+                           double bx, double by,
+                           double cx, double cy)
+{
+    double d1 = triangle_sign(x, y, ax, ay, bx, by);
+    double d2 = triangle_sign(x, y, bx, by, cx, cy);
+    double d3 = triangle_sign(x, y, cx, cy, ax, ay);
+    bool neg = d1 < -1e-9 || d2 < -1e-9 || d3 < -1e-9;
+    bool pos = d1 >  1e-9 || d2 >  1e-9 || d3 >  1e-9;
+    return !(neg && pos);
+}
+
+bool probe_xy_gamut(const AVFrame *frame, int width, int height,
+                    int sample_stride, uint32_t *bins,
+                    uint32_t *peak_count, ProbeGamutStats *stats)
+{
+    if (peak_count) *peak_count = 0;
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (!frame || !frame->data[0] || !bins || width <= 0 || height <= 0)
+        return false;
+    if (sample_stride < 1) sample_stride = 1;
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    int depth = 0;
+    if (!luma_plane_supported(desc, &depth) ||
+        !chroma_planes_supported(desc))
+        return false;
+    for (int c = 0; c < 3; c++)
+        if (!frame->data[desc->comp[c].plane]) return false;
+
+    size_t count = (size_t)width * (size_t)height;
+    memset(bins, 0, count * sizeof(*bins));
+    bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
+    int max_raw = (1 << depth) - 1;
+    int y_lo = 16 << (depth - 8), y_hi = 235 << (depth - 8);
+    int c_lo = 16 << (depth - 8), c_hi = 240 << (depth - 8);
+    int c_mid = (c_lo + c_hi) / 2;
+    Matrix yuv = matrix_for(frame->colorspace);
+    XyzMatrix xyz = xyz_matrix_for(frame->color_primaries,
+                                   frame->colorspace);
+    const SigLut *linear = sig_lut_get(frame->color_trc);
+    double linear_black = sig_lut_eval(linear, 0.0);
+    ProbeGamutStats local = {0};
+    uint32_t peak = 0;
+
+    for (int sy = 0; sy < frame->height; sy += sample_stride) {
+        for (int sx = 0; sx < frame->width; sx += sample_stride) {
+            int y_raw = read_component(frame, desc, 0, sx, sy);
+            int u_raw = read_component(frame, desc, 1, sx, sy);
+            int v_raw = read_component(frame, desc, 2, sx, sy);
+            double Yn, Cb, Cr;
+            if (full_range) {
+                Yn = (double)y_raw / max_raw;
+                Cb = (double)u_raw / max_raw - 0.5;
+                Cr = (double)v_raw / max_raw - 0.5;
+            } else {
+                Yn = (double)(y_raw - y_lo) / (y_hi - y_lo);
+                Cb = (double)(u_raw - c_mid) / (c_hi - c_lo);
+                Cr = (double)(v_raw - c_mid) / (c_hi - c_lo);
+            }
+
+            double signal[3];
+            signal[0] = Yn + 2.0 * (1.0 - yuv.kr) * Cr;
+            signal[2] = Yn + 2.0 * (1.0 - yuv.kb) * Cb;
+            signal[1] = (Yn - yuv.kr * signal[0] - yuv.kb * signal[2]) /
+                        yuv.kg;
+            double max_signal = fmax(signal[0], fmax(signal[1], signal[2]));
+            if (max_signal <= 0.01) continue;
+
+            double rgb[3];
+            for (int c = 0; c < 3; c++) {
+                double v = signal[c];
+                if (v < 0.0) v = 0.0;
+                if (v > 1.0) v = 1.0;
+                rgb[c] = fmax(0.0, sig_lut_eval(linear, v) - linear_black);
+            }
+            double X = xyz.m[0][0] * rgb[0] + xyz.m[0][1] * rgb[1] +
+                       xyz.m[0][2] * rgb[2];
+            double Y = xyz.m[1][0] * rgb[0] + xyz.m[1][1] * rgb[1] +
+                       xyz.m[1][2] * rgb[2];
+            double Z = xyz.m[2][0] * rgb[0] + xyz.m[2][1] * rgb[1] +
+                       xyz.m[2][2] * rgb[2];
+            double sum = X + Y + Z;
+            if (!(sum > 1e-12)) continue;
+            double x = X / sum, y = Y / sum;
+
+            local.samples++;
+            if (!xy_in_triangle(x, y, 0.640, 0.330, 0.300, 0.600,
+                                0.150, 0.060))
+                local.outside_709++;
+            if (!xy_in_triangle(x, y, 0.680, 0.320, 0.265, 0.690,
+                                0.150, 0.060))
+                local.outside_p3++;
+
+            if (x < 0.0 || x > PROBE_GAMUT_X_MAX ||
+                y < 0.0 || y > PROBE_GAMUT_Y_MAX)
+                continue;
+            int bx = (int)llround(x / PROBE_GAMUT_X_MAX * (width - 1));
+            int by = height - 1 -
+                     (int)llround(y / PROBE_GAMUT_Y_MAX * (height - 1));
+            uint32_t n = ++bins[(size_t)by * width + bx];
+            if (n > peak) peak = n;
+        }
+    }
+
+    if (peak_count) *peak_count = peak;
+    if (stats) *stats = local;
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* BT.2020 -> BT.709 linear conversion, used only to decide whether a  */
 /* pixel's chromaticity falls outside the 709 gamut. Negative output   */
