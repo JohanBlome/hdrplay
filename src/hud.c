@@ -146,6 +146,7 @@ static int          scope_cache_src = -1;
 static int          scope_cache_frame = -1;
 static int          scope_cache_w = 0, scope_cache_h = 0;
 static HdrplayScopeView scope_cache_view = HDRPLAY_SCOPE_OFF;
+static float        scope_cache_vector_gain = 0.0f;
 
 /* Storage for overlay descriptors passed to libplacebo each frame.
  * Sized once, mutated per-frame. */
@@ -161,6 +162,7 @@ void hud_close(pl_gpu gpu)
     scope_cache_src = scope_cache_frame = -1;
     scope_cache_w = scope_cache_h = 0;
     scope_cache_view = HDRPLAY_SCOPE_OFF;
+    scope_cache_vector_gain = 0.0f;
 }
 
 static void ensure_slot(int s, pl_gpu gpu, int W, int H)
@@ -619,6 +621,346 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_GAMUT;
+    return 0;
+}
+
+static void vector_to_pixel(double cb, double cr,
+                            int left, int top, int size,
+                            int *px, int *py)
+{
+    double nx = (cb + PROBE_VECTOR_LIMIT) / (2.0 * PROBE_VECTOR_LIMIT);
+    double ny = (cr + PROBE_VECTOR_LIMIT) / (2.0 * PROBE_VECTOR_LIMIT);
+    *px = left + (int)lround(nx * (size - 1));
+    *py = top + size - 1 - (int)lround(ny * (size - 1));
+}
+
+static void draw_vector_circle(uint8_t *buf, int W, int H,
+                               int left, int top, int size, double radius,
+                               uint8_t level)
+{
+    int old_x = 0, old_y = 0;
+    for (int i = 0; i <= 96; i++) {
+        double a = i * (2.0 * 3.14159265358979323846 / 96.0);
+        int x, y;
+        vector_to_pixel(radius * cos(a), radius * sin(a),
+                        left, top, size, &x, &y);
+        if (i)
+            draw_scope_line(buf, W, H, old_x, old_y, x, y,
+                            level, level, level);
+        old_x = x; old_y = y;
+    }
+}
+
+static int build_vector_panel(Renderer *r, Source *sources, int n,
+                              int src, pl_gpu gpu, LayoutRect dst)
+{
+    if (src < 0 || src >= n || !sources[src].shown) return -1;
+    AVFrame *frame = sources[src].shown;
+
+    int W = (int)lroundf(dst.x1 - dst.x0);
+    int H = (int)lroundf(dst.y1 - dst.y0);
+    if (W < 240 || H < 180) return -1;
+    bool resized = slots[SLOT_SCOPE].W != W || slots[SLOT_SCOPE].H != H;
+    ensure_slot(SLOT_SCOPE, gpu, W, H);
+    if (!slots[SLOT_SCOPE].tex) return -1;
+    bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_VECTOR ||
+                   scope_cache_src != src ||
+                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_w != W || scope_cache_h != H ||
+                   fabsf(scope_cache_vector_gain - r->vector_gain) > 0.01f;
+    if (!rebuild) {
+        position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
+                      (int)lroundf(dst.y0));
+        return 0;
+    }
+
+    uint8_t *buf = make_panel(W, H, 225);
+    if (!buf) return -1;
+    int detail_scale = W >= 1000 && H >= 500 ? 2 : 1;
+    int title_scale = W >= 1000 && H >= 400 ? 3 : 2;
+    int top = 12 + FONT_H * title_scale;
+    int left = 46;
+    int info_reserve = detail_scale > 1 ? 330 : 180;
+    int plot_size = H - top - 24;
+    int max_w = W - left - info_reserve - 16;
+    if (plot_size > max_w) plot_size = max_w;
+    if (plot_size < 100) { free(buf); return -1; }
+    int right = left + plot_size - 1;
+    int bottom = top + plot_size - 1;
+    int cx, cy;
+    vector_to_pixel(0.0, 0.0, left, top, plot_size, &cx, &cy);
+
+    draw_scope_line(buf, W, H, left, cy, right, cy, 55, 55, 55);
+    draw_scope_line(buf, W, H, cx, top, cx, bottom, 55, 55, 55);
+    draw_vector_circle(buf, W, H, left, top, plot_size, .25, 38);
+    draw_vector_circle(buf, W, H, left, top, plot_size, .50, 70);
+
+    int bin_size = plot_size < 512 ? plot_size : 512;
+    size_t bin_count = (size_t)bin_size * (size_t)bin_size;
+    uint32_t *bins = calloc(bin_count, sizeof(*bins));
+    if (!bins) { free(buf); return -1; }
+    uint32_t peak = 0;
+    ProbeVectorStats stats;
+    bool ok = probe_cbcr_vectorscope(frame, bin_size, bin_size, 8,
+                                     r->vector_gain,
+                                     bins, &peak, &stats);
+    if (ok) {
+        for (int by = 0; by < bin_size; by++) {
+            for (int bx = 0; bx < bin_size; bx++) {
+                uint32_t count = bins[(size_t)by * bin_size + bx];
+                if (!count) continue;
+                int intensity = (int)lroundf(48.0f * sqrtf((float)count));
+                if (intensity > 255) intensity = 255;
+                int x0 = left + bx * plot_size / bin_size;
+                int x1 = left + (bx + 1) * plot_size / bin_size;
+                int y0 = top + by * plot_size / bin_size;
+                int y1 = top + (by + 1) * plot_size / bin_size;
+                if (x1 <= x0) x1 = x0 + 1;
+                if (y1 <= y0) y1 = y0 + 1;
+                for (int py = y0; py < y1; py++)
+                    for (int px = x0; px < x1; px++) {
+                        scope_pixel(buf, W, H, px, py, 0,
+                                    (uint8_t)(intensity * 2 / 5));
+                        scope_pixel(buf, W, H, px, py, 1,
+                                    (uint8_t)intensity);
+                        scope_pixel(buf, W, H, px, py, 2,
+                                    (uint8_t)(intensity * 3 / 5));
+                    }
+            }
+        }
+    }
+    free(bins);
+
+    static const char *target_names[6] = { "R", "MG", "B", "CY", "G", "Y" };
+    static const uint8_t target_colors[6][3] = {
+        {255, 70, 70}, {255, 70, 255}, {80, 100, 255},
+        {70, 230, 230}, {70, 230, 70}, {240, 220, 70},
+    };
+    double targets[6][2];
+    bool targets_ok = probe_vectorscope_targets(frame->colorspace, .75,
+                                                 targets);
+    if (targets_ok) {
+        int box = detail_scale > 1 ? 6 : 4;
+        for (int i = 0; i < 6; i++) {
+            int tx, ty;
+            vector_to_pixel(targets[i][0], targets[i][1],
+                            left, top, plot_size, &tx, &ty);
+            draw_scope_line(buf, W, H, tx - box, ty - box,
+                            tx + box, ty - box,
+                            target_colors[i][0], target_colors[i][1],
+                            target_colors[i][2]);
+            draw_scope_line(buf, W, H, tx + box, ty - box,
+                            tx + box, ty + box,
+                            target_colors[i][0], target_colors[i][1],
+                            target_colors[i][2]);
+            draw_scope_line(buf, W, H, tx + box, ty + box,
+                            tx - box, ty + box,
+                            target_colors[i][0], target_colors[i][1],
+                            target_colors[i][2]);
+            draw_scope_line(buf, W, H, tx - box, ty + box,
+                            tx - box, ty - box,
+                            target_colors[i][0], target_colors[i][1],
+                            target_colors[i][2]);
+            draw_text_color(buf, W, H, tx + box + 3,
+                            ty - 4 * detail_scale, detail_scale,
+                            target_names[i], target_colors[i][0],
+                            target_colors[i][1], target_colors[i][2]);
+        }
+    }
+
+    /* Conventional flesh-tone / I-line indicator. This is a practical
+     * camera-grading heuristic at about 123 degrees, not a normative skin
+     * chromaticity and not a detector of whether a pixel is skin. */
+    const double skin_angle = 123.0 * 3.14159265358979323846 / 180.0;
+    int skin_x, skin_y;
+    vector_to_pixel(.50 * cos(skin_angle), .50 * sin(skin_angle),
+                    left, top, plot_size, &skin_x, &skin_y);
+    draw_scope_line(buf, W, H, cx, cy, skin_x, skin_y, 210, 150, 100);
+    draw_text_color(buf, W, H, skin_x + 4,
+                    skin_y - 4 * detail_scale, detail_scale,
+                    "SKIN", 220, 160, 105);
+
+    draw_text_color(buf, W, H, 8, 7, title_scale,
+                    "CB CR VECTORSCOPE", 235, 235, 235);
+    draw_text_color(buf, W, H, right - 10 * (FONT_W + 1) * detail_scale,
+                    cy + 5, detail_scale, "+CB", 140, 140, 140);
+    draw_text_color(buf, W, H, cx + 5, top + 3, detail_scale,
+                    "+CR", 140, 140, 140);
+    int info_x = right + 16;
+    if (info_x + 120 * detail_scale < W) {
+        char line[96];
+        int line_step = FONT_H * detail_scale + 8;
+        draw_text_color(buf, W, H, info_x, top, detail_scale,
+                        "SIGNAL CHROMA", 190, 190, 190);
+        double outside = stats.samples
+            ? 100.0 * stats.outside_nominal / stats.samples : 0.0;
+        snprintf(line, sizeof(line), "OUTSIDE %.2f%%", outside);
+        draw_text_color(buf, W, H, info_x, top + line_step,
+                        detail_scale, line, 180, 220, 180);
+        snprintf(line, sizeof(line), "MATRIX %s",
+                 av_color_space_name(frame->colorspace) ?: "UNSPECIFIED");
+        draw_text_color(buf, W, H, info_x, top + 3 * line_step,
+                        detail_scale, line, 170, 170, 170);
+        snprintf(line, sizeof(line), "TRACE %.0fX", r->vector_gain);
+        draw_text_color(buf, W, H, info_x, top + 4 * line_step,
+                        detail_scale, line, 180, 220, 180);
+        draw_text_color(buf, W, H, info_x, top + 5 * line_step,
+                        detail_scale,
+                        targets_ok ? "75% TARGETS" : "TARGETS N/A FOR CL",
+                        190, 190, 190);
+    }
+    if (!ok)
+        draw_text_color(buf, W, H, left + 12, top + 12, 1,
+                        "VECTOR UNAVAILABLE FOR PIXEL FORMAT",
+                        255, 120, 80);
+
+    commit_slot(SLOT_SCOPE, gpu, buf,
+                (int)lroundf(dst.x0), (int)lroundf(dst.y0));
+    free(buf);
+    scope_cache_src = src;
+    scope_cache_frame = sources[src].frame_no;
+    scope_cache_w = W;
+    scope_cache_h = H;
+    scope_cache_view = HDRPLAY_SCOPE_VECTOR;
+    scope_cache_vector_gain = r->vector_gain;
+    return 0;
+}
+
+static int histogram_level_x(int left, int right, double level)
+{
+    double t = (level - PROBE_WAVEFORM_MIN_SIGNAL) /
+               (PROBE_WAVEFORM_MAX_SIGNAL - PROBE_WAVEFORM_MIN_SIGNAL);
+    return left + (int)llround(t * (right - left));
+}
+
+static int build_histogram_panel(Renderer *r, Source *sources, int n,
+                                 int src, pl_gpu gpu, LayoutRect dst)
+{
+    (void)r;
+    if (src < 0 || src >= n || !sources[src].shown) return -1;
+
+    int W = (int)lroundf(dst.x1 - dst.x0);
+    int H = (int)lroundf(dst.y1 - dst.y0);
+    if (W < 180 || H < 120) return -1;
+    bool resized = slots[SLOT_SCOPE].W != W || slots[SLOT_SCOPE].H != H;
+    ensure_slot(SLOT_SCOPE, gpu, W, H);
+    if (!slots[SLOT_SCOPE].tex) return -1;
+    bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_HISTOGRAM ||
+                   scope_cache_src != src ||
+                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_w != W || scope_cache_h != H;
+    if (!rebuild) {
+        position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
+                      (int)lroundf(dst.y0));
+        return 0;
+    }
+
+    uint8_t *buf = make_panel(W, H, 225);
+    if (!buf) return -1;
+    int detail_scale = W >= 1000 && H >= 500 ? 2 : 1;
+    int title_scale = W >= 1000 && H >= 400 ? 3 : 2;
+    int left = detail_scale > 1 ? 58 : 46;
+    int right = W - 14;
+    int top = 12 + FONT_H * title_scale;
+    int bottom = H - 16 - FONT_H * detail_scale;
+    int plot_w = right - left + 1;
+    int plot_h = bottom - top + 1;
+    if (plot_w < 64 || plot_h < 48) { free(buf); return -1; }
+
+    /* Log-frequency grid. The horizontal divisions describe relative
+     * display height, not linear sample percentages. */
+    for (int q = 0; q <= 4; q++) {
+        int y = bottom - q * (bottom - top) / 4;
+        draw_scope_line(buf, W, H, left, y, right, y,
+                        q == 0 || q == 4 ? 70 : 36,
+                        q == 0 || q == 4 ? 70 : 36,
+                        q == 0 || q == 4 ? 70 : 36);
+    }
+    static const int levels[] = { 0, 25, 50, 75, 100 };
+    for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+        int x = histogram_level_x(left, right, levels[i] / 100.0);
+        uint8_t grid = levels[i] == 0 || levels[i] == 100 ? 76 : 38;
+        draw_scope_line(buf, W, H, x, top, x, bottom, grid, grid, grid);
+        char label[8];
+        snprintf(label, sizeof(label), "%d", levels[i]);
+        int label_w = (int)strlen(label) * (FONT_W + 1) * detail_scale;
+        draw_text_color(buf, W, H, x - label_w / 2,
+                        bottom + 5, detail_scale, label,
+                        165, 165, 165);
+    }
+    draw_scope_line(buf, W, H, left, top, left, bottom, 70, 70, 70);
+    draw_scope_line(buf, W, H, right, top, right, bottom, 70, 70, 70);
+
+    /* A histogram is for seeing distribution trends, not the source code
+     * lattice. A fixed 256 bins gives about 0.47 percentage-point signal
+     * resolution across the full -10%..110% guard range while remaining
+     * legible on high-resolution displays. */
+    const int bin_count = 256;
+    uint32_t *bins = calloc(3 * (size_t)bin_count, sizeof(*bins));
+    if (!bins) { free(buf); return -1; }
+    uint32_t peaks[3] = {0};
+    ProbeRgbHistogramStats stats;
+    bool ok = probe_rgb_histogram(sources[src].shown, bin_count, 8,
+                                  bins, peaks, &stats);
+    uint32_t common_peak = peaks[0];
+    if (peaks[1] > common_peak) common_peak = peaks[1];
+    if (peaks[2] > common_peak) common_peak = peaks[2];
+    if (ok && common_peak) {
+        double log_peak = log1p((double)common_peak);
+        for (int c = 0; c < 3; c++) {
+            for (int bx = 0; bx < bin_count; bx++) {
+                uint32_t count = bins[(size_t)c * bin_count + bx];
+                if (!count) continue;
+                double density = log1p((double)count) / log_peak;
+                int y0 = bottom - (int)llround(density * (plot_h - 1));
+                int x0 = left + bx * plot_w / bin_count;
+                int x1 = left + (bx + 1) * plot_w / bin_count;
+                if (x1 <= x0) x1 = x0 + 1;
+                for (int x = x0; x < x1; x++) {
+                    for (int y = y0; y <= bottom; y++)
+                        scope_pixel(buf, W, H, x, y, c, 48);
+                    scope_pixel(buf, W, H, x, y0, c, 255);
+                    scope_pixel(buf, W, H, x, y0 + 1, c, 150);
+                }
+            }
+        }
+    }
+    free(bins);
+
+    int glyph_advance = (FONT_W + 1) * title_scale;
+    draw_text_color(buf, W, H, 8, 7, title_scale, "R", 255, 80, 80);
+    draw_text_color(buf, W, H, 8 + glyph_advance, 7, title_scale,
+                    "G", 80, 255, 80);
+    draw_text_color(buf, W, H, 8 + 2 * glyph_advance, 7, title_scale,
+                    "B", 80, 120, 255);
+    draw_text_color(buf, W, H, 8 + 3 * glyph_advance, 7, title_scale,
+                    " HISTOGRAM", 235, 235, 235);
+    draw_text_color(buf, W, H,
+                    W - 11 * (FONT_W + 1) * detail_scale,
+                    7, detail_scale, "LOG COUNT", 155, 155, 155);
+    if (ok) {
+        char line[128];
+        double denom = stats.samples ? (double)stats.samples : 1.0;
+        snprintf(line, sizeof(line), "OUTSIDE R %.2f%% G %.2f%% B %.2f%%",
+                 100.0 * stats.outside_nominal[0] / denom,
+                 100.0 * stats.outside_nominal[1] / denom,
+                 100.0 * stats.outside_nominal[2] / denom);
+        draw_text_color(buf, W, H, left, top + 5, detail_scale, line,
+                        180, 180, 180);
+    } else {
+        draw_text_color(buf, W, H, left + 12, top + 12, 1,
+                        "HISTOGRAM UNAVAILABLE FOR PIXEL FORMAT",
+                        255, 120, 80);
+    }
+
+    commit_slot(SLOT_SCOPE, gpu, buf,
+                (int)lroundf(dst.x0), (int)lroundf(dst.y0));
+    free(buf);
+    scope_cache_src = src;
+    scope_cache_frame = sources[src].frame_no;
+    scope_cache_w = W;
+    scope_cache_h = H;
+    scope_cache_view = HDRPLAY_SCOPE_HISTOGRAM;
     return 0;
 }
 
@@ -1104,10 +1446,18 @@ void hud_prepare(Renderer *r, Source *sources, int n,
             }
 
             case LAYOUT_OV_SCOPE: {
-                int rc = r->scope_view == HDRPLAY_SCOPE_GAMUT
-                       ? build_gamut_panel(r, sources, n, ov->src,
-                                           gpu, ov->dst)
-                       : build_waveform_panel(r, sources, n, ov->src,
+                int rc;
+                if (r->scope_view == HDRPLAY_SCOPE_GAMUT)
+                    rc = build_gamut_panel(r, sources, n, ov->src,
+                                           gpu, ov->dst);
+                else if (r->scope_view == HDRPLAY_SCOPE_VECTOR)
+                    rc = build_vector_panel(r, sources, n, ov->src,
+                                            gpu, ov->dst);
+                else if (r->scope_view == HDRPLAY_SCOPE_HISTOGRAM)
+                    rc = build_histogram_panel(r, sources, n, ov->src,
+                                               gpu, ov->dst);
+                else
+                    rc = build_waveform_panel(r, sources, n, ov->src,
                                               gpu, ov->dst);
                 if (rc == 0) {
                     out->scope = overlay_arr[SLOT_SCOPE];

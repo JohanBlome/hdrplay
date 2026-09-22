@@ -163,6 +163,8 @@ hdrplay video.mp4
 hdrplay -f video.mp4                  # fullscreen HDR playback
 hdrplay --waveform video.mp4          # start with the RGB waveform
 hdrplay --gamut video.mp4             # start with the CIE gamut scope
+hdrplay --vectorscope video.mp4       # start with the Cb/Cr vectorscope
+hdrplay --histogram video.mp4         # start with the RGB histogram
 hdrplay first.mov second.mov          # synchronized comparison
 ```
 
@@ -175,7 +177,8 @@ hdrplay first.mov second.mov          # synchronized comparison
 | `P` | HDR/SDR split for one file; comparison for two files |
 | `O` | cycle split orientation and comparison wipes |
 | `C` | cycle color, Y, Cb, Cr, legal, clip and plateau views |
-| `V` | cycle scopes: off, RGB waveform, CIE gamut |
+| `V` | cycle scopes: off, waveform, gamut, vectorscope, histogram |
+| `G` | toggle vectorscope trace gain between 1x and 2x |
 | `D` | toggle current/previous or A/B difference |
 | `Space` | pause or resume |
 | `.` / `,` | step one frame forward or backward |
@@ -222,8 +225,9 @@ false-color views, and `u`, `v` and `flat` are accepted aliases.
 
 ### Video scopes
 
-Press `V` to cycle between no scope, a channel-overlaid RGB waveform and a CIE
-1931 xy gamut plot. `--waveform` and `--gamut` select either scope at startup.
+Press `V` to cycle between no scope, a channel-overlaid RGB waveform, a CIE
+1931 xy gamut plot, a digital vectorscope and an RGB histogram. `--waveform`,
+`--gamut`, `--vectorscope` and `--histogram` select a scope at startup.
 
 In the waveform, horizontal position follows the source image and vertical
 position is the encoded R'G'B' signal level before transfer conversion, HLG
@@ -241,6 +245,32 @@ Rec.709, Display-P3 and BT.2020 boundaries. It reports the percentage of
 non-black samples outside Rec.709 and Display-P3. This distinguishes declared
 primaries from actual gamut use: a BT.2020-tagged file can still contain only
 Rec.709 colors.
+
+The vectorscope plots normalized Cb horizontally and Cr vertically, directly
+from the decoded chroma planes. This is the digital successor to the analog
+NTSC instrument: hue remains the angle around the center and saturation the
+distance from it, but the six 75% color-bar targets are calculated from the
+file's declared Y'CbCr matrix. Rec.709 and BT.2020 NCL therefore have different
+target positions. BT.2020 constant-luminance content is plotted but does not
+show NCL target boxes. A conventional 123-degree skin-tone line is included as
+a hue guide; it is not a skin detector and is not a normative color target.
+
+The vectorscope trace defaults to 2x display gain because natural content
+usually occupies the center of the scope. The target boxes stay fixed and the
+scope is clearly labelled `TRACE 2X`; only the trace is magnified. Press `G`
+to compare against the unmagnified 1x view, or select the startup value with
+`--vector-gain 1|2`. Density bins are deliberately displayed without
+smoothing so an 8-bit or otherwise coarsely quantized chroma lattice remains
+visible.
+
+The histogram overlays the distributions of encoded R', G' and B' before
+transfer conversion, tone mapping or display color management. Its horizontal
+axis uses the waveform's -10%..110% signal range, while logarithmic count
+height keeps sparse highlight and shadow populations visible beside dominant
+tones. It uses 256 signal bins so broad distribution trends remain clear on
+high-resolution displays. Values beyond the guard range collect at its end
+bins; the panel also reports how many channel samples are outside nominal
+0%..100%.
 
 In two-file comparison, the active scope stays inside one pane and follows the
 focused (first visible) source.
@@ -479,10 +509,10 @@ libplacebo behavior and HDR/SDR brightness handling.
 | `src/main.c`        | arg parse, event loop, frame pump, key handling |
 | `src/decoder.c`     | ffmpeg demux + decode, HDR side-data extraction |
 | `src/renderer.c`    | SDL3, Vulkan and libplacebo initialization and rendering |
-| `src/hud.c`         | status panels, labels, waveform and gamut scope overlays |
+| `src/hud.c`         | status panels, labels and video-scope overlays |
 | `src/diagnose.c`    | `--diagnose` HDR sanity checks (per-display PASS/WARN/FAIL) |
 | `src/brightness.c`  | `--set-brightness` via IOKit / `brightness` CLI / m1ddc |
-| `src/probe.c`       | source-signal probes, waveform/gamut data and luminance statistics |
+| `src/probe.c`       | source probes, scope data and luminance statistics |
 | `src/stats.c`       | session accumulation: PTS-deduped histograms, percentiles, spread decomposition |
 | `src/layout.c`      | pure render planning: passes, crops, masks, overlay routing (GPU-free, so it can be tested) |
 | `src/source.c`      | one input: decode, frame ring for step-back, clock following |

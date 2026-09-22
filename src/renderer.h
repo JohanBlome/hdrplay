@@ -32,6 +32,8 @@ typedef enum {
     HDRPLAY_SCOPE_OFF = 0,
     HDRPLAY_SCOPE_WAVEFORM,
     HDRPLAY_SCOPE_GAMUT,
+    HDRPLAY_SCOPE_VECTOR,
+    HDRPLAY_SCOPE_HISTOGRAM,
     HDRPLAY_SCOPE_COUNT,
 } HdrplayScopeView;
 
@@ -248,7 +250,8 @@ typedef struct Renderer {
      * the HUD and feeds each frame in. NULL when unavailable. */
     struct SessionStats *session;
     bool   session_panel;       /* 'A' toggles the accumulated panel   */
-    HdrplayScopeView scope_view; /* 'V' cycles waveform/gamut/off       */
+    HdrplayScopeView scope_view; /* 'V' cycles diagnostic scopes       */
+    float  vector_gain;          /* vectorscope trace magnification     */
 
     /* HDR10 static metadata the container DECLARES, copied from the
      * decoder so the HUD can print measured-vs-declared side by side.

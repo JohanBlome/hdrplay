@@ -606,6 +606,76 @@ bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
     return true;
 }
 
+bool probe_rgb_histogram(const AVFrame *frame, int width, int sample_stride,
+                         uint32_t *bins, uint32_t peak_count[3],
+                         ProbeRgbHistogramStats *stats)
+{
+    if (peak_count) memset(peak_count, 0, 3 * sizeof(*peak_count));
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (!frame || !frame->data[0] || !bins || width <= 0)
+        return false;
+    if (sample_stride < 1) sample_stride = 1;
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    int depth = 0;
+    if (!luma_plane_supported(desc, &depth) ||
+        !chroma_planes_supported(desc))
+        return false;
+    for (int c = 0; c < 3; c++)
+        if (!frame->data[desc->comp[c].plane]) return false;
+
+    memset(bins, 0, 3 * (size_t)width * sizeof(*bins));
+    bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
+    int max_raw = (1 << depth) - 1;
+    int y_lo = 16 << (depth - 8), y_hi = 235 << (depth - 8);
+    int c_lo = 16 << (depth - 8), c_hi = 240 << (depth - 8);
+    int c_mid = (c_lo + c_hi) / 2;
+    Matrix m = matrix_for(frame->colorspace);
+    const double signal_span = PROBE_WAVEFORM_MAX_SIGNAL -
+                               PROBE_WAVEFORM_MIN_SIGNAL;
+    ProbeRgbHistogramStats local = {0};
+    uint32_t local_peak[3] = {0};
+
+    for (int y = 0; y < frame->height; y += sample_stride) {
+        for (int x = 0; x < frame->width; x += sample_stride) {
+            int y_raw = read_component(frame, desc, 0, x, y);
+            int u_raw = read_component(frame, desc, 1, x, y);
+            int v_raw = read_component(frame, desc, 2, x, y);
+            double Yn, Cb, Cr;
+            if (full_range) {
+                Yn = (double)y_raw / max_raw;
+                Cb = (double)u_raw / max_raw - 0.5;
+                Cr = (double)v_raw / max_raw - 0.5;
+            } else {
+                Yn = (double)(y_raw - y_lo) / (y_hi - y_lo);
+                Cb = (double)(u_raw - c_mid) / (c_hi - c_lo);
+                Cr = (double)(v_raw - c_mid) / (c_hi - c_lo);
+            }
+
+            double rgb[3];
+            rgb[0] = Yn + 2.0 * (1.0 - m.kr) * Cr;
+            rgb[2] = Yn + 2.0 * (1.0 - m.kb) * Cb;
+            rgb[1] = (Yn - m.kr * rgb[0] - m.kb * rgb[2]) / m.kg;
+            for (int c = 0; c < 3; c++) {
+                if (rgb[c] < 0.0 || rgb[c] > 1.0)
+                    local.outside_nominal[c]++;
+                double t = (rgb[c] - PROBE_WAVEFORM_MIN_SIGNAL) /
+                           signal_span;
+                if (t < 0.0) t = 0.0;
+                if (t > 1.0) t = 1.0;
+                int bin = (int)llround(t * (width - 1));
+                uint32_t count = ++bins[(size_t)c * width + bin];
+                if (count > local_peak[c]) local_peak[c] = count;
+            }
+            local.samples++;
+        }
+    }
+
+    if (peak_count) memcpy(peak_count, local_peak, sizeof(local_peak));
+    if (stats) *stats = local;
+    return true;
+}
+
 typedef struct {
     double m[3][3];
 } XyzMatrix;
@@ -753,6 +823,100 @@ bool probe_xy_gamut(const AVFrame *frame, int width, int height,
             int bx = (int)llround(x / PROBE_GAMUT_X_MAX * (width - 1));
             int by = height - 1 -
                      (int)llround(y / PROBE_GAMUT_Y_MAX * (height - 1));
+            uint32_t n = ++bins[(size_t)by * width + bx];
+            if (n > peak) peak = n;
+        }
+    }
+
+    if (peak_count) *peak_count = peak;
+    if (stats) *stats = local;
+    return true;
+}
+
+bool probe_vectorscope_targets(enum AVColorSpace matrix, double amplitude,
+                               double cbcr[6][2])
+{
+    if (!cbcr || !(amplitude > 0.0)) return false;
+    if (matrix == AVCOL_SPC_BT2020_CL) return false;
+    Matrix m = matrix_for(matrix);
+    static const double bars[6][3] = {
+        { 1, 0, 0 }, /* R  */
+        { 1, 0, 1 }, /* Mg */
+        { 0, 0, 1 }, /* B  */
+        { 0, 1, 1 }, /* Cy */
+        { 0, 1, 0 }, /* G  */
+        { 1, 1, 0 }, /* Y  */
+    };
+    for (int i = 0; i < 6; i++) {
+        double R = amplitude * bars[i][0];
+        double G = amplitude * bars[i][1];
+        double B = amplitude * bars[i][2];
+        double Y = m.kr * R + m.kg * G + m.kb * B;
+        cbcr[i][0] = (B - Y) / (2.0 * (1.0 - m.kb));
+        cbcr[i][1] = (R - Y) / (2.0 * (1.0 - m.kr));
+    }
+    return true;
+}
+
+bool probe_cbcr_vectorscope(const AVFrame *frame, int width, int height,
+                            int sample_stride, double display_gain,
+                            uint32_t *bins,
+                            uint32_t *peak_count, ProbeVectorStats *stats)
+{
+    if (peak_count) *peak_count = 0;
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (!frame || !frame->data[0] || !bins || width <= 0 || height <= 0)
+        return false;
+    if (sample_stride < 1) sample_stride = 1;
+    if (!(display_gain > 0.0) || !isfinite(display_gain))
+        display_gain = 1.0;
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    int depth = 0;
+    if (!luma_plane_supported(desc, &depth) ||
+        !chroma_planes_supported(desc))
+        return false;
+    for (int c = 1; c <= 2; c++)
+        if (!frame->data[desc->comp[c].plane]) return false;
+
+    size_t bin_count = (size_t)width * (size_t)height;
+    memset(bins, 0, bin_count * sizeof(*bins));
+    bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
+    int max_raw = (1 << depth) - 1;
+    int c_lo = 16 << (depth - 8), c_hi = 240 << (depth - 8);
+    int c_mid = (c_lo + c_hi) / 2;
+    ProbeVectorStats local = {0};
+    uint32_t peak = 0;
+
+    for (int sy = 0; sy < frame->height; sy += sample_stride) {
+        for (int sx = 0; sx < frame->width; sx += sample_stride) {
+            int u_raw = read_component(frame, desc, 1, sx, sy);
+            int v_raw = read_component(frame, desc, 2, sx, sy);
+            double cb, cr;
+            if (full_range) {
+                cb = (double)u_raw / max_raw - 0.5;
+                cr = (double)v_raw / max_raw - 0.5;
+            } else {
+                cb = (double)(u_raw - c_mid) / (c_hi - c_lo);
+                cr = (double)(v_raw - c_mid) / (c_hi - c_lo);
+            }
+            local.samples++;
+            if (fabs(cb) > 0.5 || fabs(cr) > 0.5)
+                local.outside_nominal++;
+
+            double plot_cb = cb * display_gain;
+            double plot_cr = cr * display_gain;
+            if (plot_cb < -PROBE_VECTOR_LIMIT ||
+                plot_cb >  PROBE_VECTOR_LIMIT ||
+                plot_cr < -PROBE_VECTOR_LIMIT ||
+                plot_cr >  PROBE_VECTOR_LIMIT)
+                continue;
+            double nx = (plot_cb + PROBE_VECTOR_LIMIT) /
+                        (2.0 * PROBE_VECTOR_LIMIT);
+            double ny = (plot_cr + PROBE_VECTOR_LIMIT) /
+                        (2.0 * PROBE_VECTOR_LIMIT);
+            int bx = (int)llround(nx * (width - 1));
+            int by = height - 1 - (int)llround(ny * (height - 1));
             uint32_t n = ++bins[(size_t)by * width + bx];
             if (n > peak) peak = n;
         }

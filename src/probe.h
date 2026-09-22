@@ -261,6 +261,19 @@ bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
                         int vertical_stride, uint32_t *bins,
                         uint32_t peak_count[3], int *out_samples);
 
+/* Source-domain R'G'B' signal histogram over the same -10%..110% range as
+ * the waveform. `bins` is channel-major and must hold 3 * width uint32_t.
+ * Values outside the displayed guard range accumulate in the edge bins;
+ * `outside_nominal` separately counts components below 0% or above 100%. */
+typedef struct {
+    uint64_t samples;
+    uint64_t outside_nominal[3];
+} ProbeRgbHistogramStats;
+
+bool probe_rgb_histogram(const AVFrame *frame, int width, int sample_stride,
+                         uint32_t *bins, uint32_t peak_count[3],
+                         ProbeRgbHistogramStats *stats);
+
 /* CIE 1931 xy density plot of the source pixels. The plot covers
  * x=0..0.8 and y=0..0.9. Near-black samples are omitted because their
  * chromaticity is numerically unstable and visually meaningless. */
@@ -275,5 +288,26 @@ typedef struct {
 bool probe_xy_gamut(const AVFrame *frame, int width, int height,
                     int sample_stride, uint32_t *bins,
                     uint32_t *peak_count, ProbeGamutStats *stats);
+
+/* Digital vectorscope: Cb on the horizontal axis and Cr vertically. Values
+ * are normalized so nominal chroma occupies -0.5..+0.5, with a 20% guard
+ * band retained around the plot. */
+#define PROBE_VECTOR_LIMIT 0.6
+typedef struct {
+    uint64_t samples;
+    uint64_t outside_nominal;
+} ProbeVectorStats;
+
+bool probe_cbcr_vectorscope(const AVFrame *frame, int width, int height,
+                            int sample_stride, double display_gain,
+                            uint32_t *bins,
+                            uint32_t *peak_count, ProbeVectorStats *stats);
+
+/* R, Mg, B, Cy, G and Y target positions for the selected Y'CbCr matrix.
+ * `amplitude` is normally 0.75 for traditional 75% color-bar boxes. Returns
+ * false for BT.2020 constant-luminance, whose piecewise encoding is not the
+ * NCL color-difference formula used by conventional targets. */
+bool probe_vectorscope_targets(enum AVColorSpace matrix, double amplitude,
+                               double cbcr[6][2]);
 
 #endif

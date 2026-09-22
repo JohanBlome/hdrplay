@@ -554,6 +554,31 @@ static void test_rgb_waveform(void)
     av_frame_free(&f);
 }
 
+static void test_rgb_histogram(void)
+{
+    puts("RGB histogram");
+    AVFrame *f = mkframe(AV_PIX_FMT_P010LE, 16, 16,
+                         AVCOL_TRC_ARIB_STD_B67, 64);
+    enum { W = 121 };
+    uint32_t bins[3 * W], peak[3];
+    ProbeRgbHistogramStats stats;
+
+    CHECK(probe_rgb_histogram(f, W, 2, bins, peak, &stats),
+          "P010 source produces an RGB histogram");
+    CHECK(stats.samples == 64, "sample count %llu (expect 64)",
+          (unsigned long long)stats.samples);
+    /* Neutral nominal black is 0%, bin 10 in a 121-bin -10%..110%
+     * histogram. All three channels coincide there. */
+    bool neutral = true;
+    for (int c = 0; c < 3; c++) {
+        neutral &= bins[c * W + 10] == 64;
+        neutral &= peak[c] == 64;
+        neutral &= stats.outside_nominal[c] == 0;
+    }
+    CHECK(neutral, "nominal black aligns all channels at 0%%");
+    av_frame_free(&f);
+}
+
 static void test_xy_gamut(void)
 {
     puts("CIE xy gamut scope");
@@ -585,6 +610,41 @@ static void test_xy_gamut(void)
     av_frame_free(&f);
 }
 
+static void test_vectorscope(void)
+{
+    puts("Cb/Cr vectorscope");
+    double targets709[6][2], targets2020[6][2];
+    CHECK(probe_vectorscope_targets(AVCOL_SPC_BT709, .75, targets709),
+          "Rec.709 75%% targets available");
+    CHECK(probe_vectorscope_targets(AVCOL_SPC_BT2020_NCL, .75,
+                                    targets2020),
+          "BT.2020 NCL 75%% targets available");
+    CHECK(NEAR(targets709[0][1], .375, 1e-12) &&
+          NEAR(targets2020[0][1], .375, 1e-12),
+          "75%% red target has Cr=0.375 in both matrices");
+    CHECK(!NEAR(targets709[0][0], targets2020[0][0], 1e-3),
+          "Rec.709 and BT.2020 red targets use different Cb positions");
+    CHECK(!probe_vectorscope_targets(AVCOL_SPC_BT2020_CL, .75,
+                                     targets2020),
+          "BT.2020 constant-luminance does not claim NCL targets");
+
+    AVFrame *f = mkframe(AV_PIX_FMT_P010LE, 16, 16,
+                         AVCOL_TRC_ARIB_STD_B67, 502);
+    enum { W = 64, H = 64 };
+    uint32_t bins[W * H], peak = 0;
+    ProbeVectorStats stats;
+    CHECK(probe_cbcr_vectorscope(f, W, H, 2, 1.0, bins, &peak, &stats),
+          "P010 source produces a Cb/Cr density plot");
+    uint64_t total = 0;
+    for (int i = 0; i < W * H; i++) total += bins[i];
+    CHECK(stats.samples == 64 && total == 64,
+          "all neutral samples land in the vectorscope");
+    CHECK(stats.outside_nominal == 0,
+          "neutral samples remain inside nominal chroma range");
+    CHECK(peak == 64, "neutral chroma accumulates at the center");
+    av_frame_free(&f);
+}
+
 int main(void)
 {
     test_lut_equivalence();
@@ -600,7 +660,9 @@ int main(void)
     test_variance_decomposition();
     test_maxrgb();
     test_rgb_waveform();
+    test_rgb_histogram();
     test_xy_gamut();
+    test_vectorscope();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

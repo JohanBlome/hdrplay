@@ -254,6 +254,9 @@ static void usage(void)
         "                        locally flat areas near either endpoint.\n"
         "  --waveform            start with the RGB waveform visible\n"
         "  --gamut               start with the CIE gamut scope visible\n"
+        "  --vectorscope         start with the Cb/Cr vectorscope visible\n"
+        "  --histogram           start with the RGB histogram visible\n"
+        "  --vector-gain N       vectorscope trace gain: 1 or 2 (default 2)\n"
         "  --split               start in split-screen (HDR left, SDR right)\n"
         "  --split-tb            split top/bottom instead of left/right\n"
         "  --split-diag          diagonal split: HDR upper-left, SDR lower-right\n"
@@ -314,7 +317,8 @@ static void usage(void)
         "                        M=toggle luminance probe (mouse → nits)\n"
         "                        I=show/hide top-left status HUD\n"
         "                        A=show/hide accumulated stats panel\n"
-        "                        V=cycle scopes: off / waveform / gamut\n"
+        "                        V=cycle scopes: off/waveform/gamut/vector/histogram\n"
+        "                        G=toggle vectorscope trace gain 1x/2x\n"
         "                        shift-A=reset accumulated stats\n"
         "                        ←/→=seek -10s/+10s\n"
         "                        . / , =step one frame fwd/back\n"
@@ -466,6 +470,7 @@ int main(int argc, char **argv)
     bool split_explicit = false;   /* user picked an orientation */
     bool loop_at_eof = false;
     HdrplayScopeView start_scope = HDRPLAY_SCOPE_OFF;
+    float vector_gain = 2.0f;
     float sdr_peak_override = 0.0f;   /* 0 = OS-tracked default */
     float sdr_saturation    = 1.0f;   /* 1.0 = libplacebo native; >1 shifts saturated reds toward orange */
     const struct pl_gamut_map_function *sdr_gamut_map = &pl_gamut_map_perceptual;
@@ -493,6 +498,19 @@ int main(int argc, char **argv)
             start_scope = HDRPLAY_SCOPE_WAVEFORM;
         else if (!strcmp(argv[i], "--gamut"))
             start_scope = HDRPLAY_SCOPE_GAMUT;
+        else if (!strcmp(argv[i], "--vectorscope") ||
+                 !strcmp(argv[i], "--vector"))
+            start_scope = HDRPLAY_SCOPE_VECTOR;
+        else if (!strcmp(argv[i], "--histogram") ||
+                 !strcmp(argv[i], "--hist"))
+            start_scope = HDRPLAY_SCOPE_HISTOGRAM;
+        else if (!strcmp(argv[i], "--vector-gain") && i+1 < argc) {
+            vector_gain = (float)atof(argv[++i]);
+            if (vector_gain != 1.0f && vector_gain != 2.0f) {
+                fprintf(stderr, "--vector-gain must be 1 or 2\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--json"))     analyze_json = true;
         else if (!strcmp(argv[i], "--stride") && i+1 < argc)
             analyze_stride = atoi(argv[++i]);
@@ -647,6 +665,7 @@ int main(int argc, char **argv)
     rend.plane_view = start_plane;
     rend.loop_enabled = loop_at_eof;
     rend.scope_view = start_scope;
+    rend.vector_gain = vector_gain;
     rend.hlg_peak_override = (float)hlg_peak;
     rend.ambient_reference_override = ambient_reference;
     rend.ambient_lux_override = ambient_lux;
@@ -869,7 +888,14 @@ int main(int argc, char **argv)
                     LOG("REND", "scope -> %s",
                         rend.scope_view == HDRPLAY_SCOPE_WAVEFORM ? "RGB waveform" :
                         rend.scope_view == HDRPLAY_SCOPE_GAMUT ? "CIE gamut" :
+                        rend.scope_view == HDRPLAY_SCOPE_VECTOR ? "Cb/Cr vectorscope" :
+                        rend.scope_view == HDRPLAY_SCOPE_HISTOGRAM ? "RGB histogram" :
                                                                "off");
+                }
+                if (e.key.key == SDLK_G) {
+                    rend.vector_gain = rend.vector_gain > 1.5f ? 1.0f : 2.0f;
+                    LOG("REND", "vectorscope trace gain -> %.0fx",
+                        rend.vector_gain);
                 }
                 /* W resizes the window so the focused source lands at
                  * exactly 1:1 with no letterbox.
