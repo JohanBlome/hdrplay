@@ -36,6 +36,8 @@ static const Glyph FONT[] = {
     G('/', 0x04,0x08,0x08,0x10,0x10,0x20,0x20,0x40),
     G('-', 0x00,0x00,0x00,0x7C,0x00,0x00,0x00,0x00),
     G('+', 0x00,0x10,0x10,0x7C,0x10,0x10,0x00,0x00),
+    G('<', 0x00,0x08,0x10,0x20,0x10,0x08,0x00,0x00),
+    G('>', 0x00,0x20,0x10,0x08,0x10,0x20,0x00,0x00),
     G('%', 0xC4,0xC8,0x10,0x20,0x40,0x98,0x18,0x00),
     G('=', 0x00,0x00,0x7C,0x00,0x7C,0x00,0x00,0x00),
     G('(', 0x18,0x20,0x40,0x40,0x40,0x40,0x20,0x18),
@@ -749,37 +751,46 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
     draw_vector_circle(buf, W, H, left, top, plot_size, .50, 70);
 
     int bin_size = plot_size < 512 ? plot_size : 512;
-    size_t bin_count = (size_t)bin_size * (size_t)bin_size;
+    size_t plane_size = (size_t)bin_size * (size_t)bin_size;
+    size_t bin_count = PROBE_VECTOR_BANDS * plane_size;
     uint32_t *bins = calloc(bin_count, sizeof(*bins));
     if (!bins) { free(buf); return -1; }
-    uint32_t peak = 0;
+    uint32_t peaks[PROBE_VECTOR_BANDS] = {0};
     ProbeVectorStats stats;
     bool ok = probe_cbcr_vectorscope(frame, region,
                                      bin_size, bin_size, 8,
                                      r->vector_gain,
-                                     bins, &peak, &stats);
+                                     bins, peaks, &stats);
     if (ok) {
-        for (int by = 0; by < bin_size; by++) {
-            for (int bx = 0; bx < bin_size; bx++) {
-                uint32_t count = bins[(size_t)by * bin_size + bx];
-                if (!count) continue;
-                uint8_t intensity = scope_density(count, peak, 48.0f,
-                                                  region != NULL);
-                int x0 = left + bx * plot_size / bin_size;
-                int x1 = left + (bx + 1) * plot_size / bin_size;
-                int y0 = top + by * plot_size / bin_size;
-                int y1 = top + (by + 1) * plot_size / bin_size;
-                if (x1 <= x0) x1 = x0 + 1;
-                if (y1 <= y0) y1 = y0 + 1;
-                for (int py = y0; py < y1; py++)
-                    for (int px = x0; px < x1; px++) {
-                        scope_pixel(buf, W, H, px, py, 0,
-                                    (uint8_t)(intensity * 2 / 5));
-                        scope_pixel(buf, W, H, px, py, 1,
-                                    intensity);
-                        scope_pixel(buf, W, H, px, py, 2,
-                                    (uint8_t)(intensity * 3 / 5));
-                    }
+        static const uint8_t band_color[PROBE_VECTOR_BANDS][3] = {
+            { 70, 120, 255 }, /* shadows   */
+            { 70, 255, 110 }, /* midtones  */
+            {255, 215,  85 }, /* highlights */
+        };
+        uint32_t common_peak = peaks[0];
+        if (peaks[1] > common_peak) common_peak = peaks[1];
+        if (peaks[2] > common_peak) common_peak = peaks[2];
+        for (int band = 0; band < PROBE_VECTOR_BANDS; band++) {
+            for (int by = 0; by < bin_size; by++) {
+                for (int bx = 0; bx < bin_size; bx++) {
+                    uint32_t count = bins[(size_t)band * plane_size +
+                                          (size_t)by * bin_size + bx];
+                    if (!count) continue;
+                    uint8_t intensity = scope_density(count, common_peak,
+                                                      48.0f, region != NULL);
+                    int x0 = left + bx * plot_size / bin_size;
+                    int x1 = left + (bx + 1) * plot_size / bin_size;
+                    int y0 = top + by * plot_size / bin_size;
+                    int y1 = top + (by + 1) * plot_size / bin_size;
+                    if (x1 <= x0) x1 = x0 + 1;
+                    if (y1 <= y0) y1 = y0 + 1;
+                    for (int py = y0; py < y1; py++)
+                        for (int px = x0; px < x1; px++)
+                            for (int c = 0; c < 3; c++)
+                                scope_pixel(buf, W, H, px, py, c,
+                                    (uint8_t)(band_color[band][c] *
+                                              intensity / 255));
+                }
             }
         }
     }
@@ -864,6 +875,23 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
                         detail_scale,
                         targets_ok ? "75% TARGETS" : "TARGETS N/A FOR CL",
                         190, 190, 190);
+        draw_text_color(buf, W, H, info_x, top + 7 * line_step,
+                        detail_scale, "Y BANDS", 190, 190, 190);
+        snprintf(line, sizeof(line), "SHADOW <25 %.0f%%",
+                 stats.samples ? 100.0 * stats.luma_band[0] / stats.samples
+                               : 0.0);
+        draw_text_color(buf, W, H, info_x, top + 8 * line_step,
+                        detail_scale, line, 70, 120, 255);
+        snprintf(line, sizeof(line), "MID 25-75 %.0f%%",
+                 stats.samples ? 100.0 * stats.luma_band[1] / stats.samples
+                               : 0.0);
+        draw_text_color(buf, W, H, info_x, top + 9 * line_step,
+                        detail_scale, line, 70, 255, 110);
+        snprintf(line, sizeof(line), "HIGH >75 %.0f%%",
+                 stats.samples ? 100.0 * stats.luma_band[2] / stats.samples
+                               : 0.0);
+        draw_text_color(buf, W, H, info_x, top + 10 * line_step,
+                        detail_scale, line, 255, 215, 85);
     }
     if (!ok)
         draw_text_color(buf, W, H, left + 12, top + 12, 1,

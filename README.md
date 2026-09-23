@@ -264,6 +264,12 @@ target positions. BT.2020 constant-luminance content is plotted but does not
 show NCL target boxes. A conventional 123-degree skin-tone line is included as
 a hue guide; it is not a skin detector and is not a normative color target.
 
+The trace is split into three encoded-luma bands on the same plot: shadows
+below 25% Y' are blue, midtones from 25% through 75% are green, and highlights
+above 75% are yellow. These are deliberately labelled signal-level bands, not
+absolute luminance in nits. A shared density scale preserves their relative
+populations, and the side legend reports the percentage of samples in each.
+
 The vectorscope trace defaults to 2x display gain because natural content
 usually occupies the center of the scope. The target boxes stay fixed and the
 scope is clearly labelled `TRACE 2X`; only the trace is magnified. Press `G`

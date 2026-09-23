@@ -890,9 +890,12 @@ bool probe_cbcr_vectorscope(const AVFrame *frame, const ProbeRegion *region,
                             int width, int height,
                             int sample_stride, double display_gain,
                             uint32_t *bins,
-                            uint32_t *peak_count, ProbeVectorStats *stats)
+                            uint32_t peak_count[PROBE_VECTOR_BANDS],
+                            ProbeVectorStats *stats)
 {
-    if (peak_count) *peak_count = 0;
+    if (peak_count)
+        memset(peak_count, 0,
+               PROBE_VECTOR_BANDS * sizeof(*peak_count));
     if (stats) memset(stats, 0, sizeof(*stats));
     if (!frame || !frame->data[0] || !bins || width <= 0 || height <= 0)
         return false;
@@ -911,28 +914,37 @@ bool probe_cbcr_vectorscope(const AVFrame *frame, const ProbeRegion *region,
     if (!probe_region_bounds(frame, region, &rx0, &ry0, &rx1, &ry1))
         return false;
 
-    size_t bin_count = (size_t)width * (size_t)height;
-    memset(bins, 0, bin_count * sizeof(*bins));
+    size_t plane_size = (size_t)width * (size_t)height;
+    memset(bins, 0,
+           PROBE_VECTOR_BANDS * plane_size * sizeof(*bins));
     bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
     int max_raw = (1 << depth) - 1;
+    int y_lo = 16 << (depth - 8), y_hi = 235 << (depth - 8);
     int c_lo = 16 << (depth - 8), c_hi = 240 << (depth - 8);
     int c_mid = (c_lo + c_hi) / 2;
     ProbeVectorStats local = {0};
-    uint32_t peak = 0;
+    uint32_t local_peak[PROBE_VECTOR_BANDS] = {0};
 
     for (int sy = ry0; sy < ry1; sy += sample_stride) {
         for (int sx = rx0; sx < rx1; sx += sample_stride) {
+            int y_raw = read_component(frame, desc, 0, sx, sy);
             int u_raw = read_component(frame, desc, 1, sx, sy);
             int v_raw = read_component(frame, desc, 2, sx, sy);
-            double cb, cr;
+            double yn, cb, cr;
             if (full_range) {
+                yn = (double)y_raw / max_raw;
                 cb = (double)u_raw / max_raw - 0.5;
                 cr = (double)v_raw / max_raw - 0.5;
             } else {
+                yn = (double)(y_raw - y_lo) / (y_hi - y_lo);
                 cb = (double)(u_raw - c_mid) / (c_hi - c_lo);
                 cr = (double)(v_raw - c_mid) / (c_hi - c_lo);
             }
+            int band = yn < 0.25 ? PROBE_VECTOR_SHADOW :
+                       yn < 0.75 ? PROBE_VECTOR_MID :
+                                   PROBE_VECTOR_HIGHLIGHT;
             local.samples++;
+            local.luma_band[band]++;
             if (fabs(cb) > 0.5 || fabs(cr) > 0.5)
                 local.outside_nominal++;
 
@@ -949,12 +961,15 @@ bool probe_cbcr_vectorscope(const AVFrame *frame, const ProbeRegion *region,
                         (2.0 * PROBE_VECTOR_LIMIT);
             int bx = (int)llround(nx * (width - 1));
             int by = height - 1 - (int)llround(ny * (height - 1));
-            uint32_t n = ++bins[(size_t)by * width + bx];
-            if (n > peak) peak = n;
+            size_t idx = (size_t)band * plane_size +
+                         (size_t)by * width + bx;
+            uint32_t n = ++bins[idx];
+            if (n > local_peak[band]) local_peak[band] = n;
         }
     }
 
-    if (peak_count) *peak_count = peak;
+    if (peak_count)
+        memcpy(peak_count, local_peak, sizeof(local_peak));
     if (stats) *stats = local;
     return true;
 }

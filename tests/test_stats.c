@@ -648,18 +648,24 @@ static void test_vectorscope(void)
     AVFrame *f = mkframe(AV_PIX_FMT_P010LE, 16, 16,
                          AVCOL_TRC_ARIB_STD_B67, 502);
     enum { W = 64, H = 64 };
-    uint32_t bins[W * H], peak = 0;
+    uint32_t bins[PROBE_VECTOR_BANDS * W * H];
+    uint32_t peak[PROBE_VECTOR_BANDS] = {0};
     ProbeVectorStats stats;
     CHECK(probe_cbcr_vectorscope(f, NULL, W, H, 2, 1.0,
                                  bins, &peak, &stats),
           "P010 source produces a Cb/Cr density plot");
     uint64_t total = 0;
-    for (int i = 0; i < W * H; i++) total += bins[i];
+    for (int i = 0; i < PROBE_VECTOR_BANDS * W * H; i++) total += bins[i];
     CHECK(stats.samples == 64 && total == 64,
           "all neutral samples land in the vectorscope");
     CHECK(stats.outside_nominal == 0,
           "neutral samples remain inside nominal chroma range");
-    CHECK(peak == 64, "neutral chroma accumulates at the center");
+    CHECK(peak[PROBE_VECTOR_SHADOW] == 0 &&
+          peak[PROBE_VECTOR_MID] == 64 &&
+          peak[PROBE_VECTOR_HIGHLIGHT] == 0,
+          "50%% Y' neutral chroma occupies the midtone band");
+    CHECK(stats.luma_band[PROBE_VECTOR_MID] == 64,
+          "vectorscope reports its Y' band population");
     ProbeRegion roi = { 4, 4, 12, 12 };
     CHECK(probe_cbcr_vectorscope(f, &roi, W, H, 2, 1.0,
                                  bins, &peak, &stats) &&

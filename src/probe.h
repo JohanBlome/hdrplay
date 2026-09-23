@@ -302,18 +302,27 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
 
 /* Digital vectorscope: Cb on the horizontal axis and Cr vertically. Values
  * are normalized so nominal chroma occupies -0.5..+0.5, with a 20% guard
- * band retained around the plot. */
+ * band retained around the plot. `bins` is luma-band-major and must hold
+ * PROBE_VECTOR_BANDS * width * height entries. */
 #define PROBE_VECTOR_LIMIT 0.6
+#define PROBE_VECTOR_BANDS 3
+enum {
+    PROBE_VECTOR_SHADOW = 0, /* Y' < 25%  */
+    PROBE_VECTOR_MID,        /* Y' 25-75% */
+    PROBE_VECTOR_HIGHLIGHT,  /* Y' > 75%  */
+};
 typedef struct {
     uint64_t samples;
     uint64_t outside_nominal;
+    uint64_t luma_band[PROBE_VECTOR_BANDS];
 } ProbeVectorStats;
 
 bool probe_cbcr_vectorscope(const AVFrame *frame, const ProbeRegion *region,
                             int width, int height,
                             int sample_stride, double display_gain,
                             uint32_t *bins,
-                            uint32_t *peak_count, ProbeVectorStats *stats);
+                            uint32_t peak_count[PROBE_VECTOR_BANDS],
+                            ProbeVectorStats *stats);
 
 /* R, Mg, B, Cy, G and Y target positions for the selected Y'CbCr matrix.
  * `amplitude` is normally 0.75 for traditional 75% color-bar boxes. Returns
