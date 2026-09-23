@@ -747,6 +747,10 @@ int main(int argc, char **argv)
     double base_wall  = 0.0;
     double base_clock = 0.0;
     bool   rebase     = true;
+    /* One line per run, not per frame: a decoder that cannot keep up is a
+     * property of the machine and the stream, and says nothing new on the
+     * second frame. */
+    bool   warned_behind = false;
     /* Redraw only when something changed. Set by any input event and by
      * a source advancing; see the render call at the bottom of the
      * loop for why an unconditional redraw is expensive here. */
@@ -1184,6 +1188,22 @@ int main(int argc, char **argv)
                     nanosleep(&ts, NULL);
                 } else if (delay < -0.050) {
                     LOGV("DEC", "behind=%.0fms (next=%.3fs)", -delay * 1000.0, next);
+                    /* hdrplay does not drop frames — every one is decoded
+                     * and measured, because a coverage figure that quietly
+                     * skipped frames would be worth less than no figure.
+                     * The cost is that a decoder slower than realtime does
+                     * not stutter, it races through the file and quits, and
+                     * without -v the only trace was an early "EOF". Say so
+                     * instead of leaving it to be inferred. */
+                    if (delay < -0.500 && !warned_behind) {
+                        warned_behind = true;
+                        LOG("DEC", "WARNING: %.1fs behind the clock — %s decode "
+                                   "is slower than realtime for this stream. "
+                                   "Every frame is still decoded and measured, "
+                                   "so playback runs to the end early.",
+                            -delay,
+                            sources[REF].dec.hw_active ? "hardware" : "software");
+                    }
                 }
             }
         } else {
