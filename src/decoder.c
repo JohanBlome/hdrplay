@@ -6,6 +6,7 @@
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/time.h>
 #include <libavutil/mastering_display_metadata.h>
 #if HDRPLAY_HAVE_AMVE
 #include <libavutil/ambient_viewing_environment.h>
@@ -479,8 +480,15 @@ bool decoder_resolve_color_range(Decoder *d, int max_frames)
     return true;
 }
 
+/* Consecutive AVERROR(EAGAIN)s from av_read_frame tolerated before the
+ * demuxer is called stuck. One millisecond apart, so this is also the
+ * wait in milliseconds. */
+#define READ_EAGAIN_LIMIT 1000
+
 int decoder_next_frame(Decoder *d)
 {
+    int eagain = 0;
+
     for (;;) {
         AVFrame *decoded = d->hw_frame ? d->hw_frame : d->frame;
         int r = avcodec_receive_frame(d->cc, decoded);
@@ -519,7 +527,12 @@ int decoder_next_frame(Decoder *d)
             return 1;
         }
         if (r == AVERROR_EOF) return 0;
-        if (r != AVERROR(EAGAIN)) { LOG("DEC", "decode error %d", r); return -1; }
+        if (r != AVERROR(EAGAIN)) {
+            char msg[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(r, msg, sizeof(msg));
+            LOG("DEC", "ERROR: decode failed: %s", msg);
+            return -1;
+        }
 
         /* Need more input. */
         r = av_read_frame(d->fmt, d->pkt);
@@ -527,10 +540,44 @@ int decoder_next_frame(Decoder *d)
             avcodec_send_packet(d->cc, NULL); /* drain */
             continue;
         }
-        if (r < 0) return -1;
+        /* A demuxer with nothing ready yet has not ended. Returning -1
+         * here made the caller mark the source finished, which surfaces
+         * as a bare "EOF" — indistinguishable from the real thing. */
+        if (r == AVERROR(EAGAIN)) {
+            av_packet_unref(d->pkt);
+            if (++eagain > READ_EAGAIN_LIMIT) {
+                LOG("DEC", "ERROR: demuxer stalled (no packet in %d ms)",
+                    READ_EAGAIN_LIMIT);
+                return -1;
+            }
+            av_usleep(1000);
+            continue;
+        }
+        if (r < 0) {
+            /* Every other read failure — truncated file, I/O error, a
+             * moov box that lied about the sample table. Silence here is
+             * what made a broken stream look like a finished one. */
+            char msg[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(r, msg, sizeof(msg));
+            LOG("DEC", "ERROR: read failed: %s", msg);
+            return -1;
+        }
+        eagain = 0;
 
-        if (d->pkt->stream_index == d->stream_idx)
-            avcodec_send_packet(d->cc, d->pkt);
+        if (d->pkt->stream_index == d->stream_idx) {
+            /* Any failure, EAGAIN included: output is drained above
+             * before every send, so the decoder cannot be asking for a
+             * read here. If it ever does, the packet this unrefs is one
+             * we silently never decoded — better said out loud. */
+            int s = avcodec_send_packet(d->cc, d->pkt);
+            if (s < 0) {
+                char msg[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(s, msg, sizeof(msg));
+                LOG("DEC", "ERROR: submit failed: %s", msg);
+                av_packet_unref(d->pkt);
+                return -1;
+            }
+        }
         av_packet_unref(d->pkt);
     }
 }

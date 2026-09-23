@@ -1129,8 +1129,19 @@ int main(int argc, char **argv)
             }
 
             if (all_eof) {
-                LOG("DEC", "EOF");
-                if (loop_at_eof && !all_still) {
+                /* Every way of running out used to print "EOF", so a
+                 * truncated file, an I/O error and a finished clip were
+                 * one message. Name the one that is not the end. */
+                bool failed = false;
+                for (int i = 0; i < n_sources; i++)
+                    if (sources[i].failed) failed = true;
+
+                LOG("DEC", "%s", failed
+                    ? "stopped: decode failed before the end of the stream"
+                    : "EOF");
+                /* Looping on a failing source would just re-run the
+                 * failure, which is neither playback nor a diagnosis. */
+                if (loop_at_eof && !all_still && !failed) {
                     for (int i = 0; i < n_sources; i++)
                         source_seek_to(&sources[i], 0.0);
                     clock_sec = 0.0;

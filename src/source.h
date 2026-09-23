@@ -57,7 +57,12 @@ typedef struct Source {
     struct AVFrame *previous;  /* predecessor for temporal diff (owned)*/
     struct AVFrame *pending;   /* decoded but not yet due (owned)      */
     bool     keep_previous;    /* retain predecessor for diff playback */
-    bool     eof;
+    bool     eof;              /* no more frames, for any reason       */
+    /* ...and whether that reason was a failure. Both end playback, but
+     * only one of them means the file actually ran out, and reporting a
+     * truncated or undecodable stream as "EOF" hides the difference at
+     * exactly the moment it matters. */
+    bool     failed;
     bool     still_image;      /* EOF after exactly one presented frame */
     int      frames_presented; /* since open or the most recent seek    */
     int      frame_no;         /* index of `shown`, for the HUD        */

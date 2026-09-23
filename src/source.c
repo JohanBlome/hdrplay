@@ -151,6 +151,7 @@ void source_flush(Source *s)
     av_frame_free(&s->pending);
     ring_clear(&s->ring);
     s->eof = false;
+    s->failed = false;
     s->still_image = false;
     s->frames_presented = 0;
     s->frame_stats_valid = false;
@@ -195,9 +196,13 @@ static bool fill_pending(Source *s)
     int r = decoder_next_frame(&s->dec);
     if (r <= 0) {
         s->eof = true;
+        s->failed = (r < 0);
         /* A still image is exposed by FFmpeg as a one-frame video stream.
          * Detect it from behavior rather than filename extensions so every
-         * decoder-backed image format receives the same treatment. */
+         * decoder-backed image format receives the same treatment. The
+         * r == 0 is load-bearing for the same reason `failed` exists: a
+         * video that dies after its first frame is a broken video, not an
+         * image, and must not be held on screen as one. */
         if (r == 0 && s->frames_presented == 1)
             s->still_image = true;
         return false;
