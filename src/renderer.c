@@ -1278,6 +1278,24 @@ int renderer_focus_source(const Renderer *r)
     return r->swapped ? 1 : 0;
 }
 
+bool renderer_window_to_source(const Renderer *r,
+                               double x, double y,
+                               int coordinate_w, int coordinate_h,
+                               bool clamp_to_image,
+                               int *source_x, int *source_y)
+{
+    if (!r || !r->focus_map_valid || coordinate_w <= 0 || coordinate_h <= 0)
+        return false;
+    double wx = x * r->focus_map_win_w / coordinate_w;
+    double wy = y * r->focus_map_win_h / coordinate_h;
+    return layout_window_to_source(r->focus_map_target, r->focus_map_image,
+                                   r->focus_map_frame_w,
+                                   r->focus_map_frame_h,
+                                   r->focus_map_rotation,
+                                   wx, wy, clamp_to_image,
+                                   source_x, source_y);
+}
+
 bool renderer_render(Renderer *r, Source *sources, int n)
 {
     if (n < 1) return false;
@@ -1439,6 +1457,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
 
     int focus = renderer_focus_source(r);
     if (!r->slot[focus].mapped) {
+        r->focus_map_valid = false;
         /* Nothing to draw from the focused source; still present so the
          * window does not freeze. */
         for (int i = 0; i < slot_count; i++)
@@ -1553,6 +1572,21 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     for (int i = 0; i < plan.n_pass; i++)
         if (plan.pass[i].src == focus) { r->last_scale = plan.pass[i].scale; break; }
 
+    const LayoutPass *focus_pass = NULL;
+    for (int i = 0; i < plan.n_pass; i++)
+        if (plan.pass[i].src == focus) { focus_pass = &plan.pass[i]; break; }
+    r->focus_map_valid = focus_pass != NULL && sources[focus].shown != NULL;
+    if (r->focus_map_valid) {
+        r->focus_map_src = focus;
+        r->focus_map_win_w = win_w;
+        r->focus_map_win_h = win_h;
+        r->focus_map_frame_w = sources[focus].shown->width;
+        r->focus_map_frame_h = sources[focus].shown->height;
+        r->focus_map_rotation = r->rotation[focus];
+        r->focus_map_target = focus_pass->target_crop;
+        r->focus_map_image = focus_pass->image_crop;
+    }
+
     /* The probe maps a window coordinate back to a source pixel, so it
      * has to account for zoom/pan the same way the render does. */
     if (r->probe_active && r->probe_x >= 0 && r->probe_y >= 0 &&
@@ -1560,41 +1594,16 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     {
         AVFrame *pf = sources[focus].shown;
 
-        /* The pass that actually draws the focused source. Under a
-         * two-pane split that is not always pass 0, and now that each
-         * pass has its own letterboxed rect, using the wrong one puts
-         * the readout in the wrong pane. */
-        const LayoutPass *fp = &plan.pass[0];
-        for (int i = 0; i < plan.n_pass; i++)
-            if (plan.pass[i].src == focus) { fp = &plan.pass[i]; break; }
-
-        /* Cursor in window pixels, rescaled if the window changed size
-         * between the motion event and now. */
-        double wx = (double)r->probe_x * win_w / r->probe_win_w;
-        double wy = (double)r->probe_y * win_h / r->probe_win_h;
-
-        LayoutRect t = fp->target_crop;
-        double tw = t.x1 - t.x0, th = t.y1 - t.y0;
-        double fx = tw > 0 ? (wx - t.x0) / tw : -1.0;
-        double fy = th > 0 ? (wy - t.y0) / th : -1.0;
-
-        if (fx < 0.0 || fx > 1.0 || fy < 0.0 || fy > 1.0) {
+        int sx, sy;
+        if (!renderer_window_to_source(r,
+                                       r->probe_x, r->probe_y,
+                                       r->probe_win_w, r->probe_win_h,
+                                       false, &sx, &sy)) {
             /* Over a letterbox bar or the other pane — no source pixel
              * there. Reporting the nearest edge pixel instead would be a
              * confident answer about something not on screen. */
             r->probe_nits = NAN;
         } else {
-            /* Window space is rotated; the crop below is not. */
-            layout_unrotate_norm(r->rotation[focus], &fx, &fy);
-            LayoutRect ic = fp->image_crop;
-            int sx, sy;
-            if (rect_is_zero(ic)) {
-                sx = (int)(fx * pf->width);
-                sy = (int)(fy * pf->height);
-            } else {
-                sx = (int)(ic.x0 + fx * (ic.x1 - ic.x0));
-                sy = (int)(ic.y0 + fy * (ic.y1 - ic.y0));
-            }
             ProbeResult pr;
             if (probe_sample(pf, sx, sy, &pr)) {
                 r->probe_nits   = pr.luma_nits;
@@ -1732,6 +1741,10 @@ bool renderer_render(Renderer *r, Source *sources, int n)
                 break;
             case LAYOUT_OV_SCOPE:
                 if (hud_ov.has_scope) ov_store[n_ov++] = hud_ov.scope;
+                break;
+            case LAYOUT_OV_SCOPE_ROI:
+                if (hud_ov.has_scope_roi)
+                    ov_store[n_ov++] = hud_ov.scope_roi;
                 break;
             case LAYOUT_OV_PLANE:
                 if (hud_ov.has_plane)   ov_store[n_ov++] = hud_ov.plane;

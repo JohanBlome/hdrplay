@@ -149,6 +149,8 @@ static void test_single_file_unchanged(void)
     layout_plan(&in, &pl);
     CHECK(count_ov_plan(&pl, LAYOUT_OV_SCOPE) == 1,
           "RGB waveform attached exactly once");
+    CHECK(count_ov_plan(&pl, LAYOUT_OV_SCOPE_ROI) == 1,
+          "scope ROI outline has one routed overlay slot");
     const LayoutOverlay *w = NULL;
     for (int i = 0; i < pl.pass[0].n_ov; i++)
         if (pl.pass[0].ov[i].kind == LAYOUT_OV_SCOPE)
@@ -423,7 +425,7 @@ static void test_overlay_routing_is_exclusive(void)
     puts("every overlay lands in exactly one pass");
     LayoutOverlayKind kinds[] = {
         LAYOUT_OV_STATUS, LAYOUT_OV_SESSION,
-        LAYOUT_OV_SCOPE, LAYOUT_OV_PLANE,
+        LAYOUT_OV_SCOPE, LAYOUT_OV_SCOPE_ROI, LAYOUT_OV_PLANE,
         LAYOUT_OV_LABEL_A, LAYOUT_OV_LABEL_B,
     };
     HdrplaySplitOrient orients[] = {
@@ -439,7 +441,7 @@ static void test_overlay_routing_is_exclusive(void)
             in.orient = orients[o];
             in.mode = (HdrplayMode)m;
             LayoutPlan pl; layout_plan(&in, &pl);
-            for (int k = 0; k < 6; k++) {
+            for (int k = 0; k < 7; k++) {
                 int n = count_ov_plan(&pl, kinds[k]);
                 CHECK(n <= 1, "orient %d mode %d: overlay %d appears %dx",
                       (int)o, m, kinds[k], n);
@@ -449,6 +451,9 @@ static void test_overlay_routing_is_exclusive(void)
                   (int)o, m);
             CHECK(count_ov_plan(&pl, LAYOUT_OV_SCOPE) == 1,
                   "orient %d mode %d: waveform appears once",
+                  (int)o, m);
+            CHECK(count_ov_plan(&pl, LAYOUT_OV_SCOPE_ROI) == 1,
+                  "orient %d mode %d: ROI outline appears once",
                   (int)o, m);
         }
     }
@@ -879,6 +884,45 @@ static void test_panes_meet_at_the_seam(void)
           "single pane is still centred (%.0f..%.0f)", t.x0, t.x1);
 }
 
+static void test_source_region_mapping(void)
+{
+    puts("source ROI mapping follows crop and rotation");
+    LayoutRect target = {100, 50, 900, 650};
+    LayoutRect crop = {200, 100, 1800, 1300};
+    int sx = -1, sy = -1;
+    CHECK(layout_window_to_source(target, crop, 2000, 1400, 0,
+                                  500, 350, false, &sx, &sy),
+          "window center maps into the source crop");
+    CHECK(sx == 1000 && sy == 700,
+          "window center -> source center (%d,%d)", sx, sy);
+    CHECK(!layout_window_to_source(target, crop, 2000, 1400, 0,
+                                   50, 350, false, &sx, &sy),
+          "point outside the rendered image is rejected");
+    CHECK(layout_window_to_source(target, crop, 2000, 1400, 0,
+                                  50, 350, true, &sx, &sy) && sx == 200,
+          "drag outside clamps to the visible source edge");
+
+    LayoutRect source = {600, 400, 1400, 1000}, window;
+    CHECK(layout_source_to_window(source, target, crop,
+                                  2000, 1400, 0, &window),
+          "source ROI projects back into the window");
+    CHECK(fabsf(window.x0 - 300.0f) < 0.01f &&
+          fabsf(window.y0 - 200.0f) < 0.01f &&
+          fabsf(window.x1 - 700.0f) < 0.01f &&
+          fabsf(window.y1 - 500.0f) < 0.01f,
+          "unrotated ROI projection is exact");
+
+    source = (LayoutRect){200, 100, 600, 400};
+    CHECK(layout_source_to_window(source, target, crop,
+                                  2000, 1400, 90, &window),
+          "source ROI projects through 90-degree rotation");
+    CHECK(fabsf(window.x0 - 700.0f) < 0.01f &&
+          fabsf(window.y0 - 50.0f) < 0.01f &&
+          fabsf(window.x1 - 900.0f) < 0.01f &&
+          fabsf(window.y1 - 200.0f) < 0.01f,
+          "90-degree ROI projection rotates position and dimensions");
+}
+
 int main(void)
 {
     test_single_file_unchanged();
@@ -899,6 +943,7 @@ int main(void)
     test_aspect_is_always_preserved();
     test_one_to_one_is_exact();
     test_panes_meet_at_the_seam();
+    test_source_region_mapping();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

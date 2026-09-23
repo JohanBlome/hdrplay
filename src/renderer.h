@@ -253,6 +253,22 @@ typedef struct Renderer {
     HdrplayScopeView scope_view; /* 'V' cycles diagnostic scopes       */
     float  vector_gain;          /* vectorscope trace magnification     */
 
+    /* Scope sampling regions are stored in original source pixels so a
+     * selection remains stable through zoom, pan, resize and rotation. */
+    ProbeRegion scope_roi[2];
+    bool        scope_roi_active[2];
+
+    /* Focused pane geometry from the most recent render. Mouse events arrive
+     * between renders, so main uses this snapshot to map window coordinates
+     * back into the source without duplicating layout policy. */
+    bool       focus_map_valid;
+    int        focus_map_src;
+    int        focus_map_win_w, focus_map_win_h;
+    int        focus_map_frame_w, focus_map_frame_h;
+    int        focus_map_rotation;
+    LayoutRect focus_map_target;
+    LayoutRect focus_map_image;
+
     /* HDR10 static metadata the container DECLARES, copied from the
      * decoder so the HUD can print measured-vs-declared side by side.
      * cll_max is MaxCLL, cll_avg is MaxFALL. */
@@ -272,6 +288,11 @@ bool renderer_render(Renderer *r, struct Source *sources, int n);
 /* Which source the HUD, probe, statistics and frame stepping describe:
  * the left/top pane in a comparison, or the soloed file. */
 int  renderer_focus_source(const Renderer *r);
+bool renderer_window_to_source(const Renderer *r,
+                               double x, double y,
+                               int coordinate_w, int coordinate_h,
+                               bool clamp_to_image,
+                               int *source_x, int *source_y);
 void renderer_update_display_state(Renderer *r);
 void renderer_close(Renderer *r);
 

@@ -55,6 +55,7 @@ typedef enum {
     LAYOUT_OV_STATUS,        /* top-left status panel                 */
     LAYOUT_OV_SESSION,       /* accumulated-statistics panel          */
     LAYOUT_OV_SCOPE,         /* waveform or gamut scope               */
+    LAYOUT_OV_SCOPE_ROI,     /* selected source region outline        */
     LAYOUT_OV_PLANE,         /* current COLOR/Y/Cb/Cr view badge      */
     LAYOUT_OV_LABEL_A,       /* badge for the first pane              */
     LAYOUT_OV_LABEL_B,       /* badge for the second pane             */
@@ -68,7 +69,7 @@ typedef struct {
 
 #define LAYOUT_MAX_PASSES   2
 #define LAYOUT_MAX_INTER    2
-#define LAYOUT_MAX_OVERLAYS 8
+#define LAYOUT_MAX_OVERLAYS 10
 
 /* An intermediate render, performed before any swapchain pass. */
 typedef struct {
@@ -225,5 +226,16 @@ void layout_rotated_dims(int rot, int w, int h, int *out_w, int *out_h);
  * Lives here rather than in renderer.c so it is reachable from the
  * layout tests; it is the same geometry as the dimension swap above. */
 void layout_unrotate_norm(int rot, double *x, double *y);
+
+/* Map between a rendered pane and the original, unrotated source. The source
+ * rectangle is clipped to the currently visible crop before projection. */
+bool layout_window_to_source(LayoutRect target, LayoutRect image_crop,
+                             int frame_w, int frame_h, int rot,
+                             double wx, double wy, bool clamp_to_target,
+                             int *sx, int *sy);
+bool layout_source_to_window(LayoutRect source, LayoutRect target,
+                             LayoutRect image_crop,
+                             int frame_w, int frame_h, int rot,
+                             LayoutRect *window);
 
 #endif

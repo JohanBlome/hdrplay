@@ -527,7 +527,24 @@ static bool chroma_planes_supported(const AVPixFmtDescriptor *desc)
     return true;
 }
 
-bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
+static bool probe_region_bounds(const AVFrame *frame,
+                                const ProbeRegion *region,
+                                int *x0, int *y0, int *x1, int *y1)
+{
+    if (!frame || frame->width <= 0 || frame->height <= 0) return false;
+    *x0 = region ? region->x0 : 0;
+    *y0 = region ? region->y0 : 0;
+    *x1 = region ? region->x1 : frame->width;
+    *y1 = region ? region->y1 : frame->height;
+    if (*x0 < 0) *x0 = 0;
+    if (*y0 < 0) *y0 = 0;
+    if (*x1 > frame->width)  *x1 = frame->width;
+    if (*y1 > frame->height) *y1 = frame->height;
+    return *x1 > *x0 && *y1 > *y0;
+}
+
+bool probe_rgb_waveform(const AVFrame *frame, const ProbeRegion *region,
+                        int width, int height,
                         int vertical_stride, uint32_t *bins,
                         uint32_t peak_count[3], int *out_samples)
 {
@@ -544,6 +561,9 @@ bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
         return false;
     for (int c = 0; c < 3; c++)
         if (!frame->data[desc->comp[c].plane]) return false;
+    int rx0, ry0, rx1, ry1;
+    if (!probe_region_bounds(frame, region, &rx0, &ry0, &rx1, &ry1))
+        return false;
 
     size_t plane_size = (size_t)width * (size_t)height;
     memset(bins, 0, 3 * plane_size * sizeof(*bins));
@@ -563,10 +583,10 @@ bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
      * guarantees a continuous scope even when a low-resolution input is
      * displayed in a wide waveform panel. */
     for (int bx = 0; bx < width; bx++) {
-        int x = (int)(((int64_t)bx * 2 + 1) * frame->width /
+        int x = rx0 + (int)(((int64_t)bx * 2 + 1) * (rx1 - rx0) /
                       ((int64_t)width * 2));
-        if (x >= frame->width) x = frame->width - 1;
-        for (int y = 0; y < frame->height; y += vertical_stride) {
+        if (x >= rx1) x = rx1 - 1;
+        for (int y = ry0; y < ry1; y += vertical_stride) {
             int y_raw = read_component(frame, desc, 0, x, y);
             int u_raw = read_component(frame, desc, 1, x, y);
             int v_raw = read_component(frame, desc, 2, x, y);
@@ -606,7 +626,8 @@ bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
     return true;
 }
 
-bool probe_rgb_histogram(const AVFrame *frame, int width, int sample_stride,
+bool probe_rgb_histogram(const AVFrame *frame, const ProbeRegion *region,
+                         int width, int sample_stride,
                          uint32_t *bins, uint32_t peak_count[3],
                          ProbeRgbHistogramStats *stats)
 {
@@ -623,6 +644,9 @@ bool probe_rgb_histogram(const AVFrame *frame, int width, int sample_stride,
         return false;
     for (int c = 0; c < 3; c++)
         if (!frame->data[desc->comp[c].plane]) return false;
+    int rx0, ry0, rx1, ry1;
+    if (!probe_region_bounds(frame, region, &rx0, &ry0, &rx1, &ry1))
+        return false;
 
     memset(bins, 0, 3 * (size_t)width * sizeof(*bins));
     bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
@@ -636,8 +660,8 @@ bool probe_rgb_histogram(const AVFrame *frame, int width, int sample_stride,
     ProbeRgbHistogramStats local = {0};
     uint32_t local_peak[3] = {0};
 
-    for (int y = 0; y < frame->height; y += sample_stride) {
-        for (int x = 0; x < frame->width; x += sample_stride) {
+    for (int y = ry0; y < ry1; y += sample_stride) {
+        for (int x = rx0; x < rx1; x += sample_stride) {
             int y_raw = read_component(frame, desc, 0, x, y);
             int u_raw = read_component(frame, desc, 1, x, y);
             int v_raw = read_component(frame, desc, 2, x, y);
@@ -735,7 +759,8 @@ static bool xy_in_triangle(double x, double y,
     return !(neg && pos);
 }
 
-bool probe_xy_gamut(const AVFrame *frame, int width, int height,
+bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
+                    int width, int height,
                     int sample_stride, uint32_t *bins,
                     uint32_t *peak_count, ProbeGamutStats *stats)
 {
@@ -752,6 +777,9 @@ bool probe_xy_gamut(const AVFrame *frame, int width, int height,
         return false;
     for (int c = 0; c < 3; c++)
         if (!frame->data[desc->comp[c].plane]) return false;
+    int rx0, ry0, rx1, ry1;
+    if (!probe_region_bounds(frame, region, &rx0, &ry0, &rx1, &ry1))
+        return false;
 
     size_t count = (size_t)width * (size_t)height;
     memset(bins, 0, count * sizeof(*bins));
@@ -768,8 +796,8 @@ bool probe_xy_gamut(const AVFrame *frame, int width, int height,
     ProbeGamutStats local = {0};
     uint32_t peak = 0;
 
-    for (int sy = 0; sy < frame->height; sy += sample_stride) {
-        for (int sx = 0; sx < frame->width; sx += sample_stride) {
+    for (int sy = ry0; sy < ry1; sy += sample_stride) {
+        for (int sx = rx0; sx < rx1; sx += sample_stride) {
             int y_raw = read_component(frame, desc, 0, sx, sy);
             int u_raw = read_component(frame, desc, 1, sx, sy);
             int v_raw = read_component(frame, desc, 2, sx, sy);
@@ -858,7 +886,8 @@ bool probe_vectorscope_targets(enum AVColorSpace matrix, double amplitude,
     return true;
 }
 
-bool probe_cbcr_vectorscope(const AVFrame *frame, int width, int height,
+bool probe_cbcr_vectorscope(const AVFrame *frame, const ProbeRegion *region,
+                            int width, int height,
                             int sample_stride, double display_gain,
                             uint32_t *bins,
                             uint32_t *peak_count, ProbeVectorStats *stats)
@@ -878,6 +907,9 @@ bool probe_cbcr_vectorscope(const AVFrame *frame, int width, int height,
         return false;
     for (int c = 1; c <= 2; c++)
         if (!frame->data[desc->comp[c].plane]) return false;
+    int rx0, ry0, rx1, ry1;
+    if (!probe_region_bounds(frame, region, &rx0, &ry0, &rx1, &ry1))
+        return false;
 
     size_t bin_count = (size_t)width * (size_t)height;
     memset(bins, 0, bin_count * sizeof(*bins));
@@ -888,8 +920,8 @@ bool probe_cbcr_vectorscope(const AVFrame *frame, int width, int height,
     ProbeVectorStats local = {0};
     uint32_t peak = 0;
 
-    for (int sy = 0; sy < frame->height; sy += sample_stride) {
-        for (int sx = 0; sx < frame->width; sx += sample_stride) {
+    for (int sy = ry0; sy < ry1; sy += sample_stride) {
+        for (int sx = rx0; sx < rx1; sx += sample_stride) {
             int u_raw = read_component(frame, desc, 1, sx, sy);
             int v_raw = read_component(frame, desc, 2, sx, sy);
             double cb, cr;

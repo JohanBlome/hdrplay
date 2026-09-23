@@ -536,7 +536,7 @@ static void test_rgb_waveform(void)
     uint32_t peak[3];
     int samples = 0;
 
-    CHECK(probe_rgb_waveform(f, W, H, 2, bins, peak, &samples),
+    CHECK(probe_rgb_waveform(f, NULL, W, H, 2, bins, peak, &samples),
           "P010 source produces an RGB waveform");
     CHECK(samples == W * 8, "sample count %d (expect %d)", samples, W * 8);
 
@@ -551,6 +551,13 @@ static void test_rgb_waveform(void)
     CHECK(peak[0] == 8 && peak[1] == 8 && peak[2] == 8,
           "per-channel density peaks preserved");
 
+    ProbeRegion roi = { 4, 4, 12, 12 };
+    CHECK(probe_rgb_waveform(f, &roi, W, H, 2,
+                             bins, peak, &samples),
+          "waveform accepts a source region");
+    CHECK(samples == W * 4,
+          "waveform samples only the selected rows (%d)", samples);
+
     av_frame_free(&f);
 }
 
@@ -563,7 +570,7 @@ static void test_rgb_histogram(void)
     uint32_t bins[3 * W], peak[3];
     ProbeRgbHistogramStats stats;
 
-    CHECK(probe_rgb_histogram(f, W, 2, bins, peak, &stats),
+    CHECK(probe_rgb_histogram(f, NULL, W, 2, bins, peak, &stats),
           "P010 source produces an RGB histogram");
     CHECK(stats.samples == 64, "sample count %llu (expect 64)",
           (unsigned long long)stats.samples);
@@ -576,6 +583,12 @@ static void test_rgb_histogram(void)
         neutral &= stats.outside_nominal[c] == 0;
     }
     CHECK(neutral, "nominal black aligns all channels at 0%%");
+    ProbeRegion roi = { 4, 4, 12, 12 };
+    CHECK(probe_rgb_histogram(f, &roi, W, 2, bins, peak, &stats),
+          "histogram accepts a source region");
+    CHECK(stats.samples == 16,
+          "histogram samples only the selected rectangle (%llu)",
+          (unsigned long long)stats.samples);
     av_frame_free(&f);
 }
 
@@ -598,7 +611,7 @@ static void test_xy_gamut(void)
     uint32_t bins[W * H];
     uint32_t peak = 0;
     ProbeGamutStats stats;
-    CHECK(probe_xy_gamut(f, W, H, 2, bins, &peak, &stats),
+    CHECK(probe_xy_gamut(f, NULL, W, H, 2, bins, &peak, &stats),
           "P010 source produces a CIE gamut density plot");
     uint64_t total = 0;
     for (int i = 0; i < W * H; i++) total += bins[i];
@@ -607,6 +620,10 @@ static void test_xy_gamut(void)
     CHECK(stats.outside_709 == 0 && stats.outside_p3 == 0,
           "neutral samples remain inside Rec.709 and Display-P3");
     CHECK(peak == 64, "coincident neutral samples retain density");
+    ProbeRegion roi = { 4, 4, 12, 12 };
+    CHECK(probe_xy_gamut(f, &roi, W, H, 2, bins, &peak, &stats) &&
+          stats.samples == 16,
+          "gamut scope samples only the selected rectangle");
     av_frame_free(&f);
 }
 
@@ -633,7 +650,8 @@ static void test_vectorscope(void)
     enum { W = 64, H = 64 };
     uint32_t bins[W * H], peak = 0;
     ProbeVectorStats stats;
-    CHECK(probe_cbcr_vectorscope(f, W, H, 2, 1.0, bins, &peak, &stats),
+    CHECK(probe_cbcr_vectorscope(f, NULL, W, H, 2, 1.0,
+                                 bins, &peak, &stats),
           "P010 source produces a Cb/Cr density plot");
     uint64_t total = 0;
     for (int i = 0; i < W * H; i++) total += bins[i];
@@ -642,6 +660,11 @@ static void test_vectorscope(void)
     CHECK(stats.outside_nominal == 0,
           "neutral samples remain inside nominal chroma range");
     CHECK(peak == 64, "neutral chroma accumulates at the center");
+    ProbeRegion roi = { 4, 4, 12, 12 };
+    CHECK(probe_cbcr_vectorscope(f, &roi, W, H, 2, 1.0,
+                                 bins, &peak, &stats) &&
+          stats.samples == 16,
+          "vectorscope samples only the selected rectangle");
     av_frame_free(&f);
 }
 

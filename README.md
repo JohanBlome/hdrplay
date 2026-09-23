@@ -166,7 +166,15 @@ hdrplay --gamut video.mp4             # start with the CIE gamut scope
 hdrplay --vectorscope video.mp4       # start with the Cb/Cr vectorscope
 hdrplay --histogram video.mp4         # start with the RGB histogram
 hdrplay first.mov second.mov          # synchronized comparison
+hdrplay image.png                     # inspect a still image
 ```
+
+Still images supported by the installed FFmpeg build—such as PNG, JPEG,
+TIFF and WebP—are decoded as one-frame streams and remain displayed until the
+window is closed. The normal zoom, comparison and HDR/SDR controls stay
+available; source-analysis scopes work when FFmpeg decodes the image to one of
+their supported pixel formats. Animated image formats retain their frame timing
+and play normally.
 
 ### Runtime controls
 
@@ -178,6 +186,7 @@ hdrplay first.mov second.mov          # synchronized comparison
 | `O` | cycle split orientation and comparison wipes |
 | `C` | cycle color, Y, Cb, Cr, legal, clip and plateau views |
 | `V` | cycle scopes: off, waveform, gamut, vectorscope, histogram |
+| `Shift`+drag | select the source rectangle used by scopes; Shift-click clears it |
 | `G` | toggle vectorscope trace gain between 1x and 2x |
 | `D` | toggle current/previous or A/B difference |
 | `Space` | pause or resume |
@@ -274,6 +283,19 @@ bins; the panel also reports how many channel samples are outside nominal
 
 In two-file comparison, the active scope stays inside one pane and follows the
 focused (first visible) source.
+
+Hold `Shift` and drag over the focused image to restrict every scope to that
+source rectangle. The yellow outline remains attached to the selected source
+pixels through zoom, pan, window resizing and rotation. Shift-click without a
+drag clears the selection and returns scopes to the full frame. Each input
+retains its own selection in two-file comparison.
+
+When an ROI is active, waveform, gamut and vectorscope trace brightness is
+normalized to the selected samples so a small region does not disappear merely
+because it contains fewer pixels. Only density brightness is normalized: axis
+positions, signal levels, vectorscope gain and target placement do not change.
+Absolute trace brightness therefore should not be compared between full-frame
+and ROI views. The histogram already uses its own peak-normalized log scale.
 
 ### Rotation
 

@@ -62,6 +62,92 @@ void layout_unrotate_norm(int rot, double *x, double *y)
     }
 }
 
+static void rotate_norm(int rot, double *x, double *y)
+{
+    double fx = *x, fy = *y;
+    switch (((rot % 360) + 360) % 360) {
+    case 90:  *x = 1.0 - fy;  *y = fx;        break;
+    case 180: *x = 1.0 - fx;  *y = 1.0 - fy;  break;
+    case 270: *x = fy;        *y = 1.0 - fx;  break;
+    default:  break;
+    }
+}
+
+static LayoutRect full_if_zero(LayoutRect crop, int w, int h)
+{
+    if (crop.x0 == 0.0f && crop.y0 == 0.0f &&
+        crop.x1 == 0.0f && crop.y1 == 0.0f)
+        return rect(0.0f, 0.0f, (float)w, (float)h);
+    return crop;
+}
+
+bool layout_window_to_source(LayoutRect target, LayoutRect image_crop,
+                             int frame_w, int frame_h, int rot,
+                             double wx, double wy, bool clamp_to_target,
+                             int *sx, int *sy)
+{
+    double tw = target.x1 - target.x0, th = target.y1 - target.y0;
+    if (!(tw > 0.0) || !(th > 0.0) || frame_w <= 0 || frame_h <= 0)
+        return false;
+    double fx = (wx - target.x0) / tw;
+    double fy = (wy - target.y0) / th;
+    if (!clamp_to_target &&
+        (fx < 0.0 || fx > 1.0 || fy < 0.0 || fy > 1.0))
+        return false;
+    if (fx < 0.0) fx = 0.0;
+    if (fx > 1.0) fx = 1.0;
+    if (fy < 0.0) fy = 0.0;
+    if (fy > 1.0) fy = 1.0;
+    layout_unrotate_norm(rot, &fx, &fy);
+
+    LayoutRect crop = full_if_zero(image_crop, frame_w, frame_h);
+    int x = (int)(crop.x0 + fx * (crop.x1 - crop.x0));
+    int y = (int)(crop.y0 + fy * (crop.y1 - crop.y0));
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= frame_w) x = frame_w - 1;
+    if (y >= frame_h) y = frame_h - 1;
+    if (sx) *sx = x;
+    if (sy) *sy = y;
+    return true;
+}
+
+bool layout_source_to_window(LayoutRect source, LayoutRect target,
+                             LayoutRect image_crop,
+                             int frame_w, int frame_h, int rot,
+                             LayoutRect *window)
+{
+    if (!window || frame_w <= 0 || frame_h <= 0 ||
+        !(target.x1 > target.x0) || !(target.y1 > target.y0))
+        return false;
+    LayoutRect crop = full_if_zero(image_crop, frame_w, frame_h);
+    if (source.x1 <= crop.x0 || source.y1 <= crop.y0 ||
+        source.x0 >= crop.x1 || source.y0 >= crop.y1 ||
+        !(source.x1 > source.x0) || !(source.y1 > source.y0))
+        return false;
+
+    double min_x = 2.0, min_y = 2.0, max_x = -1.0, max_y = -1.0;
+    for (int iy = 0; iy < 2; iy++) {
+        for (int ix = 0; ix < 2; ix++) {
+            double x = ((ix ? source.x1 : source.x0) - crop.x0) /
+                       (crop.x1 - crop.x0);
+            double y = ((iy ? source.y1 : source.y0) - crop.y0) /
+                       (crop.y1 - crop.y0);
+            rotate_norm(rot, &x, &y);
+            if (x < min_x) min_x = x;
+            if (x > max_x) max_x = x;
+            if (y < min_y) min_y = y;
+            if (y > max_y) max_y = y;
+        }
+    }
+    double tw = target.x1 - target.x0, th = target.y1 - target.y0;
+    *window = rect((float)(target.x0 + min_x * tw),
+                   (float)(target.y0 + min_y * th),
+                   (float)(target.x0 + max_x * tw),
+                   (float)(target.y0 + max_y * th));
+    return true;
+}
+
 HdrplaySplitOrient layout_next_split_orient(HdrplaySplitOrient current,
                                              bool two_source_compare)
 {
@@ -330,8 +416,10 @@ static void plan_single(const LayoutInput *in, LayoutPlan *out, int src)
         add_ov(p, LAYOUT_OV_INTERMEDIATE, src, full);
     }
 
-    if (in->scope_visible)
+    if (in->scope_visible) {
+        add_ov(p, LAYOUT_OV_SCOPE_ROI, src, tgt);
         add_ov(p, LAYOUT_OV_SCOPE, src, scope_rect(in, false));
+    }
 
     if (!in->hud_hidden)
         add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
@@ -414,8 +502,10 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
             .dst = tb, .image_crop = ib_ };
         add_ov(p, LAYOUT_OV_INTERMEDIATE, b, full);
 
-        if (in->scope_visible)
+        if (in->scope_visible) {
+            add_ov(p, LAYOUT_OV_SCOPE_ROI, a, ta);
             add_ov(p, LAYOUT_OV_SCOPE, a, scope_rect(in, false));
+        }
 
         if (!in->hud_hidden)   add_ov(p, LAYOUT_OV_STATUS, -1, status_rect());
         add_ov(p, LAYOUT_OV_PLANE, -1, plane_rect(in));
@@ -490,6 +580,7 @@ static void plan_pair(const LayoutInput *in, LayoutPlan *out)
 
     if (in->scope_visible) {
         LayoutRect wr = scope_rect(in, true);
+        add_ov(pa, LAYOUT_OV_SCOPE_ROI, a, ta);
         add_ov(rect_contains(ca, wr) ? pa : pb,
                LAYOUT_OV_SCOPE, a, wr);
     }
@@ -553,9 +644,10 @@ static void plan_diff(const LayoutInput *in, LayoutPlan *out)
 
     /* The diff is opaque, so it must precede the diagnostic overlays. */
     add_ov(&out->pass[0], LAYOUT_OV_DIFF, -1, full);
-    if (in->scope_visible)
-        add_ov(&out->pass[0], LAYOUT_OV_SCOPE,
-               layout_reference_source(in), scope_rect(in, false));
+    if (in->scope_visible) {
+        add_ov(&out->pass[0], LAYOUT_OV_SCOPE_ROI, a, ta);
+        add_ov(&out->pass[0], LAYOUT_OV_SCOPE, a, scope_rect(in, false));
+    }
     if (!in->hud_hidden)
         add_ov(&out->pass[0], LAYOUT_OV_STATUS, -1, status_rect());
     add_ov(&out->pass[0], LAYOUT_OV_PLANE, -1, plane_rect(in));

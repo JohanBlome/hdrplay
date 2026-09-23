@@ -151,6 +151,8 @@ void source_flush(Source *s)
     av_frame_free(&s->pending);
     ring_clear(&s->ring);
     s->eof = false;
+    s->still_image = false;
+    s->frames_presented = 0;
     s->frame_stats_valid = false;
 }
 
@@ -191,7 +193,15 @@ static bool fill_pending(Source *s)
     if (s->eof) return false;
 
     int r = decoder_next_frame(&s->dec);
-    if (r <= 0) { s->eof = true; return false; }
+    if (r <= 0) {
+        s->eof = true;
+        /* A still image is exposed by FFmpeg as a one-frame video stream.
+         * Detect it from behavior rather than filename extensions so every
+         * decoder-backed image format receives the same treatment. */
+        if (r == 0 && s->frames_presented == 1)
+            s->still_image = true;
+        return false;
+    }
 
     decoder_absorb_frame_side_data(&s->dec);
     s->pending = av_frame_clone(s->dec.frame);
@@ -227,6 +237,7 @@ static void promote(Source *s)
         session_stats_note_unsupported(&s->session);
 
     s->frame_no = displayed_frame_no(s, f, s->frame_no + 1);
+    s->frames_presented++;
 
     if (s->ring.cap > 0)
         ring_push(&s->ring, av_frame_clone(f));

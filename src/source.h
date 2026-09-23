@@ -58,6 +58,8 @@ typedef struct Source {
     struct AVFrame *pending;   /* decoded but not yet due (owned)      */
     bool     keep_previous;    /* retain predecessor for diff playback */
     bool     eof;
+    bool     still_image;      /* EOF after exactly one presented frame */
+    int      frames_presented; /* since open or the most recent seek    */
     int      frame_no;         /* index of `shown`, for the HUD        */
 
     FrameRing ring;

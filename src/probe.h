@@ -257,7 +257,16 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
 /* X position. Returns false for unsupported source formats.            */
 #define PROBE_WAVEFORM_MIN_SIGNAL (-0.10)
 #define PROBE_WAVEFORM_MAX_SIGNAL ( 1.10)
-bool probe_rgb_waveform(const AVFrame *frame, int width, int height,
+typedef struct {
+    int x0, y0; /* inclusive */
+    int x1, y1; /* exclusive */
+} ProbeRegion;
+
+/* A NULL region selects the full frame. Non-NULL regions are clipped to the
+ * frame bounds and shared by all live scope probes below. */
+
+bool probe_rgb_waveform(const AVFrame *frame, const ProbeRegion *region,
+                        int width, int height,
                         int vertical_stride, uint32_t *bins,
                         uint32_t peak_count[3], int *out_samples);
 
@@ -270,7 +279,8 @@ typedef struct {
     uint64_t outside_nominal[3];
 } ProbeRgbHistogramStats;
 
-bool probe_rgb_histogram(const AVFrame *frame, int width, int sample_stride,
+bool probe_rgb_histogram(const AVFrame *frame, const ProbeRegion *region,
+                         int width, int sample_stride,
                          uint32_t *bins, uint32_t peak_count[3],
                          ProbeRgbHistogramStats *stats);
 
@@ -285,7 +295,8 @@ typedef struct {
     uint64_t outside_p3;
 } ProbeGamutStats;
 
-bool probe_xy_gamut(const AVFrame *frame, int width, int height,
+bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
+                    int width, int height,
                     int sample_stride, uint32_t *bins,
                     uint32_t *peak_count, ProbeGamutStats *stats);
 
@@ -298,7 +309,8 @@ typedef struct {
     uint64_t outside_nominal;
 } ProbeVectorStats;
 
-bool probe_cbcr_vectorscope(const AVFrame *frame, int width, int height,
+bool probe_cbcr_vectorscope(const AVFrame *frame, const ProbeRegion *region,
+                            int width, int height,
                             int sample_stride, double display_gain,
                             uint32_t *bins,
                             uint32_t *peak_count, ProbeVectorStats *stats);

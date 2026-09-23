@@ -318,6 +318,7 @@ static void usage(void)
         "                        I=show/hide top-left status HUD\n"
         "                        A=show/hide accumulated stats panel\n"
         "                        V=cycle scopes: off/waveform/gamut/vector/histogram\n"
+        "                        shift-drag=select scope source area\n"
         "                        G=toggle vectorscope trace gain 1x/2x\n"
         "                        shift-A=reset accumulated stats\n"
         "                        ←/→=seek -10s/+10s\n"
@@ -750,6 +751,9 @@ int main(int argc, char **argv)
      * a source advancing; see the render call at the bottom of the
      * loop for why an unconditional redraw is expensive here. */
     bool   dirty      = true;
+    bool   scope_selecting = false;
+    int    scope_select_src = -1;
+    int    scope_select_x0 = 0, scope_select_y0 = 0;
 
     /* Reference source for stepping and for the frame counter: the pane
      * you are looking at. */
@@ -1010,6 +1014,51 @@ int main(int argc, char **argv)
                 }
             }
 
+            if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                e.button.button == SDL_BUTTON_LEFT &&
+                (SDL_GetModState() & SDL_KMOD_SHIFT) &&
+                rend.scope_view != HDRPLAY_SCOPE_OFF)
+            {
+                int lw = 0, lh = 0, sx = 0, sy = 0;
+                SDL_GetWindowSize(rend.window, &lw, &lh);
+                if (renderer_window_to_source(&rend,
+                                              e.button.x, e.button.y,
+                                              lw, lh, false, &sx, &sy)) {
+                    scope_selecting = true;
+                    scope_select_src = renderer_focus_source(&rend);
+                    scope_select_x0 = sx;
+                    scope_select_y0 = sy;
+                }
+            }
+
+            if (e.type == SDL_EVENT_MOUSE_BUTTON_UP &&
+                e.button.button == SDL_BUTTON_LEFT && scope_selecting)
+            {
+                int lw = 0, lh = 0, sx = scope_select_x0, sy = scope_select_y0;
+                SDL_GetWindowSize(rend.window, &lw, &lh);
+                renderer_window_to_source(&rend,
+                                          e.button.x, e.button.y,
+                                          lw, lh, true, &sx, &sy);
+                ProbeRegion roi = {
+                    .x0 = sx < scope_select_x0 ? sx : scope_select_x0,
+                    .y0 = sy < scope_select_y0 ? sy : scope_select_y0,
+                    .x1 = (sx > scope_select_x0 ? sx : scope_select_x0) + 1,
+                    .y1 = (sy > scope_select_y0 ? sy : scope_select_y0) + 1,
+                };
+                bool usable = roi.x1 - roi.x0 >= 2 && roi.y1 - roi.y0 >= 2;
+                rend.scope_roi[scope_select_src] = roi;
+                rend.scope_roi_active[scope_select_src] = usable;
+                if (usable)
+                    LOG("REND", "scope ROI %s -> %d,%d %dx%d",
+                        sources[scope_select_src].label,
+                        roi.x0, roi.y0, roi.x1 - roi.x0, roi.y1 - roi.y0);
+                else
+                    LOG("REND", "scope ROI cleared for %s",
+                        sources[scope_select_src].label);
+                scope_selecting = false;
+                scope_select_src = -1;
+            }
+
             /* Drag pans; bare motion feeds the probe. The two coexist
              * because one needs a held button and the other does not. */
             if (e.type == SDL_EVENT_MOUSE_MOTION) {
@@ -1020,7 +1069,24 @@ int main(int argc, char **argv)
                 SDL_GetWindowSize(rend.window, &lw, &lh);
                 if (lw > 0 && lh > 0) { sx = (float)w / lw; sy = (float)h / lh; }
 
-                if ((e.motion.state & SDL_BUTTON_LMASK) && rend.zoom > 0.0f) {
+                if (scope_selecting &&
+                    (e.motion.state & SDL_BUTTON_LMASK)) {
+                    int sx = scope_select_x0, sy = scope_select_y0;
+                    if (renderer_window_to_source(&rend,
+                                                  e.motion.x, e.motion.y,
+                                                  lw, lh, true, &sx, &sy)) {
+                        ProbeRegion roi = {
+                            .x0 = sx < scope_select_x0 ? sx : scope_select_x0,
+                            .y0 = sy < scope_select_y0 ? sy : scope_select_y0,
+                            .x1 = (sx > scope_select_x0 ? sx : scope_select_x0) + 1,
+                            .y1 = (sy > scope_select_y0 ? sy : scope_select_y0) + 1,
+                        };
+                        rend.scope_roi[scope_select_src] = roi;
+                        rend.scope_roi_active[scope_select_src] =
+                            roi.x1 - roi.x0 >= 2 && roi.y1 - roi.y0 >= 2;
+                    }
+                } else if ((e.motion.state & SDL_BUTTON_LMASK) &&
+                           rend.zoom > 0.0f) {
                     /* Pan is in normalized source units, so the drag has
                      * to be divided by how much of the source is on
                      * screen — otherwise it accelerates with zoom. */
@@ -1050,17 +1116,21 @@ int main(int argc, char **argv)
             clock_sec = base_clock + (now - base_wall);
 
             bool all_eof = true;
+            bool any_still = false;
+            bool all_still = true;
             for (int i = 0; i < n_sources; i++) {
                 if (source_advance_to(&sources[i], clock_sec)) dirty = true;
                 /* A source that has run out holds its last frame rather
                  * than going black; only quit when EVERY source is done,
                  * so a short B does not cut a longer A short. */
                 if (!sources[i].eof) all_eof = false;
+                if (sources[i].still_image) any_still = true;
+                else                         all_still = false;
             }
 
             if (all_eof) {
                 LOG("DEC", "EOF");
-                if (loop_at_eof) {
+                if (loop_at_eof && !all_still) {
                     for (int i = 0; i < n_sources; i++)
                         source_seek_to(&sources[i], 0.0);
                     clock_sec = 0.0;
@@ -1068,7 +1138,18 @@ int main(int argc, char **argv)
                     dirty = true;
                     continue;
                 }
-                quit = true;
+                if (any_still) {
+                    /* One-frame inputs are images in FFmpeg's video-shaped
+                     * API. Hold the decoded frame and enter the existing
+                     * paused event loop so scopes, zoom, probes and display
+                     * controls remain fully interactive without spinning. */
+                    paused = true;
+                    rend.paused = true;
+                    dirty = true;
+                    LOG("DEC", "still image held; press Q/Esc to close");
+                } else {
+                    quit = true;
+                }
             }
 
             /* Pace against the NEXT frame, not the one already shown.

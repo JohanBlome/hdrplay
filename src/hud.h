@@ -18,8 +18,10 @@ typedef struct {
     struct pl_overlay plane;      /* persistent COLOR/Y/Cb/Cr badge       */
     struct pl_overlay session;    /* accumulated statistics panel         */
     struct pl_overlay scope;      /* waveform or gamut scope                */
+    struct pl_overlay scope_roi;  /* selected source-region outline         */
     bool has_status, has_label_a, has_label_b, has_plane, has_session;
     bool has_scope;
+    bool has_scope_roi;
     int  win_w, win_h;
 } HudOverlays;
 

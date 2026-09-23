@@ -135,6 +135,7 @@ enum {
     SLOT_PLANE_LABEL,
     SLOT_SESSION,
     SLOT_SCOPE,
+    SLOT_SCOPE_ROI,
     SLOT_COUNT,
 };
 
@@ -147,11 +148,14 @@ static int          scope_cache_frame = -1;
 static int          scope_cache_w = 0, scope_cache_h = 0;
 static HdrplayScopeView scope_cache_view = HDRPLAY_SCOPE_OFF;
 static float        scope_cache_vector_gain = 0.0f;
+static bool         scope_cache_roi_active = false;
+static ProbeRegion  scope_cache_roi = {0};
 
 /* Storage for overlay descriptors passed to libplacebo each frame.
  * Sized once, mutated per-frame. */
 static struct pl_overlay      overlay_arr[SLOT_COUNT];
 static struct pl_overlay_part overlay_parts[SLOT_COUNT];
+static struct pl_overlay_part roi_parts[4];
 
 void hud_close(pl_gpu gpu)
 {
@@ -163,6 +167,28 @@ void hud_close(pl_gpu gpu)
     scope_cache_w = scope_cache_h = 0;
     scope_cache_view = HDRPLAY_SCOPE_OFF;
     scope_cache_vector_gain = 0.0f;
+    scope_cache_roi_active = false;
+    scope_cache_roi = (ProbeRegion){0};
+}
+
+static const ProbeRegion *scope_region_for(const Renderer *r, int src)
+{
+    return src >= 0 && src < 2 && r->scope_roi_active[src]
+         ? &r->scope_roi[src] : NULL;
+}
+
+static bool scope_region_changed(const Renderer *r, int src)
+{
+    const ProbeRegion *roi = scope_region_for(r, src);
+    if ((roi != NULL) != scope_cache_roi_active) return true;
+    return roi && memcmp(roi, &scope_cache_roi, sizeof(*roi)) != 0;
+}
+
+static void scope_region_cache(const Renderer *r, int src)
+{
+    const ProbeRegion *roi = scope_region_for(r, src);
+    scope_cache_roi_active = roi != NULL;
+    scope_cache_roi = roi ? *roi : (ProbeRegion){0};
 }
 
 static void ensure_slot(int s, pl_gpu gpu, int W, int H)
@@ -231,6 +257,21 @@ static void scope_pixel(uint8_t *buf, int W, int H, int x, int y,
     if (p[3] < 235) p[3] = 235;
 }
 
+/* Full-frame scopes retain their established absolute density rendering.
+ * A small ROI may contain only a few hundred sparse samples, however, making
+ * every occupied bin nearly black. Normalize only display intensity in that
+ * case: bin positions and relative square-root density remain untouched. */
+static uint8_t scope_density(uint32_t count, uint32_t peak,
+                             float absolute_scale, bool normalize)
+{
+    if (!count) return 0;
+    float value = normalize && peak
+        ? 64.0f + 171.0f * sqrtf((float)count / (float)peak)
+        : absolute_scale * sqrtf((float)count);
+    if (value > 255.0f) value = 255.0f;
+    return (uint8_t)lroundf(value);
+}
+
 static int waveform_level_y(int top, int bottom, double level)
 {
     double t = (level - PROBE_WAVEFORM_MIN_SIGNAL) /
@@ -241,8 +282,8 @@ static int waveform_level_y(int top, int bottom, double level)
 static int build_waveform_panel(Renderer *r, Source *sources, int n,
                                 int src, pl_gpu gpu, LayoutRect dst)
 {
-    (void)r;
     if (src < 0 || src >= n || !sources[src].shown) return -1;
+    const ProbeRegion *region = scope_region_for(r, src);
 
     int W = (int)lroundf(dst.x1 - dst.x0);
     int H = (int)lroundf(dst.y1 - dst.y0);
@@ -254,7 +295,8 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
     bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_WAVEFORM ||
                    scope_cache_src != src ||
                    scope_cache_frame != sources[src].frame_no ||
-                   scope_cache_w != W || scope_cache_h != H;
+                   scope_cache_w != W || scope_cache_h != H ||
+                   scope_region_changed(r, src);
     if (!rebuild) {
         position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
                       (int)lroundf(dst.y0));
@@ -312,7 +354,8 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
     draw_text_color(buf, W, H, 8 + 2 * glyph_advance, 7, title_scale,
                     "B", 80, 120, 255);
     draw_text_color(buf, W, H, 8 + 3 * glyph_advance, 7, title_scale,
-                    " WAVEFORM", 235, 235, 235);
+                    region ? " WAVEFORM ROI NORM" : " WAVEFORM",
+                    235, 235, 235);
     draw_text_color(buf, W, H, W - 8 - 9 * (FONT_W + 1) * detail_scale,
                     7, detail_scale, "-10..110%", 150, 150, 150);
     char source_label[40];
@@ -324,19 +367,23 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
 
     uint32_t peaks[3];
     int samples = 0;
-    bool ok = probe_rgb_waveform(sources[src].shown, plot_w, plot_h, 4,
+    bool ok = probe_rgb_waveform(sources[src].shown, region,
+                                 plot_w, plot_h, 4,
                                  bins, peaks, &samples);
     if (ok) {
+        uint32_t common_peak = peaks[0];
+        if (peaks[1] > common_peak) common_peak = peaks[1];
+        if (peaks[2] > common_peak) common_peak = peaks[2];
         for (int c = 0; c < 3; c++) {
             for (int y = 0; y < plot_h; y++) {
                 for (int x = 0; x < plot_w; x++) {
                     uint32_t count = bins[((size_t)c * plot_h + y) *
                                           plot_w + x];
                     if (!count) continue;
-                    int intensity = (int)lroundf(36.0f * sqrtf((float)count));
-                    if (intensity > 255) intensity = 255;
+                    uint8_t intensity = scope_density(count, common_peak,
+                                                      36.0f, region != NULL);
                     scope_pixel(buf, W, H, left + x, top + y,
-                                c, (uint8_t)intensity);
+                                c, intensity);
                     /* A faint neighbor keeps single-sample traces visible
                      * on high-DPI displays without smearing the density. */
                     uint8_t halo = (uint8_t)(intensity / 3);
@@ -360,6 +407,7 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_WAVEFORM;
+    scope_region_cache(r, src);
     return 0;
 }
 
@@ -436,8 +484,8 @@ static void xy_display_rgb(double x, double y, uint8_t out[3])
 static int build_gamut_panel(Renderer *r, Source *sources, int n,
                              int src, pl_gpu gpu, LayoutRect dst)
 {
-    (void)r;
     if (src < 0 || src >= n || !sources[src].shown) return -1;
+    const ProbeRegion *region = scope_region_for(r, src);
 
     int W = (int)lroundf(dst.x1 - dst.x0);
     int H = (int)lroundf(dst.y1 - dst.y0);
@@ -448,7 +496,8 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_GAMUT ||
                    scope_cache_src != src ||
                    scope_cache_frame != sources[src].frame_no ||
-                   scope_cache_w != W || scope_cache_h != H;
+                   scope_cache_w != W || scope_cache_h != H ||
+                   scope_region_changed(r, src);
     if (!rebuild) {
         position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
                       (int)lroundf(dst.y0));
@@ -493,15 +542,15 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     if (!bins) { free(buf); return -1; }
     uint32_t peak = 0;
     ProbeGamutStats stats;
-    bool ok = probe_xy_gamut(sources[src].shown, bin_w, bin_h, 8,
+    bool ok = probe_xy_gamut(sources[src].shown, region, bin_w, bin_h, 8,
                              bins, &peak, &stats);
     if (ok) {
         for (int by = 0; by < bin_h; by++) {
             for (int bx = 0; bx < bin_w; bx++) {
                 uint32_t count = bins[(size_t)by * bin_w + bx];
                 if (!count) continue;
-                int intensity = (int)lroundf(48.0f * sqrtf((float)count));
-                if (intensity > 255) intensity = 255;
+                uint8_t intensity = scope_density(count, peak, 48.0f,
+                                                  region != NULL);
                 double x = ((double)bx + 0.5) / bin_w * PROBE_GAMUT_X_MAX;
                 double y = (1.0 - ((double)by + 0.5) / bin_h) *
                            PROBE_GAMUT_Y_MAX;
@@ -570,7 +619,8 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     draw_scope_line(buf, W, H, wx, wy - 3, wx, wy + 3, 255, 255, 255);
 
     draw_text_color(buf, W, H, 8, 7, title_scale,
-                    "CIE XY GAMUT", 235, 235, 235);
+                    region ? "CIE XY GAMUT ROI NORM" : "CIE XY GAMUT",
+                    235, 235, 235);
     int info_x = right + 16;
     if (info_x + 120 * detail_scale < W) {
         char line[80];
@@ -621,6 +671,7 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_GAMUT;
+    scope_region_cache(r, src);
     return 0;
 }
 
@@ -656,6 +707,7 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
 {
     if (src < 0 || src >= n || !sources[src].shown) return -1;
     AVFrame *frame = sources[src].shown;
+    const ProbeRegion *region = scope_region_for(r, src);
 
     int W = (int)lroundf(dst.x1 - dst.x0);
     int H = (int)lroundf(dst.y1 - dst.y0);
@@ -667,7 +719,8 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
                    scope_cache_src != src ||
                    scope_cache_frame != sources[src].frame_no ||
                    scope_cache_w != W || scope_cache_h != H ||
-                   fabsf(scope_cache_vector_gain - r->vector_gain) > 0.01f;
+                   fabsf(scope_cache_vector_gain - r->vector_gain) > 0.01f ||
+                   scope_region_changed(r, src);
     if (!rebuild) {
         position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
                       (int)lroundf(dst.y0));
@@ -701,7 +754,8 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
     if (!bins) { free(buf); return -1; }
     uint32_t peak = 0;
     ProbeVectorStats stats;
-    bool ok = probe_cbcr_vectorscope(frame, bin_size, bin_size, 8,
+    bool ok = probe_cbcr_vectorscope(frame, region,
+                                     bin_size, bin_size, 8,
                                      r->vector_gain,
                                      bins, &peak, &stats);
     if (ok) {
@@ -709,8 +763,8 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
             for (int bx = 0; bx < bin_size; bx++) {
                 uint32_t count = bins[(size_t)by * bin_size + bx];
                 if (!count) continue;
-                int intensity = (int)lroundf(48.0f * sqrtf((float)count));
-                if (intensity > 255) intensity = 255;
+                uint8_t intensity = scope_density(count, peak, 48.0f,
+                                                  region != NULL);
                 int x0 = left + bx * plot_size / bin_size;
                 int x1 = left + (bx + 1) * plot_size / bin_size;
                 int y0 = top + by * plot_size / bin_size;
@@ -722,7 +776,7 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
                         scope_pixel(buf, W, H, px, py, 0,
                                     (uint8_t)(intensity * 2 / 5));
                         scope_pixel(buf, W, H, px, py, 1,
-                                    (uint8_t)intensity);
+                                    intensity);
                         scope_pixel(buf, W, H, px, py, 2,
                                     (uint8_t)(intensity * 3 / 5));
                     }
@@ -781,7 +835,9 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
                     "SKIN", 220, 160, 105);
 
     draw_text_color(buf, W, H, 8, 7, title_scale,
-                    "CB CR VECTORSCOPE", 235, 235, 235);
+                    region ? "CB CR VECTORSCOPE ROI NORM" :
+                             "CB CR VECTORSCOPE",
+                    235, 235, 235);
     draw_text_color(buf, W, H, right - 10 * (FONT_W + 1) * detail_scale,
                     cy + 5, detail_scale, "+CB", 140, 140, 140);
     draw_text_color(buf, W, H, cx + 5, top + 3, detail_scale,
@@ -823,6 +879,7 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_VECTOR;
     scope_cache_vector_gain = r->vector_gain;
+    scope_region_cache(r, src);
     return 0;
 }
 
@@ -836,8 +893,8 @@ static int histogram_level_x(int left, int right, double level)
 static int build_histogram_panel(Renderer *r, Source *sources, int n,
                                  int src, pl_gpu gpu, LayoutRect dst)
 {
-    (void)r;
     if (src < 0 || src >= n || !sources[src].shown) return -1;
+    const ProbeRegion *region = scope_region_for(r, src);
 
     int W = (int)lroundf(dst.x1 - dst.x0);
     int H = (int)lroundf(dst.y1 - dst.y0);
@@ -848,7 +905,8 @@ static int build_histogram_panel(Renderer *r, Source *sources, int n,
     bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_HISTOGRAM ||
                    scope_cache_src != src ||
                    scope_cache_frame != sources[src].frame_no ||
-                   scope_cache_w != W || scope_cache_h != H;
+                   scope_cache_w != W || scope_cache_h != H ||
+                   scope_region_changed(r, src);
     if (!rebuild) {
         position_slot(SLOT_SCOPE, (int)lroundf(dst.x0),
                       (int)lroundf(dst.y0));
@@ -900,7 +958,7 @@ static int build_histogram_panel(Renderer *r, Source *sources, int n,
     if (!bins) { free(buf); return -1; }
     uint32_t peaks[3] = {0};
     ProbeRgbHistogramStats stats;
-    bool ok = probe_rgb_histogram(sources[src].shown, bin_count, 8,
+    bool ok = probe_rgb_histogram(sources[src].shown, region, bin_count, 8,
                                   bins, peaks, &stats);
     uint32_t common_peak = peaks[0];
     if (peaks[1] > common_peak) common_peak = peaks[1];
@@ -961,6 +1019,59 @@ static int build_histogram_panel(Renderer *r, Source *sources, int n,
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_HISTOGRAM;
+    scope_region_cache(r, src);
+    return 0;
+}
+
+static int build_scope_roi(Renderer *r, pl_gpu gpu)
+{
+    int src = renderer_focus_source(r);
+    if (src < 0 || src >= 2 || !r->scope_roi_active[src] ||
+        !r->focus_map_valid || r->focus_map_src != src)
+        return -1;
+
+    ProbeRegion roi = r->scope_roi[src];
+    LayoutRect source = {
+        (float)roi.x0, (float)roi.y0, (float)roi.x1, (float)roi.y1,
+    };
+    LayoutRect dst;
+    if (!layout_source_to_window(source, r->focus_map_target,
+                                 r->focus_map_image,
+                                 r->focus_map_frame_w,
+                                 r->focus_map_frame_h,
+                                 r->focus_map_rotation, &dst))
+        return -1;
+
+    int x0 = (int)floorf(dst.x0), y0 = (int)floorf(dst.y0);
+    int x1 = (int)ceilf(dst.x1),  y1 = (int)ceilf(dst.y1);
+    if (x1 <= x0 || y1 <= y0) return -1;
+    int thick = r->focus_map_win_w >= 2000 ? 4 : 2;
+    if (x1 - x0 < 2 * thick) thick = 1;
+    if (y1 - y0 < 2 * thick) thick = 1;
+
+    ensure_slot(SLOT_SCOPE_ROI, gpu, 1, 1);
+    if (!slots[SLOT_SCOPE_ROI].tex) return -1;
+    uint8_t pixel[4] = { 255, 210, 30, 255 };
+    pl_tex_upload(gpu, pl_tex_transfer_params(
+        .tex = slots[SLOT_SCOPE_ROI].tex,
+        .ptr = pixel,
+    ));
+    roi_parts[0] = (struct pl_overlay_part){
+        .src = {0, 0, 1, 1}, .dst = {x0, y0, x1, y0 + thick} };
+    roi_parts[1] = (struct pl_overlay_part){
+        .src = {0, 0, 1, 1}, .dst = {x0, y1 - thick, x1, y1} };
+    roi_parts[2] = (struct pl_overlay_part){
+        .src = {0, 0, 1, 1}, .dst = {x0, y0, x0 + thick, y1} };
+    roi_parts[3] = (struct pl_overlay_part){
+        .src = {0, 0, 1, 1}, .dst = {x1 - thick, y0, x1, y1} };
+    overlay_arr[SLOT_SCOPE_ROI] = (struct pl_overlay){
+        .tex = slots[SLOT_SCOPE_ROI].tex,
+        .mode = PL_OVERLAY_NORMAL,
+        .parts = roi_parts,
+        .num_parts = 4,
+        .repr = pl_color_repr_rgb,
+        .color = pl_color_space_srgb,
+    };
     return 0;
 }
 
@@ -1465,6 +1576,13 @@ void hud_prepare(Renderer *r, Source *sources, int n,
                 }
                 break;
             }
+
+            case LAYOUT_OV_SCOPE_ROI:
+                if (build_scope_roi(r, gpu) == 0) {
+                    out->scope_roi = overlay_arr[SLOT_SCOPE_ROI];
+                    out->has_scope_roi = true;
+                }
+                break;
 
             case LAYOUT_OV_PLANE: {
                 const char *big =
