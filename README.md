@@ -238,6 +238,11 @@ Press `V` to cycle between no scope, a channel-overlaid RGB waveform, a CIE
 1931 xy gamut plot, a digital vectorscope and an RGB histogram. `--waveform`,
 `--gamut`, `--vectorscope` and `--histogram` select a scope at startup.
 
+All four scopes support 4:2:0, 4:2:2 and 4:4:4 YUV at 8, 10 and 12 bits.
+Chroma is sampled on the decoded format's native grid, including planar,
+semi-planar NV12/P010 and byte-packed 4:2:2 layouts; it is not assumed to be
+half-resolution in both axes.
+
 In the waveform, horizontal position follows the source image and vertical
 position is the encoded R'G'B' signal level before transfer conversion, HLG
 processing, tone mapping or display color management. Red, green and blue

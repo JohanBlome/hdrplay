@@ -138,6 +138,8 @@ static void test_format_guard(void)
         { AV_PIX_FMT_YUV420P,     true,  true,  "yuv420p"     },
         { AV_PIX_FMT_YUV422P10LE, true,  true,  "yuv422p10le" },
         { AV_PIX_FMT_YUV444P10LE, true,  true,  "yuv444p10le" },
+        { AV_PIX_FMT_YUYV422,      true,  true,  "yuyv422"      },
+        { AV_PIX_FMT_UYVY422,      true,  true,  "uyvy422"      },
         { AV_PIX_FMT_NV12,        true,  true,  "nv12"        },
         { AV_PIX_FMT_P010LE,      true,  true,  "p010le"      },
         { AV_PIX_FMT_YUV420P10BE, false, false, "yuv420p10be" },
@@ -178,6 +180,78 @@ static void test_format_guard(void)
     CHECK(probe_frame_stats(n, 1, PROBE_LUMA_ONLY, &fs), "NV12 luma-only works");
     CHECK(probe_frame_stats(n, 1, PROBE_FULL_RGB, &fs), "NV12 full-RGB works");
     av_frame_free(&n);
+}
+
+static void test_scope_subsampling(void)
+{
+    puts("scope chroma subsampling");
+    const struct {
+        enum AVPixelFormat fmt;
+        const char *name;
+    } cases[] = {
+        { AV_PIX_FMT_YUV420P,       "yuv420p"       },
+        { AV_PIX_FMT_YUV422P,       "yuv422p"       },
+        { AV_PIX_FMT_YUV444P,       "yuv444p"       },
+        { AV_PIX_FMT_YUV420P10LE,   "yuv420p10le"   },
+        { AV_PIX_FMT_YUV422P10LE,   "yuv422p10le"   },
+        { AV_PIX_FMT_YUV444P10LE,   "yuv444p10le"   },
+        { AV_PIX_FMT_YUV420P12LE,   "yuv420p12le"   },
+        { AV_PIX_FMT_YUV422P12LE,   "yuv422p12le"   },
+        { AV_PIX_FMT_YUV444P12LE,   "yuv444p12le"   },
+        { AV_PIX_FMT_YUYV422,       "yuyv422"        },
+        { AV_PIX_FMT_UYVY422,       "uyvy422"        },
+    };
+    enum { W = 8, H = 8, PLOT_W = 16, PLOT_H = 16 };
+    uint32_t waveform[3 * PLOT_W * PLOT_H];
+    uint32_t histogram[3 * PLOT_W];
+    uint32_t plot[PROBE_VECTOR_BANDS * PLOT_W * PLOT_H];
+    uint32_t peak3[3];
+    ProbeRgbHistogramStats histogram_stats;
+    ProbeGamutStats gamut_stats;
+    ProbeVectorStats vector_stats;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
+        int depth = av_pix_fmt_desc_get(cases[i].fmt)->comp[0].depth;
+        unsigned mid = 128u << (depth - 8);
+        AVFrame *f = mkframe(cases[i].fmt, W, H, AVCOL_TRC_BT709, mid);
+        bool waveform_ok = probe_rgb_waveform(f, NULL, PLOT_W, PLOT_H, 1,
+                                               waveform, peak3, NULL);
+        bool histogram_ok = probe_rgb_histogram(f, NULL, PLOT_W, 1,
+                                                 histogram, peak3,
+                                                 &histogram_stats);
+        bool gamut_ok = probe_xy_gamut(f, NULL, PLOT_W, PLOT_H, 1,
+                                       plot, &peak3[0], &gamut_stats);
+        bool vector_ok = probe_cbcr_vectorscope(f, NULL, PLOT_W, PLOT_H,
+                                                1, 1.0, plot, peak3,
+                                                &vector_stats);
+        CHECK(waveform_ok && histogram_ok && gamut_ok && vector_ok,
+              "%-12s accepted by every scope", cases[i].name);
+        av_frame_free(&f);
+    }
+
+    /* Prove that chroma rows are selected from the descriptor, not by the
+     * old 4:2:0-only y/2 rule: the same luma coordinate addresses row 1 in
+     * 4:2:0, row 2 in 4:2:2 and row 2 in 4:4:4. Horizontal addressing is
+     * likewise half-width for 4:2:x and full-width for 4:4:4. */
+    const enum AVPixelFormat planar[] = {
+        AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P,
+    };
+    const int expected_x[] = { 1, 1, 2 };
+    const int expected_y[] = { 1, 2, 2 };
+    for (int i = 0; i < 3; i++) {
+        AVFrame *f = mkframe(planar[i], W, H, AVCOL_TRC_BT709, 128);
+        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->format);
+        int cw = AV_CEIL_RSHIFT(W, d->log2_chroma_w);
+        int ch = AV_CEIL_RSHIFT(H, d->log2_chroma_h);
+        for (int y = 0; y < ch; y++)
+            for (int x = 0; x < cw; x++)
+                put_component(f, d, 1, x, y, (unsigned)(16 + y * cw + x));
+        int got = read_component(f, d, 1, 2, 2);
+        int want = 16 + expected_y[i] * cw + expected_x[i];
+        CHECK(got == want, "%-12s maps (2,2) to chroma (%d,%d)",
+              av_get_pix_fmt_name(planar[i]), expected_x[i], expected_y[i]);
+        av_frame_free(&f);
+    }
 }
 
 static void test_histogram(void)
@@ -679,6 +753,7 @@ int main(void)
     test_lut_equivalence();
     test_hlg_ootf();
     test_format_guard();
+    test_scope_subsampling();
     test_histogram();
     test_black_and_underflow();
     test_sdr_black_level();

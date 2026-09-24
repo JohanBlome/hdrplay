@@ -152,12 +152,11 @@ typedef struct {
     LumReference reference;
 } ProbeResult;
 
-/* Sample (src_x, src_y) from `frame`. Supports 8/10/12-bit planar
- * little-endian YUV at any chroma subsampling (420/422/444), covering
- * ~all HDR10, HLG and SDR clips plus ProRes-style 4:2:2 / 4:4:4
- * masters. Returns false for anything else — notably semi-planar and
- * bit-shifted layouts (NV12, P010), which naive plane indexing cannot
- * read. */
+/* Sample (src_x, src_y) from `frame`. Supports byte-addressable 8/10/12-bit
+ * little-endian YUV at any chroma subsampling (420/422/444), including
+ * planar masters, semi-planar NV12/P010 and packed YUYV-style layouts.
+ * Chroma coordinates come from AVPixFmtDescriptor rather than assuming
+ * 4:2:0. */
 bool probe_sample(const AVFrame *frame, int src_x, int src_y,
                   ProbeResult *out);
 
@@ -236,9 +235,7 @@ typedef struct {
 /* Compute per-frame statistics. `sample_stride` controls sparseness:
  * 1 = every pixel (exact, offline), 8 = every 8th in both axes (~130k
  * samples on 4K, sub-ms). Returns false on unsupported pix_fmt — see
- * probe_sample() for the accepted set. PROBE_FULL_RGB additionally
- * requires separate chroma planes, so it rejects NV12 where
- * PROBE_LUMA_ONLY accepts it. */
+ * probe_sample() for the accepted set. */
 bool probe_frame_stats(const AVFrame *frame, int sample_stride,
                        ProbeMode mode, FrameStats *out);
 

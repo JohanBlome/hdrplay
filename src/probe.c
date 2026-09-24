@@ -465,10 +465,10 @@ static inline double sig_lut_eval(const SigLut *S, double V)
 /* Pixel-format guard.                                                 */
 /*                                                                     */
 /* Read through AVComponentDescriptor rather than assuming one tightly */
-/* packed plane per component. Hardware decoders normally download as  */
-/* NV12/P010: chroma is interleaved and P010 stores its 10-bit values in */
-/* the high bits of 16-bit words. The descriptor's plane/step/offset/   */
-/* shift fields describe both without pixel-format special cases.      */
+/* packed plane per component or a fixed 4:2:0 sampling grid. Its       */
+/* plane/step/offset/shift fields cover planar 4:2:0, 4:2:2 and 4:4:4, */
+/* semi-planar NV12/P010, and byte-addressable packed formats such as   */
+/* YUYV422. log2_chroma_w/h below supplies the format-specific grid.    */
 static bool component_supported(const AVPixFmtDescriptor *desc, int c)
 {
     if (!desc || c < 0 || c >= desc->nb_components) return false;
@@ -506,8 +506,6 @@ static bool luma_plane_supported(const AVPixFmtDescriptor *desc, int *depth_out)
                        AV_PIX_FMT_FLAG_HWACCEL   | AV_PIX_FMT_FLAG_RGB |
                        AV_PIX_FMT_FLAG_BE))
         return false;
-    if (!(desc->flags & AV_PIX_FMT_FLAG_PLANAR)) return false;
-
     int depth = desc->comp[0].depth;
     if (depth != 8 && depth != 10 && depth != 12) return false;
     if (!component_supported(desc, 0)) return false;
