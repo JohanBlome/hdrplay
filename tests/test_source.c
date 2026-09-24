@@ -12,6 +12,7 @@
 #include "source.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include <libavutil/frame.h>
 #if HDRPLAY_HAVE_AMVE
@@ -195,6 +196,76 @@ static void test_source_clock_alignment_in_history(void)
     ring_free(&s.ring);
 }
 
+/* The distinction that made a seek onto the last frame quit: the
+ * decoder running dry is one peek AHEAD of the last frame leaving the
+ * screen, so it cannot be the signal to stop. */
+static void test_finished_holds_the_last_frame(void)
+{
+    puts("source: finishing waits for the last frame to play out");
+    Source s = {0};
+    s.tb_sec = 1.0;
+    s.fps = 2.0;                /* 0.5s frames when the container is silent */
+    s.shown = mkf(4);           /* last frame, pts 4s, no stated duration */
+
+    CHECK(!source_finished(&s, 100.0),
+          "a source with frames left is never finished, however late the clock");
+
+    s.eof = true;
+    CHECK(!source_finished(&s, 4.0), "not finished the instant the decoder dries up");
+    CHECK(!source_finished(&s, 4.4), "still showing the last frame partway through");
+    CHECK(source_finished(&s, 4.5), "finished once the last frame has had its 0.5s");
+
+    /* A stated duration wins over the nominal rate, so a variable-rate
+     * stream is not held for an interval it never used. */
+    s.shown->duration = 2;      /* 2s in this timebase, not 1/fps */
+    CHECK(!source_finished(&s, 5.9), "a stated frame duration outlasts the nominal rate");
+    CHECK(source_finished(&s, 6.0), "finished at pts + stated duration");
+
+    av_frame_free(&s.shown);
+
+    /* Nothing was ever shown — there is no frame to wait out. */
+    Source empty = {0};
+    empty.tb_sec = 1.0;
+    empty.eof = true;
+    CHECK(source_finished(&empty, 0.0), "a source that showed nothing is finished at once");
+}
+
+static void test_seek_ceiling(void)
+{
+    puts("source: a forward seek clamps inside the last frame");
+    /* 33 frames stamped 30fps but actually running at 30.006 — the real
+     * shape of the clip that exposed this. The last frame starts at
+     * 1.066456, which is PAST duration - 1/30 (1.066444). A whole-frame
+     * backoff lands on frame 31 and the last frame is unreachable. */
+    Source s[2];
+    memset(s, 0, sizeof(s));
+    s[0].duration_sec = 1.099778;
+    s[0].fps = 30.0;
+    double last_pts = 1.066456;
+
+    double c = source_seek_ceiling(s, 1);
+    CHECK(c >= last_pts, "ceiling %.6f reaches the last frame at %.6f", c, last_pts);
+    CHECK(c < s[0].duration_sec, "and stays inside the clip");
+
+    /* With two inputs the longer one decides, so the short one is not
+     * cut off by a clamp derived from its own end. */
+    s[1].duration_sec = 5.0;
+    s[1].fps = 25.0;
+    CHECK(source_seek_ceiling(s, 2) > 4.9, "the longest input sets the ceiling");
+
+    /* A source with no declared duration must not contribute a guess. */
+    Source unknown = {0};
+    unknown.fps = 30.0;
+    CHECK(source_seek_ceiling(&unknown, 1) < 0.0,
+          "no duration means no clamp, not a clamp to zero");
+
+    /* A duration shorter than the backoff must not go negative. */
+    Source tiny = {0};
+    tiny.duration_sec = 0.001;
+    tiny.fps = 30.0;
+    CHECK(source_seek_ceiling(&tiny, 1) == 0.0, "a sub-frame clip clamps to 0");
+}
+
 #if HDRPLAY_HAVE_AMVE
 static void test_ambient_viewing_metadata(void)
 {
@@ -277,6 +348,8 @@ int main(void)
     test_ring_disabled();
     test_temporal_previous();
     test_source_clock_alignment_in_history();
+    test_finished_holds_the_last_frame();
+    test_seek_ceiling();
 #if HDRPLAY_HAVE_AMVE
     test_ambient_viewing_metadata();
 #endif

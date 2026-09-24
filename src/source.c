@@ -151,6 +151,7 @@ void source_flush(Source *s)
     av_frame_free(&s->pending);
     ring_clear(&s->ring);
     s->eof = false;
+    s->failed = false;
     s->still_image = false;
     s->frames_presented = 0;
     s->frame_stats_valid = false;
@@ -195,9 +196,13 @@ static bool fill_pending(Source *s)
     int r = decoder_next_frame(&s->dec);
     if (r <= 0) {
         s->eof = true;
+        s->failed = (r < 0);
         /* A still image is exposed by FFmpeg as a one-frame video stream.
          * Detect it from behavior rather than filename extensions so every
-         * decoder-backed image format receives the same treatment. */
+         * decoder-backed image format receives the same treatment. The
+         * r == 0 is load-bearing for the same reason `failed` exists: a
+         * video that dies after its first frame is a broken video, not an
+         * image, and must not be held on screen as one. */
         if (r == 0 && s->frames_presented == 1)
             s->still_image = true;
         return false;
@@ -220,6 +225,36 @@ double source_peek_next_sec(Source *s)
     }
     if (!fill_pending(s)) return NAN;
     return pts_to_sec(s, s->pending);
+}
+
+bool source_finished(const Source *s, double t)
+{
+    if (!s->eof) return false;
+
+    double shown = source_shown_sec(s);
+    if (isnan(shown)) return true;   /* nothing on screen to wait out */
+
+    /* The frame's own duration when the container states one, so a
+     * variable-rate stream is not held for a nominal interval it never
+     * used. */
+    double dur = (s->shown && s->shown->duration > 0)
+                 ? (double)s->shown->duration * s->tb_sec
+                 : (s->fps > 0.0 ? 1.0 / s->fps : 0.0);
+    return t >= shown + dur;
+}
+
+double source_seek_ceiling(const Source *sources, int n)
+{
+    double last = -1.0;
+    for (int i = 0; i < n; i++) {
+        double d = sources[i].duration_sec;
+        if (!(d > 0.0)) continue;
+        double half = sources[i].fps > 0.0 ? 0.5 / sources[i].fps : 0.0;
+        double end = d - half;
+        if (end < 0.0) end = 0.0;
+        if (end > last) last = end;
+    }
+    return last;
 }
 
 /* Promote `pending` to `shown`, folding it into the ring and stats. */
