@@ -652,7 +652,7 @@ static void test_vectorscope(void)
     uint32_t peak[PROBE_VECTOR_BANDS] = {0};
     ProbeVectorStats stats;
     CHECK(probe_cbcr_vectorscope(f, NULL, W, H, 2, 1.0,
-                                 bins, &peak, &stats),
+                                 bins, peak, &stats),
           "P010 source produces a Cb/Cr density plot");
     uint64_t total = 0;
     for (int i = 0; i < PROBE_VECTOR_BANDS * W * H; i++) total += bins[i];
@@ -668,7 +668,7 @@ static void test_vectorscope(void)
           "vectorscope reports its Y' band population");
     ProbeRegion roi = { 4, 4, 12, 12 };
     CHECK(probe_cbcr_vectorscope(f, &roi, W, H, 2, 1.0,
-                                 bins, &peak, &stats) &&
+                                 bins, peak, &stats) &&
           stats.samples == 16,
           "vectorscope samples only the selected rectangle");
     av_frame_free(&f);
