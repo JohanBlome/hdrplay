@@ -83,6 +83,30 @@ double source_shown_sec(const Source *s);
  * NAN at EOF. */
 double source_peek_next_sec(Source *s);
 
+/* Whether this source has nothing left to show at clock time `t`.
+ *
+ * Not the same as `eof`, which only says the decoder has run dry — and
+ * it runs dry the instant the LAST frame is decoded, one peek ahead of
+ * that frame being displayed. Treating that as finished gave the final
+ * frame zero milliseconds on screen, and turned any seek that landed on
+ * it into an exit. */
+bool source_finished(const Source *s, double t);
+
+/* Highest clock time a seek may land on across `n` sources: inside the
+ * last frame of the longest one. Negative when nothing declares a usable
+ * duration, meaning the caller must not clamp — an unclamped seek past
+ * the end is recoverable, but clamping to a guess is not.
+ *
+ * Lands HALF a nominal frame short of the duration, not a whole one.
+ * `duration` runs to the end of the last frame, so some backoff is
+ * needed, but a full nominal interval overshoots backwards past that
+ * frame whenever the real rate sits a hair above the nominal one — a
+ * clip stamped 30fps that actually runs at 30.006 puts its last frame
+ * 12us beyond `duration - 1/30`, and the seek quietly lands on the
+ * second-to-last frame. Half an interval still falls inside the final
+ * frame's time on screen, which is what source_finished() tests. */
+double source_seek_ceiling(const Source *sources, int n);
+
 /* Align to the frame in effect at `t` seconds — i.e. the last frame whose
  * PTS is <= t. Forward movement decodes normally; backward movement uses
  * retained frames when possible and seeks otherwise. Returns true if the

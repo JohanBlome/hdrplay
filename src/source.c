@@ -227,6 +227,36 @@ double source_peek_next_sec(Source *s)
     return pts_to_sec(s, s->pending);
 }
 
+bool source_finished(const Source *s, double t)
+{
+    if (!s->eof) return false;
+
+    double shown = source_shown_sec(s);
+    if (isnan(shown)) return true;   /* nothing on screen to wait out */
+
+    /* The frame's own duration when the container states one, so a
+     * variable-rate stream is not held for a nominal interval it never
+     * used. */
+    double dur = (s->shown && s->shown->duration > 0)
+                 ? (double)s->shown->duration * s->tb_sec
+                 : (s->fps > 0.0 ? 1.0 / s->fps : 0.0);
+    return t >= shown + dur;
+}
+
+double source_seek_ceiling(const Source *sources, int n)
+{
+    double last = -1.0;
+    for (int i = 0; i < n; i++) {
+        double d = sources[i].duration_sec;
+        if (!(d > 0.0)) continue;
+        double half = sources[i].fps > 0.0 ? 0.5 / sources[i].fps : 0.0;
+        double end = d - half;
+        if (end < 0.0) end = 0.0;
+        if (end > last) last = end;
+    }
+    return last;
+}
+
 /* Promote `pending` to `shown`, folding it into the ring and stats. */
 static void promote(Source *s)
 {

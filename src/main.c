@@ -855,6 +855,16 @@ int main(int argc, char **argv)
                     double delta = (e.key.key == SDLK_RIGHT) ? 10.0 : -10.0;
                     double target = clock_sec + delta;
                     if (target < 0.0) target = 0.0;
+                    /* Clamp to the last frame of the longest input. A
+                     * ten-second step past the end of a clip shorter than
+                     * ten seconds used to land beyond every source at
+                     * once, which is EOF, which quits — so on short
+                     * material the right arrow exited instead of seeking.
+                     * Landing ON the last frame is fine: source_finished()
+                     * holds it for its duration, and while paused it holds
+                     * indefinitely, which is the frame-inspection case. */
+                    double last = source_seek_ceiling(sources, n_sources);
+                    if (last >= 0.0 && target > last) target = last;
                     for (int i = 0; i < n_sources; i++)
                         source_seek_to(&sources[i], target);
                     clock_sec = target;
@@ -1126,8 +1136,10 @@ int main(int argc, char **argv)
                 if (source_advance_to(&sources[i], clock_sec)) dirty = true;
                 /* A source that has run out holds its last frame rather
                  * than going black; only quit when EVERY source is done,
-                 * so a short B does not cut a longer A short. */
-                if (!sources[i].eof) all_eof = false;
+                 * so a short B does not cut a longer A short. "Done"
+                 * includes having shown the last frame for its duration —
+                 * see source_finished(). */
+                if (!source_finished(&sources[i], clock_sec)) all_eof = false;
                 if (sources[i].still_image) any_still = true;
                 else                         all_still = false;
             }
