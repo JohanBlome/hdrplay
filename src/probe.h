@@ -22,11 +22,17 @@ typedef enum {
     LUM_ABSOLUTE_PQ,     /* cd/m², absolute                            */
     LUM_HLG_OOTF,        /* cd/m², premised on a stated L_W            */
     LUM_SDR_RELATIVE,    /* nominal only, 100-nit reference white      */
+    LUM_SCENE_RELATIVE,  /* decoded camera Log; ratios only             */
 } LumReference;
 
 LumReference lum_reference_of(enum AVColorTransferCharacteristic trc);
 const char  *lum_reference_name(LumReference r);
 bool         lum_reference_is_absolute(LumReference r);
+
+/* Make statistics decode Z-Log2 rather than trusting the frame's false
+ * BT.709 tag. Values remain scene-relative; exposure affects scale but not
+ * ratios such as dynamic range. */
+void probe_set_zlog2_override(bool enabled, double exposure_stops);
 
 /* ------------------------------------------------------------------ */
 /* SDR black level (BT.1886 L_B, cd/m²).                               */
@@ -217,6 +223,13 @@ typedef struct {
     float  pct_above_1000;   /* % of samples > 1000 nits (HDR)         */
     int    samples;          /* how many pixels were inspected         */
 
+    /* Source-code excursions around nominal limited range. Exact counts
+     * explain the LEGAL overlay; guarded counts reject ordinary codec
+     * ringing (PROBE_RANGE_GUARD_CODES in 8-bit-equivalent code values). */
+    uint64_t range_samples;
+    uint64_t range_below, range_above;
+    uint64_t range_below_guard, range_above_guard;
+
     ProbeHist luma;
     double    mu_log2;       /* mean of log2(nits) over valid samples  */
     double    var_log2;      /* variance ditto — feeds spatial spread  */
@@ -296,6 +309,12 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
                     int width, int height,
                     int sample_stride, uint32_t *bins,
                     uint32_t *peak_count, ProbeGamutStats *stats);
+/* As above, but decode Z-Log2 and transform Z CAM gamut to ACES AP0 before
+ * computing chromaticity. Used when playback overrides a false BT.709 tag. */
+bool probe_xy_gamut_zlog2(const AVFrame *frame, const ProbeRegion *region,
+                          int width, int height,
+                          int sample_stride, uint32_t *bins,
+                          uint32_t *peak_count, ProbeGamutStats *stats);
 
 /* Digital vectorscope: Cb on the horizontal axis and Cr vertically. Values
  * are normalized so nominal chroma occupies -0.5..+0.5, with a 20% guard

@@ -7,6 +7,7 @@
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/vulkan.h>
 #include <libplacebo/gamut_mapping.h>
+#include <libplacebo/shaders/lut.h>
 #include "probe.h"
 #include "layout.h"
 
@@ -37,6 +38,11 @@ typedef enum {
     HDRPLAY_SCOPE_COUNT,
 } HdrplayScopeView;
 
+typedef enum {
+    HDRPLAY_INPUT_TRANSFER_TAGGED = 0,
+    HDRPLAY_INPUT_TRANSFER_ZLOG2,
+} HdrplayInputTransfer;
+
 typedef struct Renderer {
     struct SDL_Window *window;
 
@@ -49,6 +55,10 @@ typedef struct Renderer {
     pl_renderer         renderer_hlg;   /* forced-L_W HLG -> absolute PQ */
     pl_renderer         renderer_hlg_out; /* absolute PQ -> display PQ    */
     pl_dispatch         dispatch_diff;  /* absolute frame difference     */
+    struct pl_custom_lut *input_lut;    /* optional camera-log .cube LUT */
+    pl_shader_obj       input_lut_state;
+    HdrplayInputTransfer input_transfer;
+    float               zlog2_exposure; /* stops around 13.5x normalization */
     pl_tex              diff_tex;
     int                 diff_w, diff_h;
 
@@ -279,6 +289,9 @@ typedef struct Renderer {
 /* display_index: 0-based index into the list SDL exposes, or -1 to use
  * the OS default. List can be inspected before init via renderer_list_displays. */
 bool renderer_init(Renderer *r, int width, int height, const char *title, int display_index);
+/* Load a .cube LUT applied to gamma-encoded RGB immediately after YUV->RGB.
+ * This is the appropriate stage for camera vendor Log -> Rec.709 LUTs. */
+bool renderer_set_input_lut(Renderer *r, const char *path);
 void renderer_list_displays(void);
 /* Render the current state of every source into one window frame.
  * `n` is 1 or 2; with 1 this reduces to exactly the previous

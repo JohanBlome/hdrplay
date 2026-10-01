@@ -31,6 +31,12 @@ static void log_metadata(const Decoder *d)
                        d->transfer == AVCOL_TRC_ARIB_STD_B67); /* HLG */
     LOG("META", "tagged_hdr=%s  (transfer=%s, bit_depth=%d)",
         tagged_hdr ? "YES" : "no", trc_name(d->transfer), d->bit_depth);
+    if (d->camera_lut[0]) {
+        LOG("META", "camera LUT tag: %s", d->camera_lut);
+        if (d->transfer == AVCOL_TRC_BT709 &&
+            (strstr(d->camera_lut, "Log") || strstr(d->camera_lut, "LOG")))
+            LOG("META", "WARNING: camera Log tag conflicts with BT.709 transfer; use --input-transfer zlog2 or --input-lut <Log-to-709.cube>");
+    }
     if (tagged_hdr && d->bit_depth < 10)
         LOG("META", "WARNING: HDR transfer with <10-bit depth — likely mislabel");
 
@@ -373,6 +379,14 @@ bool decoder_open(Decoder *d, const char *path)
     const AVPixFmtDescriptor *pd = av_pix_fmt_desc_get(d->pix_fmt);
     d->bit_depth = pd ? pd->comp[0].depth : 8;
 
+    /* Z CAM writes the selected capture/viewing curve as a QuickTime format
+     * tag. It names a curve but does not contain LUT samples. Preserve it as
+     * a diagnostic so a misleading BT.709 `colr` atom is not silently trusted. */
+    AVDictionaryEntry *camera_lut =
+        av_dict_get(d->fmt->metadata, "com.zcam.camera.lut", NULL, 0);
+    if (camera_lut && camera_lut->value)
+        snprintf(d->camera_lut, sizeof(d->camera_lut), "%s", camera_lut->value);
+
     extract_stream_sidedata(d, st);
     log_metadata(d);
     if (g_range_override != AVCOL_RANGE_UNSPECIFIED)
@@ -439,13 +453,14 @@ static bool seek_bytes(Decoder *d, int64_t pos)
 bool decoder_resolve_color_range(Decoder *d, int max_frames)
 {
     if (!d) return false;
-    if (d->range_effective != AVCOL_RANGE_UNSPECIFIED) return true;
+    bool unresolved = d->range_effective == AVCOL_RANGE_UNSPECIFIED;
     if (max_frames < 1) max_frames = 1;
 
     /* Consuming frames is only acceptable if they can be put back. */
     if (!can_rewind(d)) {
-        LOG("META", "range unspecified and input not seekable — reading as limited");
-        return false;
+        if (unresolved)
+            LOG("META", "range unspecified and input not seekable — reading as limited");
+        return !unresolved;
     }
 
     double sum = 0.0;
@@ -460,8 +475,9 @@ bool decoder_resolve_color_range(Decoder *d, int max_frames)
 
     bool rewound = decoder_seek_start(d);
     if (!n) {
-        LOG("META", "range unspecified and no frame was readable — reading as limited");
-        return false;
+        if (unresolved)
+            LOG("META", "range unspecified and no frame was readable — reading as limited");
+        return !unresolved;
     }
     if (!rewound)
         LOG("DEC", "WARNING: could not rewind after the range probe; "
@@ -470,13 +486,25 @@ bool decoder_resolve_color_range(Decoder *d, int max_frames)
     /* Pooled over frames, not voted: a single fade-in or title card
      * carries no excursions and would otherwise outvote the content. */
     d->range_outside_frac = sum / n;
-    d->range_guessed      = true;
-    d->range_effective    = (d->range_outside_frac > PROBE_RANGE_FULL_FRAC)
-                            ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-    LOG("META", "range unspecified — %.3f%% of luma outside the limited-range "
-                "window over %d frame%s, reading as %s",
-        d->range_outside_frac * 100.0, n, n == 1 ? "" : "s",
-        rng_name(d->range_effective));
+    d->range_audited = true;
+    bool pixels_look_full = d->range_outside_frac > PROBE_RANGE_FULL_FRAC;
+    if (unresolved) {
+        d->range_guessed = true;
+        d->range_effective = pixels_look_full ? AVCOL_RANGE_JPEG
+                                               : AVCOL_RANGE_MPEG;
+        LOG("META", "range unspecified — %.3f%% of luma outside the limited-range "
+                    "window over %d frame%s, reading as %s",
+            d->range_outside_frac * 100.0, n, n == 1 ? "" : "s",
+            rng_name(d->range_effective));
+    } else {
+        d->range_conflict = d->range == AVCOL_RANGE_MPEG && pixels_look_full;
+        LOG("META", "startup range probe — %.3f%% of luma outside the limited-range "
+                    "window over %d frame%s%s",
+            d->range_outside_frac * 100.0, n, n == 1 ? "" : "s",
+            d->range_conflict
+                ? "; WARNING: declared limited but pixels suggest full range"
+                : "; consistent with limited range (or inconclusive)");
+    }
     return true;
 }
 

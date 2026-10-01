@@ -25,6 +25,13 @@ typedef struct SessionStats {
     uint64_t maxrgb_valid;
     bool     has_maxrgb;
 
+    uint64_t range_samples;
+    uint64_t range_below, range_above;
+    uint64_t range_below_guard, range_above_guard;
+    double   worst_range_exact_frac;
+    double   worst_range_guard_frac;
+    double   worst_range_sec;
+
     /* CTA-861.3 quantities, measured. MaxCLL is the max over frames of
      * the per-frame max(R,G,B); MaxFALL the max over frames of the
      * per-frame average of max(R,G,B). Both are LOWER bounds when
@@ -32,6 +39,7 @@ typedef struct SessionStats {
     double   maxcll_nits;
     double   maxfall_nits;
     double   peak_luma_nits;
+
     double   min_frame_avg_nits;
 
     /* Spread decomposition, all in log2-nits (stops) over the `valid`
@@ -120,6 +128,10 @@ typedef struct {
 
     double   black_pct, underflow_pct;
     double   peak_luma_nits;
+    double   range_below_pct, range_above_pct;
+    double   range_below_guard_pct, range_above_guard_pct;
+    double   worst_range_exact_pct, worst_range_guard_pct;
+    double   worst_range_sec;
 
     LumReference reference;
     double       hlg_lw;

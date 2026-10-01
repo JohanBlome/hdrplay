@@ -544,8 +544,12 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     if (!bins) { free(buf); return -1; }
     uint32_t peak = 0;
     ProbeGamutStats stats;
-    bool ok = probe_xy_gamut(sources[src].shown, region, bin_w, bin_h, 8,
-                             bins, &peak, &stats);
+    bool zlog2 = r->input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2;
+    bool ok = zlog2
+        ? probe_xy_gamut_zlog2(sources[src].shown, region, bin_w, bin_h, 8,
+                               bins, &peak, &stats)
+        : probe_xy_gamut(sources[src].shown, region, bin_w, bin_h, 8,
+                         bins, &peak, &stats);
     if (ok) {
         for (int by = 0; by < bin_h; by++) {
             for (int bx = 0; bx < bin_w; bx++) {
@@ -653,9 +657,12 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
         draw_text_color(buf, W, H, info_x, top + 7 * line_step,
                         detail_scale,
                         "2020", 60, 190, 220);
-        snprintf(line, sizeof(line), "TAG %s",
-                 av_color_primaries_name(sources[src].shown->color_primaries)
-                    ?: "UNSPECIFIED");
+        if (zlog2)
+            snprintf(line, sizeof(line), "XFORM ZCAM AP0");
+        else
+            snprintf(line, sizeof(line), "TAG %s",
+                     av_color_primaries_name(sources[src].shown->color_primaries)
+                        ?: "UNSPECIFIED");
         draw_text_color(buf, W, H, info_x, top + 9 * line_step,
                         detail_scale, line,
                         170, 170, 170);

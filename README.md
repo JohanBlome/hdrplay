@@ -165,9 +165,28 @@ hdrplay --waveform video.mp4          # start with the RGB waveform
 hdrplay --gamut video.mp4             # start with the CIE gamut scope
 hdrplay --vectorscope video.mp4       # start with the Cb/Cr vectorscope
 hdrplay --histogram video.mp4         # start with the RGB histogram
+hdrplay --input-lut Z-Log2-to-Rec709.cube clip.mov  # camera Log playback
+hdrplay --input-transfer zlog2 clip.mov             # built-in Z-Log2 decode
 hdrplay first.mov second.mov          # synchronized comparison
 hdrplay image.png                     # inspect a still image
 ```
+
+`--input-lut FILE.cube` applies a camera/vendor 3D LUT to the
+gamma-encoded RGB signal on the GPU before normal display color management.
+This is useful when a camera records Z-Log2 (or another Log curve) while the
+container incorrectly declares BT.709. Z CAM's `com.zcam.camera.lut` tag is
+logged as a diagnostic, but it only names the selected curve—it does not embed
+the LUT samples—so pass the corresponding technical Log-to-Rec.709 `.cube`
+file explicitly. The media file is never modified.
+
+For Z CAM footage, `--input-transfer zlog2` instead uses the built-in
+Z-Log2-to-scene-linear curve and Z CAM-gamut-to-ACES-AP0 matrix. libplacebo
+then performs the normal output mapping, so the same transform works for
+BT.709 SDR and BT.2020 HDR displays without separate baked display LUTs.
+The curve is fitted to Z CAM's official 4096-entry reference LUT; Z CAM has
+not published a normative equation. Its scene-linear exposure normalization
+is likewise undocumented, so hdrplay uses the independently derived 13.5x
+normalization and exposes `--zlog2-exposure STOPS` for calibration.
 
 Still images supported by the installed FFmpeg build—such as PNG, JPEG,
 TIFF and WebP—are decoded as one-frame streams and remain displayed until the

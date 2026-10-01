@@ -151,8 +151,18 @@ const char *lum_reference_name(LumReference r)
     switch (r) {
     case LUM_ABSOLUTE_PQ: return "PQ absolute";
     case LUM_HLG_OOTF:    return "HLG (assumed L_W)";
+    case LUM_SCENE_RELATIVE: return "Z-Log2 scene-relative";
     default:              return "SDR relative (100-nit white)";
     }
+}
+
+static bool g_zlog2_override;
+static double g_zlog2_exposure;
+
+void probe_set_zlog2_override(bool enabled, double exposure_stops)
+{
+    g_zlog2_override = enabled;
+    g_zlog2_exposure = exposure_stops;
 }
 
 bool lum_reference_is_absolute(LumReference r)
@@ -757,10 +767,23 @@ static bool xy_in_triangle(double x, double y,
     return !(neg && pos);
 }
 
-bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
-                    int width, int height,
-                    int sample_stride, uint32_t *bins,
-                    uint32_t *peak_count, ProbeGamutStats *stats)
+static double zlog2_decode(double t)
+{
+    const double a = 249.77914428710938, b = 0.9484496712684631;
+    const double c = 0.3455176055431366, d = 0.1709400862455368;
+    const double e = 1.3393715620040894, f = -0.06127290427684784;
+    const double cut = -0.0652475655078888;
+    double v = t > e * cut + f
+             ? (pow(10.0, (t - d) / c) - b) / a
+             : (t - f) / e;
+    return fmax(v, 0.0);
+}
+
+static bool probe_xy_gamut_impl(const AVFrame *frame,
+                                const ProbeRegion *region,
+                                int width, int height, int sample_stride,
+                                uint32_t *bins, uint32_t *peak_count,
+                                ProbeGamutStats *stats, bool zlog2)
 {
     if (peak_count) *peak_count = 0;
     if (stats) memset(stats, 0, sizeof(*stats));
@@ -787,8 +810,12 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
     int c_lo = 16 << (depth - 8), c_hi = 240 << (depth - 8);
     int c_mid = (c_lo + c_hi) / 2;
     Matrix yuv = matrix_for(frame->colorspace);
-    XyzMatrix xyz = xyz_matrix_for(frame->color_primaries,
-                                   frame->colorspace);
+    XyzMatrix xyz = zlog2 ? (XyzMatrix){{
+        /* ACES AP0 (D60) linear RGB -> CIE XYZ. */
+        { 0.95255240, 0.00000000,  0.00009368 },
+        { 0.34396645, 0.72816610, -0.07213255 },
+        { 0.00000000, 0.00000000,  1.00882518 },
+    }} : xyz_matrix_for(frame->color_primaries, frame->colorspace);
     const SigLut *linear = sig_lut_get(frame->color_trc);
     double linear_black = sig_lut_eval(linear, 0.0);
     ProbeGamutStats local = {0};
@@ -819,11 +846,20 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
             if (max_signal <= 0.01) continue;
 
             double rgb[3];
-            for (int c = 0; c < 3; c++) {
-                double v = signal[c];
-                if (v < 0.0) v = 0.0;
-                if (v > 1.0) v = 1.0;
-                rgb[c] = fmax(0.0, sig_lut_eval(linear, v) - linear_black);
+            if (zlog2) {
+                double z[3];
+                for (int c = 0; c < 3; c++)
+                    z[c] = zlog2_decode(fmin(fmax(signal[c], 0.0), 1.0));
+                rgb[0] =  0.59268922 * z[0] + 0.23980554 * z[1] + 0.09364286 * z[2];
+                rgb[1] =  0.00782530 * z[0] + 0.99994013 * z[1] - 0.07973914 * z[2];
+                rgb[2] =  0.06103745 * z[0] - 0.24592234 * z[1] + 1.13939635 * z[2];
+            } else {
+                for (int c = 0; c < 3; c++) {
+                    double v = signal[c];
+                    if (v < 0.0) v = 0.0;
+                    if (v > 1.0) v = 1.0;
+                    rgb[c] = fmax(0.0, sig_lut_eval(linear, v) - linear_black);
+                }
             }
             double X = xyz.m[0][0] * rgb[0] + xyz.m[0][1] * rgb[1] +
                        xyz.m[0][2] * rgb[2];
@@ -831,6 +867,15 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
                        xyz.m[1][2] * rgb[2];
             double Z = xyz.m[2][0] * rgb[0] + xyz.m[2][1] * rgb[1] +
                        xyz.m[2][2] * rgb[2];
+            /* Log footage stores deep shadows well above code zero. The
+             * encoded-signal black test above therefore admits pixels whose
+             * scene-linear luminance is effectively zero, where 4:2:2 chroma
+             * noise makes xy explode into long, non-physical rays. Filter in
+             * the transformed domain as well. Negative tristimulus values do
+             * not describe a physical chromaticity and must not count as
+             * target-gamut overflow. */
+            if (zlog2 && (Y <= 1e-4 || X < 0.0 || Y < 0.0 || Z < 0.0))
+                continue;
             double sum = X + Y + Z;
             if (!(sum > 1e-12)) continue;
             double x = X / sum, y = Y / sum;
@@ -857,6 +902,23 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
     if (peak_count) *peak_count = peak;
     if (stats) *stats = local;
     return true;
+}
+
+bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
+                    int width, int height, int sample_stride, uint32_t *bins,
+                    uint32_t *peak_count, ProbeGamutStats *stats)
+{
+    return probe_xy_gamut_impl(frame, region, width, height, sample_stride,
+                               bins, peak_count, stats, false);
+}
+
+bool probe_xy_gamut_zlog2(const AVFrame *frame, const ProbeRegion *region,
+                          int width, int height, int sample_stride,
+                          uint32_t *bins, uint32_t *peak_count,
+                          ProbeGamutStats *stats)
+{
+    return probe_xy_gamut_impl(frame, region, width, height, sample_stride,
+                               bins, peak_count, stats, true);
 }
 
 bool probe_vectorscope_targets(enum AVColorSpace matrix, double amplitude,
@@ -1116,7 +1178,8 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
         if (!frame->data[desc->comp[c].plane]) return false;
 
     bool  full_range = (frame->color_range == AVCOL_RANGE_JPEG);
-    out->reference   = lum_reference_of(frame->color_trc);
+    out->reference   = g_zlog2_override ? LUM_SCENE_RELATIVE
+                                        : lum_reference_of(frame->color_trc);
     out->hlg_lw      = (out->reference == LUM_HLG_OOTF)
                        ? probe_hlg_peak_nits(frame) : 0.0;
     out->width       = frame->width;
@@ -1139,6 +1202,9 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
     int           max_raw = (1 << depth) - 1;
 
     int w = frame->width, h = frame->height;
+    int range_scale = 1 << (depth - 8);
+    int range_lo = 16 * range_scale, range_hi = 235 * range_scale;
+    int range_guard = PROBE_RANGE_GUARD_CODES * range_scale;
     double peak = 0.0, floor_min = 1e9, sum = 0.0;
     double rgb_peak = 0.0, rgb_sum = 0.0;
     int    n = 0, a100 = 0, a500 = 0, a1000 = 0, out709 = 0;
@@ -1154,10 +1220,32 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
             if (yraw < 0) yraw = 0;
             if (yraw > max_raw) yraw = max_raw;
 
-            double nits    = L->nits[yraw];
+            out->range_samples++;
+            if (yraw < range_lo) out->range_below++;
+            if (yraw > range_hi) out->range_above++;
+            if (yraw < range_lo - range_guard) out->range_below_guard++;
+            if (yraw > range_hi + range_guard) out->range_above_guard++;
+
+            double nits;
+            if (g_zlog2_override) {
+                int y_hi = full_range ? max_raw : (235 << (depth - 8));
+                double yn = full_range
+                    ? (double)yraw / max_raw
+                    : (double)(yraw - L->y_lo) / (y_hi - L->y_lo);
+                yn = dclamp01(yn);
+                /* 100 is merely a convenient relative-white unit. The 13.5x
+                 * normalization matches playback; all stop ratios are
+                 * invariant to both this scale and the exposure offset. */
+                nits = 100.0 * 13.5 * exp2(g_zlog2_exposure) *
+                       zlog2_decode(yn);
+            } else {
+                nits = L->nits[yraw];
+            }
             bool   isblack = (yraw <= L->y_lo);
 
-            hist_add(&out->luma, L->bin[yraw], isblack);
+            hist_add(&out->luma, g_zlog2_override
+                                  ? probe_nits_to_bin(nits) : L->bin[yraw],
+                     isblack);
 
             if (nits > peak) peak = nits;
             if (nits > floor_cutoff_nits && nits < floor_min) floor_min = nits;

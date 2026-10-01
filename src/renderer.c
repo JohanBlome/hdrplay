@@ -7,6 +7,7 @@
 #include "source.h"
 #include "ambient.h"
 
+#include <errno.h>
 #include <math.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -361,6 +362,109 @@ bool renderer_init(Renderer *r, int width, int height, const char *title, int di
     LOG("SWAP", "swapchain ready, HDR signaling %s",
         r->display_hdr_capable ? "ACTIVE" : "off (display in SDR mode)");
     return true;
+}
+
+bool renderer_set_input_lut(Renderer *r, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        LOG("REND", "cannot open input LUT %s: %s", path, strerror(errno));
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long size = ftell(f);
+    if (size <= 0 || size > 64 * 1024 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        LOG("REND", "invalid input LUT size for %s", path);
+        fclose(f);
+        return false;
+    }
+    char *data = malloc((size_t)size + 1);
+    if (!data) { fclose(f); return false; }
+    size_t got = fread(data, 1, (size_t)size, f);
+    fclose(f);
+    data[got] = '\0';
+    if (got != (size_t)size) {
+        LOG("REND", "short read loading input LUT %s", path);
+        free(data);
+        return false;
+    }
+
+    struct pl_custom_lut *lut = pl_lut_parse_cube(r->pl_log, data, got);
+    free(data);
+    if (!lut) {
+        LOG("REND", "failed to parse input LUT %s (expected .cube)", path);
+        return false;
+    }
+    pl_lut_free(&r->input_lut);
+    r->input_lut = lut;
+    LOG("REND", "input LUT loaded: %s (%dx%dx%d)", path,
+        lut->size[0], lut->size[1], lut->size[2]);
+    return true;
+}
+
+static struct pl_hook_res input_lut_hook(
+    void *priv, const struct pl_hook_params *params)
+{
+    Renderer *r = priv;
+    pl_shader_custom_lut(params->sh, r->input_lut, &r->input_lut_state);
+    return (struct pl_hook_res){
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = params->sh,
+        .repr = params->repr,
+        .color = params->color,
+        .components = params->components,
+        .rect = params->rect,
+    };
+}
+
+static struct pl_hook_res zlog2_hook(
+    void *priv, const struct pl_hook_params *params)
+{
+    Renderer *r = priv;
+    float gain = 13.5f * exp2f(r->zlog2_exposure);
+    struct pl_shader_var vars[] = {{
+        .var = pl_var_float("zlog2_gain"),
+        .data = &gain,
+        .dynamic = true,
+    }};
+    static const char *body =
+        /* Curve fitted against Z CAM's official 4096-entry Z-Log2-to-linear
+         * LUT by Thatcher Freeman. Negative results are clipped, matching
+         * the reference LUT's legal 0..1 domain. */
+        "const float a = 249.77914428710938;\n"
+        "const float b = 0.9484496712684631;\n"
+        "const float c = 0.3455176055431366;\n"
+        "const float d = 0.1709400862455368;\n"
+        "const float e = 1.3393715620040894;\n"
+        "const float f = -0.06127290427684784;\n"
+        "const float cut = -0.0652475655078888;\n"
+        "vec3 log_branch = (pow(vec3(10.0), (color.rgb - d) / c) - b) / a;\n"
+        "vec3 lin_branch = (color.rgb - f) / e;\n"
+        "vec3 linear_zcam = mix(lin_branch, log_branch, greaterThan(color.rgb, vec3(e * cut + f)));\n"
+        "linear_zcam = max(linear_zcam * zlog2_gain, 0.0);\n"
+        /* Published Z CAM gamut -> ACES AP0 scene-linear matrix. */
+        "color.rgb = mat3(\n"
+        "  0.59268922,  0.00782530,  0.06103745,\n"
+        "  0.23980554,  0.99994013, -0.24592234,\n"
+        "  0.09364286, -0.07973914,  1.13939635\n"
+        ") * linear_zcam;\n";
+    bool ok = pl_shader_custom(params->sh, &(struct pl_custom_shader){
+        .description = "Z-Log2 / Z CAM gamut to scene-linear ACES AP0",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+        .variables = vars,
+        .num_variables = 1,
+    });
+    return (struct pl_hook_res){
+        .failed = !ok,
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = params->sh,
+        .repr = params->repr,
+        .color = params->color,
+        .components = params->components,
+        .rect = params->rect,
+    };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1427,6 +1531,18 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             r->ambient_unavailable_logged = true;
         }
 
+        /* The RGB hook decodes Z-Log2 and maps Z CAM gamut into ACES AP0.
+         * Declare its result before rendering: libplacebo requires hook output
+         * colorspace to agree with the enclosing image. This does not disturb
+         * Y'CbCr decoding, whose BT.709 matrix lives in image.repr.sys. */
+        if (r->input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2) {
+            r->slot[i].image.color.primaries = PL_COLOR_PRIM_ACES_AP0;
+            r->slot[i].image.color.transfer = PL_COLOR_TRC_LINEAR;
+            r->slot[i].image.color.hdr.min_luma = 0.0f;
+            r->slot[i].image.color.hdr.max_luma =
+                1350.0f * exp2f(r->zlog2_exposure);
+        }
+
         /* HLG is scene-referred. Its conversion to display light depends
          * on the nominal display peak L_W. The actual conversion is done
          * below, after all AVFrames have been mapped. */
@@ -1501,6 +1617,30 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         .hook = plateau_hook,
         .signature = UINT64_C(0x687064706c617400),
     };
+    struct pl_hook input_lut_hook_desc = {
+        /* Explicitly after YUV -> RGB, but before transfer linearization.
+         * PL_LUT_NATIVE is too early for YUV sources and feeds camera LUTs
+         * component-coded YCbCr rather than the RGB they were authored for. */
+        .stages = PL_HOOK_RGB,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = r,
+        .hook = input_lut_hook,
+        .signature = UINT64_C(0x687064696c757400),
+    };
+    struct pl_hook zlog2_hook_desc = {
+        .stages = PL_HOOK_RGB,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = r,
+        .hook = zlog2_hook,
+        .signature = UINT64_C(0x6870647a6c6f6732),
+    };
+    const struct pl_hook *active_hooks[2];
+    int num_active_hooks = 0;
+    if (r->input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2 &&
+        r->plane_view == HDRPLAY_PLANE_COLOR)
+        active_hooks[num_active_hooks++] = &zlog2_hook_desc;
+    else if (r->input_lut && r->plane_view == HDRPLAY_PLANE_COLOR)
+        active_hooks[num_active_hooks++] = &input_lut_hook_desc;
     const struct pl_hook *plane_hook_ptr = NULL;
     if (r->plane_view != HDRPLAY_PLANE_COLOR) {
         if (r->plane_view == HDRPLAY_PLANE_PLATEAU)
@@ -1510,12 +1650,15 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             plane_hook_ptr = &clip_hook;
         else
             plane_hook_ptr = &plane_hooks[r->plane_view - HDRPLAY_PLANE_Y];
-        rp.hooks = &plane_hook_ptr;
-        rp.num_hooks = 1;
+        active_hooks[num_active_hooks++] = plane_hook_ptr;
         /* Preserve individual 4:2:0/4:2:2 chroma samples when zooming rather
          * than smoothing their boundaries before the diagnostic hook sees
          * them. */
         rp.plane_upscaler = &pl_filter_nearest;
+    }
+    if (num_active_hooks) {
+        rp.hooks = active_hooks;
+        rp.num_hooks = num_active_hooks;
     }
 
     struct pl_frame base_target;
@@ -1785,6 +1928,8 @@ bool renderer_render(Renderer *r, Source *sources, int n)
 
 void renderer_close(Renderer *r)
 {
+    pl_shader_obj_destroy(&r->input_lut_state);
+    pl_lut_free(&r->input_lut);
     if (r->vulkan) {
         /* Per-slot: plane uploads and the compositing intermediate. */
         for (int s = 0; s < 2; s++) {

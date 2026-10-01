@@ -48,6 +48,7 @@ typedef struct Decoder {
     enum AVColorRange            range;      /* as the container claims */
     enum AVPixelFormat           pix_fmt;
     int                          bit_depth;
+    char                         camera_lut[64]; /* vendor descriptive tag */
 
     /* The range every decoded frame is stamped with. Equal to `range`
      * when the container declares one; otherwise recovered from the
@@ -55,6 +56,8 @@ typedef struct Decoder {
      * (which every consumer reads as limited) when that fails. */
     enum AVColorRange            range_effective;
     bool                         range_guessed;
+    bool                         range_audited;
+    bool                         range_conflict;
     double                       range_outside_frac;
 
     /* HDR10 static metadata, if present in stream side data. */
@@ -82,13 +85,13 @@ void  decoder_set_range_override(enum AVColorRange r);
 
 bool  decoder_open(Decoder *d, const char *path);
 
-/* Recover the colour range of an untagged source from its pixels, then
- * rewind. No-op when the container declares a range, when --range set
- * one, or when the input cannot be seeked back (recovering the range
- * is not worth consuming the head of a pipe). Pools the excursion
+/* Audit the limited-range window from pixels, recover the range when
+ * untagged, then rewind. Explicit metadata is still audited and a declared
+ * limited source is flagged when substantial samples occur beyond a ringing
+ * guard. --range controls interpretation, not whether the audit runs. Pools
  * counts over up to `max_frames` frames rather than trusting one,
  * which a fade-in or a title card would otherwise decide. Returns true
- * if a range was resolved. Call right after decoder_open(). */
+ * if a range was resolved or audited. Call right after decoder_open(). */
 bool  decoder_resolve_color_range(Decoder *d, int max_frames);
 
 int   decoder_next_frame(Decoder *d);   /* >0 got frame, 0 EOF, <0 error */

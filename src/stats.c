@@ -12,6 +12,7 @@ void session_stats_init(SessionStats *s, double tb_sec, double duration_sec)
     s->duration_sec  = duration_sec > 0.0 ? duration_sec : 0.0;
     s->high_water_pts = INT64_MIN;
     s->min_frame_avg_nits = INFINITY;
+    s->worst_range_sec = NAN;
     s->width = s->height = -1;
     s->pix_fmt = s->color_trc = s->color_range = -1;
 }
@@ -93,6 +94,24 @@ bool session_stats_add(SessionStats *s, int64_t pts, int64_t dur,
     s->underflow += f->luma.underflow;
     s->valid     += f->luma.valid;
 
+    s->range_samples     += f->range_samples;
+    s->range_below       += f->range_below;
+    s->range_above       += f->range_above;
+    s->range_below_guard += f->range_below_guard;
+    s->range_above_guard += f->range_above_guard;
+    if (f->range_samples) {
+        double exact = (double)(f->range_below + f->range_above) /
+                       (double)f->range_samples;
+        double guard = (double)(f->range_below_guard + f->range_above_guard) /
+                       (double)f->range_samples;
+        if (exact > s->worst_range_exact_frac) {
+            s->worst_range_exact_frac = exact;
+            s->worst_range_guard_frac = guard;
+            s->worst_range_sec = pts != AV_NOPTS_VALUE && s->tb_sec > 0.0
+                               ? (double)pts * s->tb_sec : NAN;
+        }
+    }
+
     if (f->has_maxrgb) {
         for (int i = 0; i < PROBE_HIST_BINS; i++)
             s->maxrgb_bins[i] += f->maxrgb.bins[i];
@@ -153,6 +172,18 @@ void session_stats_derive(const SessionStats *s, SessionDerived *out)
     out->maxfall_nits = s->maxfall_nits;
     out->maxcll_valid = s->has_maxrgb;
     out->peak_luma_nits = s->peak_luma_nits;
+    if (s->range_samples) {
+        double scale = 100.0 / (double)s->range_samples;
+        out->range_below_pct       = scale * s->range_below;
+        out->range_above_pct       = scale * s->range_above;
+        out->range_below_guard_pct = scale * s->range_below_guard;
+        out->range_above_guard_pct = scale * s->range_above_guard;
+        out->worst_range_exact_pct = 100.0 * s->worst_range_exact_frac;
+        out->worst_range_guard_pct = 100.0 * s->worst_range_guard_frac;
+        out->worst_range_sec       = s->worst_range_sec;
+    } else {
+        out->worst_range_sec = NAN;
+    }
 
     /* Coding limits, so a dynamic-range figure can be read against what
      * the format could actually carry rather than in isolation. */
@@ -161,9 +192,10 @@ void session_stats_derive(const SessionStats *s, SessionDerived *out)
             ? av_pix_fmt_desc_get((enum AVPixelFormat)s->pix_fmt) : NULL;
         out->bit_depth  = pd ? pd->comp[0].depth : 8;
         out->full_range = (s->color_range == AVCOL_RANGE_JPEG);
-        out->dr_ceiling_stops = probe_dr_ceiling_stops(
-            (enum AVColorTransferCharacteristic)s->color_trc,
-            out->bit_depth, out->full_range, s->hlg_lw);
+        out->dr_ceiling_stops = s->reference == LUM_SCENE_RELATIVE ? NAN :
+            probe_dr_ceiling_stops(
+                (enum AVColorTransferCharacteristic)s->color_trc,
+                out->bit_depth, out->full_range, s->hlg_lw);
     }
 
     if (s->duration_sec > 0.0 && s->covered_sec >= 0.0) {

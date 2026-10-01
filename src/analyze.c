@@ -149,6 +149,28 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
         check(R_INFO, "colour range recovered", buf);
         check_note("override with --range limited|full if this is wrong");
     }
+    int code_scale = 1 << (d.bit_depth > 8 ? d.bit_depth - 8 : 0);
+    snprintf(buf, sizeof(buf),
+             "below %.4f%%, above %.4f%% (nominal codes %d..%d)",
+             d.range_below_pct, d.range_above_pct,
+             16 * code_scale, 235 * code_scale);
+    check(R_INFO, "legal-range excursions", buf);
+
+    double guarded = d.range_below_guard_pct + d.range_above_guard_pct;
+    snprintf(buf, sizeof(buf),
+             "below %.4f%%, above %.4f%% (outside %d..%d)",
+             d.range_below_guard_pct, d.range_above_guard_pct,
+             (16 - PROBE_RANGE_GUARD_CODES) * code_scale,
+             (235 + PROBE_RANGE_GUARD_CODES) * code_scale);
+    check(guarded > PROBE_RANGE_FULL_FRAC * 100.0 ? R_WARN : R_INFO,
+          "beyond ringing guard", buf);
+    if (isfinite(d.worst_range_sec)) {
+        snprintf(buf, sizeof(buf),
+                 "t=%.3fs, exact %.3f%%, beyond guard %.3f%%",
+                 d.worst_range_sec, d.worst_range_exact_pct,
+                 d.worst_range_guard_pct);
+        check(R_INFO, "worst range frame", buf);
+    }
 
     snprintf(buf, sizeof(buf), "%s", lum_reference_name(d.reference));
     check(R_INFO, "luminance reference", buf);
@@ -162,6 +184,8 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
                      "bare 100·V^2.4, no black floor (--sdr-black 0)");
         check_note(buf);
     }
+    if (d.reference == LUM_SCENE_RELATIVE)
+        check_note("relative scene-light units; absolute-nit checks suppressed");
     if (d.reference == LUM_HLG_OOTF) {
         /* Name the source, not just the number. HLG carries no absolute
          * luminance, so every nit below rests on this assumption, and
@@ -207,13 +231,21 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
             check_note("luma-only scan: MaxCLL is defined over max(R,G,B)");
     } else {
         check(R_INFO, "absolute checks",
-              "suppressed — SDR source has no absolute luminance");
+              d.reference == LUM_SCENE_RELATIVE
+                ? "suppressed — camera Log is scene-relative"
+                : "suppressed — SDR source has no absolute luminance");
     }
 
     check_dynamic_range(&d);
 
-    snprintf(buf, sizeof(buf), "p1 %.3fN  p50 %.1fN  p99 %.0fN  p99.9 %.0fN",
-             d.p1, d.p50, d.p99, d.p99_9);
+    if (d.reference == LUM_SCENE_RELATIVE)
+        snprintf(buf, sizeof(buf),
+                 "p1 %.3f  p50 %.1f  p99 %.0f  p99.9 %.0f relative",
+                 d.p1, d.p50, d.p99, d.p99_9);
+    else
+        snprintf(buf, sizeof(buf),
+                 "p1 %.3fN  p50 %.1fN  p99 %.0fN  p99.9 %.0fN",
+                 d.p1, d.p50, d.p99, d.p99_9);
     check(R_INFO, "luminance distribution", buf);
 
     snprintf(buf, sizeof(buf), "%.2f spatial / %.2f temporal stops",

@@ -248,6 +248,12 @@ static void usage(void)
         "  -d INDEX              place the window on display INDEX\n"
         "                        (0-based; see --list-displays)\n"
         "  --start-sdr           start in SDR-fallback rendering mode\n"
+        "  --input-lut FILE      apply a .cube LUT to input RGB before color\n"
+        "                        management (e.g. Z-Log2 -> Rec.709)\n"
+        "  --input-transfer TRC  override the tagged input transfer; supported:\n"
+        "                        tagged (default), zlog2\n"
+        "  --zlog2-exposure N    exposure offset in stops after Z-Log2 decode\n"
+        "                        (default 0 around the 13.5x normalization)\n"
         "  --plane MODE          color/y/cb/cr/legal/clip/plateau. LEGAL marks\n"
         "                        nominal video-range limits; CLIP marks only\n"
         "                        literal storage endpoints; PLATEAU marks\n"
@@ -485,6 +491,9 @@ int main(int argc, char **argv)
     double sdr_black_nits = -1.0;     /* <0 = leave probe.c's BT.1886 default */
     enum AVColorRange range_override = AVCOL_RANGE_UNSPECIFIED;  /* auto */
     const char *stats_path = NULL;
+    const char *input_lut_path = NULL;
+    HdrplayInputTransfer input_transfer = HDRPLAY_INPUT_TRANSFER_TAGGED;
+    float zlog2_exposure = 0.0f;
     const char *paths[2] = { NULL, NULL };
     int   n_paths = 0;
     int   step_buffer = 8;   /* frames retained for step-back */
@@ -537,6 +546,21 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--step-buffer") && i+1 < argc)
             step_buffer = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--start-sdr")) start_mode = HDRPLAY_MODE_SDR;
+        else if (!strcmp(argv[i], "--input-lut") && i+1 < argc)
+            input_lut_path = argv[++i];
+        else if (!strcmp(argv[i], "--input-transfer") && i+1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "tagged") || !strcmp(m, "auto"))
+                input_transfer = HDRPLAY_INPUT_TRANSFER_TAGGED;
+            else if (!strcmp(m, "zlog2"))
+                input_transfer = HDRPLAY_INPUT_TRANSFER_ZLOG2;
+            else {
+                fprintf(stderr, "unknown --input-transfer: %s\n", m);
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--zlog2-exposure") && i+1 < argc)
+            zlog2_exposure = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--plane") && i+1 < argc) {
             const char *p = argv[++i];
             if      (!strcmp(p, "color")) start_plane = HDRPLAY_PLANE_COLOR;
@@ -596,6 +620,8 @@ int main(int argc, char **argv)
 
     if (hlg_peak > 0.0) probe_set_hlg_peak_override(hlg_peak);
     if (sdr_black_nits >= 0.0) probe_set_sdr_black_nits(sdr_black_nits);
+    probe_set_zlog2_override(input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2,
+                             zlog2_exposure);
     decoder_set_range_override(range_override);
 
     ensure_moltenvk_icd();
@@ -657,11 +683,24 @@ int main(int argc, char **argv)
         for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
         return 1;
     }
+    if (input_lut_path && !renderer_set_input_lut(&rend, input_lut_path)) {
+        renderer_close(&rend);
+        for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
+        return 1;
+    }
+    if (input_lut_path && input_transfer != HDRPLAY_INPUT_TRANSFER_TAGGED) {
+        fprintf(stderr, "--input-lut and --input-transfer cannot be combined\n");
+        renderer_close(&rend);
+        for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
+        return 2;
+    }
 
     if (fullscreen)
         SDL_SetWindowFullscreen(rend.window, true);
 
     rend.mode = start_mode;
+    rend.input_transfer = input_transfer;
+    rend.zlog2_exposure = zlog2_exposure;
     rend.split_orient = start_orient;
     rend.plane_view = start_plane;
     rend.loop_enabled = loop_at_eof;
