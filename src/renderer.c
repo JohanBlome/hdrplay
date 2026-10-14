@@ -421,32 +421,30 @@ static struct pl_hook_res zlog2_hook(
     void *priv, const struct pl_hook_params *params)
 {
     Renderer *r = priv;
-    float gain = 13.5f * exp2f(r->zlog2_exposure);
+    float gain = (float)(HDRPLAY_ZLOG2_GAIN * exp2(r->input_exposure_active));
     struct pl_shader_var vars[] = {{
         .var = pl_var_float("zlog2_gain"),
         .data = &gain,
         .dynamic = true,
     }};
     static const char *body =
-        /* Curve fitted against Z CAM's official 4096-entry Z-Log2-to-linear
-         * LUT by Thatcher Freeman. Negative results are clipped, matching
-         * the reference LUT's legal 0..1 domain. */
-        "const float a = 249.77914428710938;\n"
-        "const float b = 0.9484496712684631;\n"
-        "const float c = 0.3455176055431366;\n"
-        "const float d = 0.1709400862455368;\n"
-        "const float e = 1.3393715620040894;\n"
-        "const float f = -0.06127290427684784;\n"
-        "const float cut = -0.0652475655078888;\n"
-        "vec3 log_branch = (pow(vec3(10.0), (color.rgb - d) / c) - b) / a;\n"
-        "vec3 lin_branch = (color.rgb - f) / e;\n"
-        "vec3 linear_zcam = mix(lin_branch, log_branch, greaterThan(color.rgb, vec3(e * cut + f)));\n"
+        /* Constants are shared with input_transform.h's CPU implementation. */
+        "const float a = " HDRPLAY_STRINGIFY(HDRPLAY_ZLOG2_A) ";\n"
+        "const float b = " HDRPLAY_STRINGIFY(HDRPLAY_ZLOG2_B) ";\n"
+        "const float c = " HDRPLAY_STRINGIFY(HDRPLAY_ZLOG2_C) ";\n"
+        "const float d = " HDRPLAY_STRINGIFY(HDRPLAY_ZLOG2_D) ";\n"
+        "const float e = " HDRPLAY_STRINGIFY(HDRPLAY_ZLOG2_E) ";\n"
+        "const float f = " HDRPLAY_STRINGIFY(HDRPLAY_ZLOG2_F) ";\n"
+        "const float cut = " HDRPLAY_STRINGIFY(HDRPLAY_ZLOG2_CUT) ";\n"
+        "vec3 encoded = clamp(color.rgb, 0.0, 1.0);\n"
+        "vec3 log_branch = (pow(vec3(10.0), (encoded - d) / c) - b) / a;\n"
+        "vec3 lin_branch = (encoded - f) / e;\n"
+        "vec3 linear_zcam = mix(lin_branch, log_branch, greaterThan(encoded, vec3(cut)));\n"
         "linear_zcam = max(linear_zcam * zlog2_gain, 0.0);\n"
-        /* Published Z CAM gamut -> ACES AP0 scene-linear matrix. */
         "color.rgb = mat3(\n"
-        "  0.59268922,  0.00782530,  0.06103745,\n"
-        "  0.23980554,  0.99994013, -0.24592234,\n"
-        "  0.09364286, -0.07973914,  1.13939635\n"
+        "  " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_00) ", " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_10) ", " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_20) ",\n"
+        "  " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_01) ", " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_11) ", " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_21) ",\n"
+        "  " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_02) ", " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_12) ", " HDRPLAY_STRINGIFY(HDRPLAY_ZCAM_AP0_22) "\n"
         ") * linear_zcam;\n";
     bool ok = pl_shader_custom(params->sh, &(struct pl_custom_shader){
         .description = "Z-Log2 / Z CAM gamut to scene-linear ACES AP0",
@@ -465,6 +463,71 @@ static struct pl_hook_res zlog2_hook(
         .components = params->components,
         .rect = params->rect,
     };
+}
+
+static struct pl_hook_res logc3_hook(
+    void *priv, const struct pl_hook_params *params)
+{
+    static const char *body =
+        /* ARRI LogC3 EI800 curve and AWG3 -> ACES2065-1 matrix from the
+         * Academy/OCIO reference transform. Constants are shared with CPU. */
+        "const float a = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_A) ";\n"
+        "const float b = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_B) ";\n"
+        "const float c = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_C) ";\n"
+        "const float d = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_D) ";\n"
+        "const float cut = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_CUT) ";\n"
+        "const float e = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_E) ";\n"
+        "const float f = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_F) ";\n"
+        "const float gain = " HDRPLAY_STRINGIFY(HDRPLAY_LOGC3_GAIN) ";\n"
+        "vec3 encoded = clamp(color.rgb, 0.0, 1.0);\n"
+        "vec3 log_branch = (pow(vec3(10.0), (encoded - d) / c) - b) / a;\n"
+        "vec3 lin_branch = (encoded - f) / e;\n"
+        "vec3 linear_awg3 = mix(lin_branch, log_branch, greaterThan(encoded, vec3(e * cut + f)));\n"
+        "linear_awg3 = max(linear_awg3 * gain, 0.0);\n"
+        "color.rgb = mat3(\n"
+        "  " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_00) ", " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_10) ", " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_20) ",\n"
+        "  " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_01) ", " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_11) ", " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_21) ",\n"
+        "  " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_02) ", " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_12) ", " HDRPLAY_STRINGIFY(HDRPLAY_AWG3_AP0_22) "\n"
+        ") * linear_awg3;\n";
+    bool ok = pl_shader_custom(params->sh, &(struct pl_custom_shader){
+        .description = "ARRI LogC3 EI800 / AWG3 to scene-linear ACES AP0",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+    });
+    return (struct pl_hook_res){
+        .failed = !ok,
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = params->sh,
+        .repr = params->repr,
+        .color = params->color,
+        .components = params->components,
+        .rect = params->rect,
+    };
+}
+
+static void configure_source_hooks(
+    Renderer *r, const Source *source, HdrplayPlaneView plane_view,
+    const struct pl_hook *zlog2_desc, const struct pl_hook *logc3_desc,
+    const struct pl_hook *input_lut_desc, const struct pl_hook *plane_desc,
+    struct pl_render_params *params, const struct pl_hook *active[2])
+{
+    params->hooks = NULL;
+    params->num_hooks = 0;
+    r->input_exposure_active = source->input_transform.exposure_stops;
+
+    if (plane_view == HDRPLAY_PLANE_COLOR) {
+        if (source->input_transform.transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2)
+            active[params->num_hooks++] = zlog2_desc;
+        else if (source->input_transform.transfer == HDRPLAY_INPUT_TRANSFER_LOGC3)
+            active[params->num_hooks++] = logc3_desc;
+        else if (r->input_lut)
+            active[params->num_hooks++] = input_lut_desc;
+    } else if (plane_desc) {
+        active[params->num_hooks++] = plane_desc;
+    }
+
+    if (params->num_hooks) params->hooks = active;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1531,16 +1594,19 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             r->ambient_unavailable_logged = true;
         }
 
-        /* The RGB hook decodes Z-Log2 and maps Z CAM gamut into ACES AP0.
-         * Declare its result before rendering: libplacebo requires hook output
-         * colorspace to agree with the enclosing image. This does not disturb
-         * Y'CbCr decoding, whose BT.709 matrix lives in image.repr.sys. */
-        if (r->input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2) {
+        /* Camera-Log hooks run only in COLOR view. Diagnostic plane views
+         * intentionally expose encoded components and therefore keep their
+         * original tagged colorspace; never label Log code values AP0/linear
+         * when the transform hook is absent. */
+        const HdrplayInputTransform *input =
+            &sources[source_index].input_transform;
+        if (r->plane_view == HDRPLAY_PLANE_COLOR &&
+            hdrplay_input_is_log(input)) {
             r->slot[i].image.color.primaries = PL_COLOR_PRIM_ACES_AP0;
             r->slot[i].image.color.transfer = PL_COLOR_TRC_LINEAR;
-            r->slot[i].image.color.hdr.min_luma = 0.0f;
+            r->slot[i].image.color.hdr.min_luma = PL_COLOR_HDR_BLACK;
             r->slot[i].image.color.hdr.max_luma =
-                1350.0f * exp2f(r->zlog2_exposure);
+                (float)hdrplay_input_peak_nits(input);
         }
 
         /* HLG is scene-referred. Its conversion to display light depends
@@ -1641,13 +1707,14 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         .hook = zlog2_hook,
         .signature = UINT64_C(0x6870647a6c6f6732),
     };
+    struct pl_hook logc3_hook_desc = {
+        .stages = PL_HOOK_RGB,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = r,
+        .hook = logc3_hook,
+        .signature = UINT64_C(0x6870646c6f676333),
+    };
     const struct pl_hook *active_hooks[2];
-    int num_active_hooks = 0;
-    if (r->input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2 &&
-        r->plane_view == HDRPLAY_PLANE_COLOR)
-        active_hooks[num_active_hooks++] = &zlog2_hook_desc;
-    else if (r->input_lut && r->plane_view == HDRPLAY_PLANE_COLOR)
-        active_hooks[num_active_hooks++] = &input_lut_hook_desc;
     const struct pl_hook *plane_hook_ptr = NULL;
     if (r->plane_view != HDRPLAY_PLANE_COLOR) {
         if (r->plane_view == HDRPLAY_PLANE_PLATEAU)
@@ -1657,15 +1724,10 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             plane_hook_ptr = &clip_hook;
         else
             plane_hook_ptr = &plane_hooks[r->plane_view - HDRPLAY_PLANE_Y];
-        active_hooks[num_active_hooks++] = plane_hook_ptr;
         /* Preserve individual 4:2:0/4:2:2 chroma samples when zooming rather
          * than smoothing their boundaries before the diagnostic hook sees
          * them. */
         rp.plane_upscaler = &pl_filter_nearest;
-    }
-    if (num_active_hooks) {
-        rp.hooks = active_hooks;
-        rp.num_hooks = num_active_hooks;
     }
 
     struct pl_frame base_target;
@@ -1756,7 +1818,8 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             r->probe_nits = NAN;
         } else {
             ProbeResult pr;
-            if (probe_sample(pf, sx, sy, &pr)) {
+            if (probe_sample(pf, &sources[focus].input_transform,
+                             sx, sy, &pr)) {
                 r->probe_nits   = pr.luma_nits;
                 r->probe_y_norm = pr.y_norm;
                 r->probe_r_nits = pr.r_nits;
@@ -1788,6 +1851,11 @@ bool renderer_render(Renderer *r, Source *sources, int n)
             select_plateau_thresholds(r, si);
         if (!rect_is_zero(plan.inter[i].image_crop))
             img.crop = to_pl_rect(plan.inter[i].image_crop);
+        int source_index = temporal_diff && si == 1 ? 0 : si;
+        configure_source_hooks(r, &sources[source_index], r->plane_view,
+                               &zlog2_hook_desc, &logc3_hook_desc,
+                               &input_lut_hook_desc, plane_hook_ptr,
+                               &rp, active_hooks);
         if (!render_to_intermediate(r, si, &img, win_w, win_h,
                                     to_pl_rect(plan.inter[i].dst),
                                     plan.inter[i].mask, plan.inter[i].sdr,
@@ -1915,6 +1983,11 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         target.overlays     = n_ov ? ov_store : NULL;
         target.num_overlays = n_ov;
 
+        int source_index = temporal_diff && lp->src == 1 ? 0 : lp->src;
+        configure_source_hooks(r, &sources[source_index], r->plane_view,
+                               &zlog2_hook_desc, &logc3_hook_desc,
+                               &input_lut_hook_desc, plane_hook_ptr,
+                               &rp, active_hooks);
         if (!pl_render_image(r->renderer, &image, &target, &rp))
             LOG("REND", "pl_render_image (%s pass %d) failed", plan.name, pi);
     }

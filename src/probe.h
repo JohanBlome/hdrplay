@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <libavutil/frame.h>
+#include "input_transform.h"
 
 /* ------------------------------------------------------------------ */
 /* Luminance reference.                                                */
@@ -23,16 +24,15 @@ typedef enum {
     LUM_HLG_OOTF,        /* cd/m², premised on a stated L_W            */
     LUM_SDR_RELATIVE,    /* nominal only, 100-nit reference white      */
     LUM_SCENE_RELATIVE,  /* decoded camera Log; ratios only             */
+    LUM_LOGC3_RELATIVE,  /* ARRI LogC3 EI800 scene-linear              */
 } LumReference;
 
 LumReference lum_reference_of(enum AVColorTransferCharacteristic trc);
 const char  *lum_reference_name(LumReference r);
 bool         lum_reference_is_absolute(LumReference r);
 
-/* Make statistics decode Z-Log2 rather than trusting the frame's false
- * BT.709 tag. Values remain scene-relative; exposure affects scale but not
- * ratios such as dynamic range. */
-void probe_set_zlog2_override(bool enabled, double exposure_stops);
+/* Camera-Log interpretation is explicit per input. All probes receive the
+ * same transform as playback so comparisons cannot mix source domains. */
 
 /* ------------------------------------------------------------------ */
 /* SDR black level (BT.1886 L_B, cd/m²).                               */
@@ -163,8 +163,8 @@ typedef struct {
  * planar masters, semi-planar NV12/P010 and packed YUYV-style layouts.
  * Chroma coordinates come from AVPixFmtDescriptor rather than assuming
  * 4:2:0. */
-bool probe_sample(const AVFrame *frame, int src_x, int src_y,
-                  ProbeResult *out);
+bool probe_sample(const AVFrame *frame, const HdrplayInputTransform *transform,
+                  int src_x, int src_y, ProbeResult *out);
 
 /* Nominal display peak (L_W, cd/m²) used to convert HLG scene light to
  * display light. HLG carries no absolute luminance of its own, so this
@@ -249,8 +249,9 @@ typedef struct {
  * 1 = every pixel (exact, offline), 8 = every 8th in both axes (~130k
  * samples on 4K, sub-ms). Returns false on unsupported pix_fmt — see
  * probe_sample() for the accepted set. */
-bool probe_frame_stats(const AVFrame *frame, int sample_stride,
-                       ProbeMode mode, FrameStats *out);
+bool probe_frame_stats(const AVFrame *frame,
+                       const HdrplayInputTransform *transform,
+                       int sample_stride, ProbeMode mode, FrameStats *out);
 
 /* ------------------------------------------------------------------ */
 /* RGB waveform.                                                       */
@@ -309,12 +310,12 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
                     int width, int height,
                     int sample_stride, uint32_t *bins,
                     uint32_t *peak_count, ProbeGamutStats *stats);
-/* As above, but decode Z-Log2 and transform Z CAM gamut to ACES AP0 before
- * computing chromaticity. Used when playback overrides a false BT.709 tag. */
-bool probe_xy_gamut_zlog2(const AVFrame *frame, const ProbeRegion *region,
-                          int width, int height,
-                          int sample_stride, uint32_t *bins,
-                          uint32_t *peak_count, ProbeGamutStats *stats);
+bool probe_xy_gamut_transform(const AVFrame *frame,
+                              const HdrplayInputTransform *transform,
+                              const ProbeRegion *region,
+                              int width, int height, int sample_stride,
+                              uint32_t *bins, uint32_t *peak_count,
+                              ProbeGamutStats *stats);
 
 /* Digital vectorscope: Cb on the horizontal axis and Cr vertically. Values
  * are normalized so nominal chroma occupies -0.5..+0.5, with a 20% guard

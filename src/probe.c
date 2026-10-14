@@ -146,23 +146,27 @@ LumReference lum_reference_of(enum AVColorTransferCharacteristic trc)
     }
 }
 
+static LumReference lum_reference_for_input(
+    const AVFrame *frame, const HdrplayInputTransform *transform)
+{
+    if (transform) {
+        if (transform->transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2)
+            return LUM_SCENE_RELATIVE;
+        if (transform->transfer == HDRPLAY_INPUT_TRANSFER_LOGC3)
+            return LUM_LOGC3_RELATIVE;
+    }
+    return lum_reference_of(frame->color_trc);
+}
+
 const char *lum_reference_name(LumReference r)
 {
     switch (r) {
     case LUM_ABSOLUTE_PQ: return "PQ absolute";
     case LUM_HLG_OOTF:    return "HLG (assumed L_W)";
     case LUM_SCENE_RELATIVE: return "Z-Log2 scene-relative";
+    case LUM_LOGC3_RELATIVE: return "ARRI LogC3 EI800 scene-relative";
     default:              return "SDR relative (100-nit white)";
     }
-}
-
-static bool g_zlog2_override;
-static double g_zlog2_exposure;
-
-void probe_set_zlog2_override(bool enabled, double exposure_stops)
-{
-    g_zlog2_override = enabled;
-    g_zlog2_exposure = exposure_stops;
 }
 
 bool lum_reference_is_absolute(LumReference r)
@@ -767,23 +771,12 @@ static bool xy_in_triangle(double x, double y,
     return !(neg && pos);
 }
 
-static double zlog2_decode(double t)
-{
-    const double a = 249.77914428710938, b = 0.9484496712684631;
-    const double c = 0.3455176055431366, d = 0.1709400862455368;
-    const double e = 1.3393715620040894, f = -0.06127290427684784;
-    const double cut = -0.0652475655078888;
-    double v = t > e * cut + f
-             ? (pow(10.0, (t - d) / c) - b) / a
-             : (t - f) / e;
-    return fmax(v, 0.0);
-}
-
 static bool probe_xy_gamut_impl(const AVFrame *frame,
+                                const HdrplayInputTransform *transform,
                                 const ProbeRegion *region,
                                 int width, int height, int sample_stride,
                                 uint32_t *bins, uint32_t *peak_count,
-                                ProbeGamutStats *stats, bool zlog2)
+                                ProbeGamutStats *stats)
 {
     if (peak_count) *peak_count = 0;
     if (stats) memset(stats, 0, sizeof(*stats));
@@ -810,7 +803,8 @@ static bool probe_xy_gamut_impl(const AVFrame *frame,
     int c_lo = 16 << (depth - 8), c_hi = 240 << (depth - 8);
     int c_mid = (c_lo + c_hi) / 2;
     Matrix yuv = matrix_for(frame->colorspace);
-    XyzMatrix xyz = zlog2 ? (XyzMatrix){{
+    bool camera_log = hdrplay_input_is_log(transform);
+    XyzMatrix xyz = camera_log ? (XyzMatrix){{
         /* ACES AP0 (D60) linear RGB -> CIE XYZ. */
         { 0.95255240, 0.00000000,  0.00009368 },
         { 0.34396645, 0.72816610, -0.07213255 },
@@ -846,13 +840,8 @@ static bool probe_xy_gamut_impl(const AVFrame *frame,
             if (max_signal <= 0.01) continue;
 
             double rgb[3];
-            if (zlog2) {
-                double z[3];
-                for (int c = 0; c < 3; c++)
-                    z[c] = zlog2_decode(fmin(fmax(signal[c], 0.0), 1.0));
-                rgb[0] =  0.59268922 * z[0] + 0.23980554 * z[1] + 0.09364286 * z[2];
-                rgb[1] =  0.00782530 * z[0] + 0.99994013 * z[1] - 0.07973914 * z[2];
-                rgb[2] =  0.06103745 * z[0] - 0.24592234 * z[1] + 1.13939635 * z[2];
+            if (camera_log) {
+                hdrplay_input_to_ap0(transform, signal, rgb);
             } else {
                 for (int c = 0; c < 3; c++) {
                     double v = signal[c];
@@ -874,7 +863,7 @@ static bool probe_xy_gamut_impl(const AVFrame *frame,
              * the transformed domain as well. Negative tristimulus values do
              * not describe a physical chromaticity and must not count as
              * target-gamut overflow. */
-            if (zlog2 && (Y <= 1e-4 || X < 0.0 || Y < 0.0 || Z < 0.0))
+            if (camera_log && (Y <= 1e-4 || X < 0.0 || Y < 0.0 || Z < 0.0))
                 continue;
             double sum = X + Y + Z;
             if (!(sum > 1e-12)) continue;
@@ -908,17 +897,22 @@ bool probe_xy_gamut(const AVFrame *frame, const ProbeRegion *region,
                     int width, int height, int sample_stride, uint32_t *bins,
                     uint32_t *peak_count, ProbeGamutStats *stats)
 {
-    return probe_xy_gamut_impl(frame, region, width, height, sample_stride,
-                               bins, peak_count, stats, false);
+    HdrplayInputTransform tagged = HDRPLAY_INPUT_TRANSFORM_TAGGED;
+    return probe_xy_gamut_impl(frame, &tagged, region, width, height,
+                               sample_stride, bins, peak_count, stats);
 }
 
-bool probe_xy_gamut_zlog2(const AVFrame *frame, const ProbeRegion *region,
-                          int width, int height, int sample_stride,
-                          uint32_t *bins, uint32_t *peak_count,
-                          ProbeGamutStats *stats)
+bool probe_xy_gamut_transform(const AVFrame *frame,
+                              const HdrplayInputTransform *transform,
+                              const ProbeRegion *region,
+                              int width, int height, int sample_stride,
+                              uint32_t *bins, uint32_t *peak_count,
+                              ProbeGamutStats *stats)
 {
-    return probe_xy_gamut_impl(frame, region, width, height, sample_stride,
-                               bins, peak_count, stats, true);
+    HdrplayInputTransform tagged = HDRPLAY_INPUT_TRANSFORM_TAGGED;
+    return probe_xy_gamut_impl(frame, transform ? transform : &tagged, region,
+                               width, height, sample_stride, bins, peak_count,
+                               stats);
 }
 
 bool probe_vectorscope_targets(enum AVColorSpace matrix, double amplitude,
@@ -1050,7 +1044,8 @@ static bool outside_bt709(double r, double g, double b)
 }
 
 /* ------------------------------------------------------------------ */
-bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
+bool probe_sample(const AVFrame *frame, const HdrplayInputTransform *transform,
+                  int src_x, int src_y, ProbeResult *out)
 {
     memset(out, 0, sizeof(*out));
     if (!frame || !frame->data[0]) return false;
@@ -1062,7 +1057,7 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
     if (src_y >= frame->height) src_y = frame->height - 1;
     out->src_x = src_x;
     out->src_y = src_y;
-    out->reference = lum_reference_of(frame->color_trc);
+    out->reference = lum_reference_for_input(frame, transform);
 
     /* Inspect pix_fmt — 8/10/12-bit planar or semi-planar YUV. */
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
@@ -1106,6 +1101,25 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
     double R = Y + 2.0 * (1.0 - m.kr) * Cr;
     double B = Y + 2.0 * (1.0 - m.kb) * Cb;
     double G = (Y - m.kr * R - m.kb * B) / m.kg;
+    double signal[3] = { R, G, B };
+    if (hdrplay_input_is_log(transform)) {
+        double ap0[3];
+        hdrplay_input_to_ap0(transform, signal, ap0);
+        out->r_norm = signal[0];
+        out->g_norm = signal[1];
+        out->b_norm = signal[2];
+        /* Relative scene-light units: 100 is a convenient diffuse-white-like
+         * display unit, not a claim of absolute luminance. */
+        out->r_nits = 100.0 * ap0[0];
+        out->g_nits = 100.0 * ap0[1];
+        out->b_nits = 100.0 * ap0[2];
+        /* Match frame statistics: relative luma is the decoded Y' channel.
+         * AP0 RGB remains available above for color-aware inspection. */
+        out->luma_nits = 100.0 *
+            hdrplay_input_decode_channel(transform, Y);
+        return true;
+    }
+
     R = dclamp01(R);
     G = dclamp01(G);
     B = dclamp01(B);
@@ -1119,10 +1133,7 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
          * channel: the system gamma is driven by the *scene luma*, then
          * applied to each channel.
          *     Y_S    = kr·R_S + kg·G_S + kb·B_S
-         *     F_D(C) = L_W · Y_S^(gamma-1) · C_S
-         * Skipping it left the values scene-referred and capped at 1.0,
-         * so probe readouts on HLG clips reported ~1 nit for full-scale
-         * white. */
+         *     F_D(C) = L_W · Y_S^(gamma-1) · C_S */
         double Rs = hlg_inverse_oetf(R);
         double Gs = hlg_inverse_oetf(G);
         double Bs = hlg_inverse_oetf(B);
@@ -1160,8 +1171,9 @@ bool probe_sample(const AVFrame *frame, int src_x, int src_y, ProbeResult *out)
 /* sided LOWER bound. Callers must not treat "measured <= declared"   */
 /* as confirmation of anything.                                       */
 /* ------------------------------------------------------------------ */
-bool probe_frame_stats(const AVFrame *frame, int sample_stride,
-                       ProbeMode mode, FrameStats *out)
+bool probe_frame_stats(const AVFrame *frame,
+                       const HdrplayInputTransform *transform,
+                       int sample_stride, ProbeMode mode, FrameStats *out)
 {
     memset(out, 0, sizeof(*out));
     if (!frame || !frame->data[0]) return false;
@@ -1178,8 +1190,7 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
         if (!frame->data[desc->comp[c].plane]) return false;
 
     bool  full_range = (frame->color_range == AVCOL_RANGE_JPEG);
-    out->reference   = g_zlog2_override ? LUM_SCENE_RELATIVE
-                                        : lum_reference_of(frame->color_trc);
+    out->reference = lum_reference_for_input(frame, transform);
     out->hlg_lw      = (out->reference == LUM_HLG_OOTF)
                        ? probe_hlg_peak_nits(frame) : 0.0;
     out->width       = frame->width;
@@ -1203,11 +1214,14 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
 
     int w = frame->width, h = frame->height;
     int range_scale = 1 << (depth - 8);
-    int range_lo = 16 * range_scale, range_hi = 235 * range_scale;
-    int range_guard = PROBE_RANGE_GUARD_CODES * range_scale;
+    int range_lo = full_range ? 0 : 16 * range_scale;
+    int range_hi = full_range ? max_raw : 235 * range_scale;
+    int range_guard = full_range ? 0 : PROBE_RANGE_GUARD_CODES * range_scale;
     double peak = 0.0, floor_min = 1e9, sum = 0.0;
     double rgb_peak = 0.0, rgb_sum = 0.0;
     int    n = 0, a100 = 0, a500 = 0, a1000 = 0, out709 = 0;
+
+    bool camera_log = hdrplay_input_is_log(transform);
 
     /* Legacy floor threshold, kept only to populate floor_nits for the
      * existing HUD line. The dynamic-range figure below comes from the
@@ -1227,24 +1241,19 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
             if (yraw > range_hi + range_guard) out->range_above_guard++;
 
             double nits;
-            if (g_zlog2_override) {
+            if (camera_log) {
                 int y_hi = full_range ? max_raw : (235 << (depth - 8));
                 double yn = full_range
                     ? (double)yraw / max_raw
                     : (double)(yraw - L->y_lo) / (y_hi - L->y_lo);
-                yn = dclamp01(yn);
-                /* 100 is merely a convenient relative-white unit. The 13.5x
-                 * normalization matches playback; all stop ratios are
-                 * invariant to both this scale and the exposure offset. */
-                nits = 100.0 * 13.5 * exp2(g_zlog2_exposure) *
-                       zlog2_decode(yn);
+                nits = 100.0 * hdrplay_input_decode_channel(transform, yn);
             } else {
                 nits = L->nits[yraw];
             }
-            bool   isblack = (yraw <= L->y_lo);
+            bool isblack = (yraw <= L->y_lo);
 
-            hist_add(&out->luma, g_zlog2_override
-                                  ? probe_nits_to_bin(nits) : L->bin[yraw],
+            hist_add(&out->luma, camera_log ? probe_nits_to_bin(nits)
+                                             : L->bin[yraw],
                      isblack);
 
             if (nits > peak) peak = nits;
@@ -1277,26 +1286,37 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
             double R = Yn + 2.0 * (1.0 - m.kr) * Cr;
             double B = Yn + 2.0 * (1.0 - m.kb) * Cb;
             double G = (Yn - m.kr * R - m.kb * B) / m.kg;
-            R = dclamp01(R);
-            G = dclamp01(G);
-            B = dclamp01(B);
 
-            double rl = sig_lut_eval(S, R);
-            double gl = sig_lut_eval(S, G);
-            double bl = sig_lut_eval(S, B);
-            if (is_hlg) {
-                /* One common scale across channels, so channel ORDER is
-                 * unchanged by the OOTF — max() commutes with it. */
-                double Ys = m.kr * rl + m.kg * gl + m.kb * bl;
-                double s  = (Ys > 0.0) ? out->hlg_lw * pow(Ys, hlg_g1) : 0.0;
-                rl *= s; gl *= s; bl *= s;
+            double rl, gl, bl;
+            if (camera_log) {
+                double signal[3] = { R, G, B };
+                double ap0[3];
+                hdrplay_input_to_ap0(transform, signal, ap0);
+                rl = 100.0 * ap0[0];
+                gl = 100.0 * ap0[1];
+                bl = 100.0 * ap0[2];
+            } else {
+                R = dclamp01(R);
+                G = dclamp01(G);
+                B = dclamp01(B);
+                rl = sig_lut_eval(S, R);
+                gl = sig_lut_eval(S, G);
+                bl = sig_lut_eval(S, B);
+                if (is_hlg) {
+                    /* One common scale across channels, so channel ORDER is
+                     * unchanged by the OOTF — max() commutes with it. */
+                    double Ys = m.kr * rl + m.kg * gl + m.kb * bl;
+                    double s = (Ys > 0.0)
+                        ? out->hlg_lw * pow(Ys, hlg_g1) : 0.0;
+                    rl *= s; gl *= s; bl *= s;
+                }
             }
 
             double mx = fmax(rl, fmax(gl, bl));
             hist_add(&out->maxrgb, probe_nits_to_bin(mx), isblack);
             if (mx > rgb_peak) rgb_peak = mx;
             rgb_sum += mx;
-            if (wide && outside_bt709(rl, gl, bl)) out709++;
+            if (!camera_log && wide && outside_bt709(rl, gl, bl)) out709++;
         }
     }
 
@@ -1323,10 +1343,14 @@ bool probe_frame_stats(const AVFrame *frame, int sample_stride,
                     ? log2(hi / lo) : 0.0;
 
     if (want_rgb) {
-        out->has_maxrgb      = true;
+        /* MaxCLL/MaxFALL are absolute display-light metrics. Camera Log is
+         * scene-relative, so retain transformed values for debugging but do
+         * not advertise them as valid CTA-861.3 measurements. */
+        out->has_maxrgb      = !camera_log;
         out->maxrgb_peak     = rgb_peak;
         out->maxrgb_avg      = rgb_sum / n;
-        out->pct_outside_709 = wide ? (100.0f * out709 / n) : 0.0f;
+        out->pct_outside_709 = (!camera_log && wide)
+                             ? (100.0f * out709 / n) : 0.0f;
     }
     return true;
 }

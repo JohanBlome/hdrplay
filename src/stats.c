@@ -192,7 +192,8 @@ void session_stats_derive(const SessionStats *s, SessionDerived *out)
             ? av_pix_fmt_desc_get((enum AVPixelFormat)s->pix_fmt) : NULL;
         out->bit_depth  = pd ? pd->comp[0].depth : 8;
         out->full_range = (s->color_range == AVCOL_RANGE_JPEG);
-        out->dr_ceiling_stops = s->reference == LUM_SCENE_RELATIVE ? NAN :
+        out->dr_ceiling_stops = (s->reference == LUM_SCENE_RELATIVE ||
+                                 s->reference == LUM_LOGC3_RELATIVE) ? NAN :
             probe_dr_ceiling_stops(
                 (enum AVColorTransferCharacteristic)s->color_trc,
                 out->bit_depth, out->full_range, s->hlg_lw);

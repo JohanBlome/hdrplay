@@ -105,9 +105,11 @@ static int displayed_frame_no(const Source *s, const AVFrame *f, int fallback)
     return (int)llround(n);
 }
 
-bool source_open(Source *s, const char *path, int ring_cap)
+bool source_open(Source *s, const char *path, int ring_cap,
+                 const HdrplayInputTransform *transform)
 {
     memset(s, 0, sizeof(*s));
+    s->input_transform = transform ? *transform : HDRPLAY_INPUT_TRANSFORM_TAGGED;
     if (!decoder_open(&s->dec, path)) return false;
     /* Before the first frame reaches the renderer or the probe, so both
      * see the same range for an untagged source. */
@@ -274,7 +276,8 @@ static void promote(Source *s)
     AVFrame *f = s->pending;
     s->pending = NULL;
 
-    s->frame_stats_valid = probe_frame_stats(f, 8, PROBE_LUMA_ONLY,
+    s->frame_stats_valid = probe_frame_stats(f, &s->input_transform, 8,
+                                             PROBE_LUMA_ONLY,
                                              &s->frame_stats);
     if (s->frame_stats_valid)
         session_stats_add(&s->session, f->best_effort_timestamp,

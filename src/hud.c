@@ -549,12 +549,9 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     if (!bins) { free(buf); return -1; }
     uint32_t peak = 0;
     ProbeGamutStats stats;
-    bool zlog2 = r->input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2;
-    bool ok = zlog2
-        ? probe_xy_gamut_zlog2(sources[src].shown, region, bin_w, bin_h, 8,
-                               bins, &peak, &stats)
-        : probe_xy_gamut(sources[src].shown, region, bin_w, bin_h, 8,
-                         bins, &peak, &stats);
+    bool ok = probe_xy_gamut_transform(
+        sources[src].shown, &sources[src].input_transform, region,
+        bin_w, bin_h, 8, bins, &peak, &stats);
     if (ok) {
         for (int by = 0; by < bin_h; by++) {
             for (int bx = 0; bx < bin_w; bx++) {
@@ -662,8 +659,12 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
         draw_text_color(buf, W, H, info_x, top + 7 * line_step,
                         detail_scale,
                         "2020", 60, 190, 220);
-        if (zlog2)
-            snprintf(line, sizeof(line), "XFORM ZCAM AP0");
+        HdrplayInputTransfer transfer =
+            sources[src].input_transform.transfer;
+        if (transfer != HDRPLAY_INPUT_TRANSFER_TAGGED)
+            snprintf(line, sizeof(line), "%s",
+                     transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2
+                        ? "XFORM ZCAM AP0" : "XFORM AWG3 AP0");
         else
             snprintf(line, sizeof(line), "TAG %s",
                      av_color_primaries_name(sources[src].shown->color_primaries)
@@ -1237,7 +1238,11 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
      * (this frame has nothing exceeding the SDR ceiling, so the
      * HDR-vs-SDR comparison will look identical on it). */
     if (r->frame_stats_valid) {
-        snprintf(line, sizeof(line), "SRC PEAK %.0fN AVG %.0fN",
+        bool relative = r->frame_stats.reference == LUM_SCENE_RELATIVE ||
+                        r->frame_stats.reference == LUM_LOGC3_RELATIVE;
+        snprintf(line, sizeof(line), relative
+                 ? "SRC PEAK %.0fREL AVG %.0fREL"
+                 : "SRC PEAK %.0fN AVG %.0fN",
                  r->frame_stats.peak_nits, r->frame_stats.avg_nits);
         draw_text(buf, W, H, 6, y, hud_scale, line);
         y += FONT_H * hud_scale + 8;
@@ -1264,13 +1269,15 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
             y += FONT_H * hud_scale + 8;
         }
 
-        snprintf(line, sizeof(line), "ABOVE 500N %.1fPCT",
-                 r->frame_stats.pct_above_500);
-        if (r->frame_stats.pct_above_500 > 0.01f)
-            draw_text_color(buf, W, H, 6, y, hud_scale, line, 120, 255, 120);
-        else
-            draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
-        y += FONT_H * hud_scale + 8;
+        if (!relative) {
+            snprintf(line, sizeof(line), "ABOVE 500N %.1fPCT",
+                     r->frame_stats.pct_above_500);
+            if (r->frame_stats.pct_above_500 > 0.01f)
+                draw_text_color(buf, W, H, 6, y, hud_scale, line, 120, 255, 120);
+            else
+                draw_text_color(buf, W, H, 6, y, hud_scale, line, 140, 140, 140);
+            y += FONT_H * hud_scale + 8;
+        }
 
         /* SDR BOOST — symmetric counterpart to ABOVE 500N. Fires when
          * source peak < SDR target peak: libplacebo's inverse_tone_mapping
@@ -1280,7 +1287,7 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
          * honest perceptual win lives: mid-tone / low-DR scenes the SDR
          * pane has to inflate to look "normal", while HDR shows them at
          * their true nits. Only shown when an SDR pane is on screen. */
-        if (r->mode != HDRPLAY_MODE_HDR &&
+        if (!relative && r->mode != HDRPLAY_MODE_HDR &&
             r->sdr_peak_effective > 0.0f &&
             r->frame_stats.peak_nits > 0.0)
         {
@@ -1297,10 +1304,15 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         }
     }
 
-    /* Luminance probe — reports nominal nits of the source pixel under
-     * the cursor. Greenish so it stands out from the rest of the panel. */
+    /* Probe values are absolute nits for display-referred input and relative
+     * scene-light units for camera Log. */
     if (r->probe_active) {
-        snprintf(line, sizeof(line), "PROBE (%d,%d) %.1f NITS",
+        bool relative = r->frame_stats_valid &&
+            (r->frame_stats.reference == LUM_SCENE_RELATIVE ||
+             r->frame_stats.reference == LUM_LOGC3_RELATIVE);
+        snprintf(line, sizeof(line), relative
+                 ? "PROBE (%d,%d) %.1f REL"
+                 : "PROBE (%d,%d) %.1f NITS",
                  r->probe_x, r->probe_y, r->probe_nits);
         draw_text_color(buf, W, H, 6, y, hud_scale, line, 120, 255, 120);
         y += FONT_H * hud_scale + 8;
@@ -1348,6 +1360,8 @@ static int build_session_panel_single(Renderer *r, pl_gpu gpu,
     int  y = 6;
     const int pitch = FONT_H * hud_scale + 8;
     bool absolute = lum_reference_is_absolute(d.reference);
+    bool camera_log = d.reference == LUM_SCENE_RELATIVE ||
+                      d.reference == LUM_LOGC3_RELATIVE;
 
     if (d.coverage >= 0.0)
         snprintf(line, sizeof(line), "SESSION %lluF COVER %.0fPCT",
@@ -1385,11 +1399,15 @@ static int build_session_panel_single(Renderer *r, pl_gpu gpu,
         }
     } else {
         draw_text_color(buf, W, H, 6, y, hud_scale,
-                        "SDR SOURCE - NO ABSOLUTE NITS", 140, 140, 140);
+                        camera_log ? "CAMERA LOG - RELATIVE UNITS"
+                                   : "SDR SOURCE - NO ABSOLUTE NITS",
+                        140, 140, 140);
         y += pitch;
     }
 
-    snprintf(line, sizeof(line), "P50 %.0fN  P1 %.0fN  P99 %.0fN",
+    snprintf(line, sizeof(line), camera_log
+             ? "P50 %.0fREL  P1 %.0fREL  P99 %.0fREL"
+             : "P50 %.0fN  P1 %.0fN  P99 %.0fN",
              d.p50, d.p1, d.p99);
     draw_text(buf, W, H, 6, y, hud_scale, line); y += pitch;
 
@@ -1473,12 +1491,20 @@ static int build_session_panel_pair(Renderer *r, pl_gpu gpu, LayoutRect dst,
 
     bool absolute = lum_reference_is_absolute(a.reference) &&
                     lum_reference_is_absolute(b.reference);
+    bool camera_log = a.reference == LUM_SCENE_RELATIVE ||
+                      a.reference == LUM_LOGC3_RELATIVE ||
+                      b.reference == LUM_SCENE_RELATIVE ||
+                      b.reference == LUM_LOGC3_RELATIVE;
+    bool luma_comparable = absolute || a.reference == b.reference ||
+                           !camera_log;
+    const char *luma_unit = camera_log && a.reference == b.reference
+                          ? "REL" : "N";
 
     struct { const char *tag; double va, vb; const char *unit; double tol; bool show; } rows[] = {
         { "MaxCLL", a.maxcll_nits,  b.maxcll_nits,  "N", 0.02, absolute },
         { "MaxFALL",a.maxfall_nits, b.maxfall_nits, "N", 0.02, absolute },
-        { "P50",    a.p50,          b.p50,          "N", 0.02, true },
-        { "P99",    a.p99,          b.p99,          "N", 0.02, true },
+        { "P50",    a.p50,          b.p50, luma_unit, 0.02, luma_comparable },
+        { "P99",    a.p99,          b.p99, luma_unit, 0.02, luma_comparable },
         { "DR",     a.dr_stops,     b.dr_stops,     "",  0.02, true },
         { "SPREAD", a.spatial_stops,b.spatial_stops,"",  0.02, true },
     };
@@ -1504,9 +1530,17 @@ static int build_session_panel_pair(Renderer *r, pl_gpu gpu, LayoutRect dst,
         y += pitch;
     }
 
+    if (!luma_comparable) {
+        draw_text_color(buf, W, H, 6, y, hud_scale,
+                        "LUMA DOMAINS DIFFER - NO P50/P99 DELTA",
+                        255, 200, 80);
+        y += pitch;
+    }
     if (!absolute)
         draw_text_color(buf, W, H, 6, y, hud_scale,
-                        "SDR - NO ABSOLUTE NITS", 140, 140, 140);
+                        camera_log ? "CAMERA LOG - RELATIVE UNITS"
+                                   : "SDR - NO ABSOLUTE NITS",
+                        140, 140, 140);
 
     commit_slot(SLOT_SESSION, gpu, buf, (int)dst.x0, (int)dst.y0);
     free(buf);

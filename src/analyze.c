@@ -5,6 +5,7 @@
 #include "probe.h"
 #include "stats.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,7 +96,76 @@ static void check_dynamic_range(const SessionDerived *d)
                    "describes the code lattice rather than a displayable range");
 }
 
+static bool contains_ascii_ci(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !*needle) return false;
+    size_t n = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < n && p[i] &&
+               tolower((unsigned char)p[i]) ==
+                   tolower((unsigned char)needle[i]))
+            i++;
+        if (i == n) return true;
+    }
+    return false;
+}
+
+static void check_input_transform(const Decoder *dec,
+                                  const HdrplayInputTransform *transform)
+{
+    HdrplayInputTransfer selected = transform
+        ? transform->transfer : HDRPLAY_INPUT_TRANSFER_TAGGED;
+    const char *tag = dec ? dec->camera_lut : NULL;
+    bool tag_log = tag && contains_ascii_ci(tag, "log");
+    bool tag_zlog2 = tag && (contains_ascii_ci(tag, "z-log2") ||
+                             contains_ascii_ci(tag, "zlog2"));
+    char buf[192];
+
+    if (tag && *tag) {
+        if (tag_zlog2 && selected == HDRPLAY_INPUT_TRANSFER_ZLOG2) {
+            snprintf(buf, sizeof(buf), "%s decoded as Z-Log2 / Z CAM gamut",
+                     tag);
+            check(R_PASS, "input transform", buf);
+        } else if (tag_zlog2 && selected == HDRPLAY_INPUT_TRANSFER_TAGGED) {
+            snprintf(buf, sizeof(buf),
+                     "%s declared but no camera-Log transform selected", tag);
+            check(R_WARN, "input transform", buf);
+            check_note("use --input-transfer zlog2 (or 0:zlog2 / 1:zlog2 for comparisons)");
+        } else if (tag_zlog2) {
+            snprintf(buf, sizeof(buf), "%s conflicts with selected %s", tag,
+                     hdrplay_input_transfer_name(selected));
+            check(R_FAIL, "input transform", buf);
+        } else if (tag_log && selected == HDRPLAY_INPUT_TRANSFER_TAGGED) {
+            snprintf(buf, sizeof(buf), "%s declared but treated as tagged video",
+                     tag);
+            check(R_WARN, "input transform", buf);
+        } else {
+            snprintf(buf, sizeof(buf), "camera tag %s; selected %s", tag,
+                     hdrplay_input_transfer_name(selected));
+            check(R_INFO, "input transform", buf);
+        }
+    } else if (selected != HDRPLAY_INPUT_TRANSFER_TAGGED) {
+        snprintf(buf, sizeof(buf), "%s selected explicitly; no camera tag present",
+                 hdrplay_input_transfer_name(selected));
+        check(R_INFO, "input transform", buf);
+    }
+
+    if (dec && tag_log && dec->transfer == AVCOL_TRC_BT709) {
+        if (tag_zlog2 && selected == HDRPLAY_INPUT_TRANSFER_ZLOG2)
+            check(R_PASS, "transfer metadata conflict",
+                  "Z-Log2 override resolves the conflicting BT.709 transfer tag");
+        else if (selected == HDRPLAY_INPUT_TRANSFER_TAGGED)
+            check(R_WARN, "transfer metadata conflict",
+                  "camera Log tag conflicts with BT.709 transfer and remains unresolved");
+        else
+            check(R_WARN, "transfer metadata conflict",
+                  "selected transform does not match the camera Log tag");
+    }
+}
+
 void analyze_print_session(const SessionStats *s, const Decoder *dec,
+                           const HdrplayInputTransform *transform,
                            const char *title)
 {
     int declared_cll_max = (dec && dec->has_cll) ? dec->cll_max : -1;
@@ -116,6 +186,8 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
     }
 
     char buf[192];
+
+    check_input_transform(dec, transform);
 
     /* Coverage first: it gates how much the rest is worth. */
     if (d.coverage >= 0.0) {
@@ -150,18 +222,24 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
         check_note("override with --range limited|full if this is wrong");
     }
     int code_scale = 1 << (d.bit_depth > 8 ? d.bit_depth - 8 : 0);
+    int code_max = (1 << d.bit_depth) - 1;
+    int nominal_lo = d.full_range ? 0 : 16 * code_scale;
+    int nominal_hi = d.full_range ? code_max : 235 * code_scale;
     snprintf(buf, sizeof(buf),
              "below %.4f%%, above %.4f%% (nominal codes %d..%d)",
              d.range_below_pct, d.range_above_pct,
-             16 * code_scale, 235 * code_scale);
+             nominal_lo, nominal_hi);
     check(R_INFO, "legal-range excursions", buf);
 
     double guarded = d.range_below_guard_pct + d.range_above_guard_pct;
+    int guard_lo = d.full_range ? 0
+                                : (16 - PROBE_RANGE_GUARD_CODES) * code_scale;
+    int guard_hi = d.full_range ? code_max
+                                : (235 + PROBE_RANGE_GUARD_CODES) * code_scale;
     snprintf(buf, sizeof(buf),
              "below %.4f%%, above %.4f%% (outside %d..%d)",
              d.range_below_guard_pct, d.range_above_guard_pct,
-             (16 - PROBE_RANGE_GUARD_CODES) * code_scale,
-             (235 + PROBE_RANGE_GUARD_CODES) * code_scale);
+             guard_lo, guard_hi);
     check(guarded > PROBE_RANGE_FULL_FRAC * 100.0 ? R_WARN : R_INFO,
           "beyond ringing guard", buf);
     if (isfinite(d.worst_range_sec)) {
@@ -184,7 +262,7 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
                      "bare 100·V^2.4, no black floor (--sdr-black 0)");
         check_note(buf);
     }
-    if (d.reference == LUM_SCENE_RELATIVE)
+    if (d.reference == LUM_SCENE_RELATIVE || d.reference == LUM_LOGC3_RELATIVE)
         check_note("relative scene-light units; absolute-nit checks suppressed");
     if (d.reference == LUM_HLG_OOTF) {
         /* Name the source, not just the number. HLG carries no absolute
@@ -231,14 +309,14 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
             check_note("luma-only scan: MaxCLL is defined over max(R,G,B)");
     } else {
         check(R_INFO, "absolute checks",
-              d.reference == LUM_SCENE_RELATIVE
+              (d.reference == LUM_SCENE_RELATIVE || d.reference == LUM_LOGC3_RELATIVE)
                 ? "suppressed — camera Log is scene-relative"
                 : "suppressed — SDR source has no absolute luminance");
     }
 
     check_dynamic_range(&d);
 
-    if (d.reference == LUM_SCENE_RELATIVE)
+    if (d.reference == LUM_SCENE_RELATIVE || d.reference == LUM_LOGC3_RELATIVE)
         snprintf(buf, sizeof(buf),
                  "p1 %.3f  p50 %.1f  p99 %.0f  p99.9 %.0f relative",
                  d.p1, d.p50, d.p99, d.p99_9);
@@ -265,16 +343,22 @@ void analyze_print_session(const SessionStats *s, const Decoder *dec,
 /* Streams straight out of the decode loop with no buffering. Per-frame
  * records are scalars only: 512 histogram bins times 170k frames is not
  * a file anyone wants. Session histograms go in the trailer, once. */
-static void stats_write_header(FILE *fp, const Decoder *d, int stride)
+static void stats_write_header(FILE *fp, const Decoder *d,
+                               const HdrplayInputTransform *transform,
+                               int stride)
 {
     fprintf(fp,
         "{\"type\":\"header\",\"schema\":1,\"width\":%d,\"height\":%d,"
         "\"bit_depth\":%d,\"stride\":%d,\"transfer\":%d,\"primaries\":%d,"
+        "\"input_transfer\":\"%s\",\"input_exposure_stops\":%.4f,"
         "\"declared_maxcll\":%d,\"declared_maxfall\":%d,"
         "\"has_amve\":%s,\"amve_lux\":%.4f,"
         "\"amve_x\":%.6f,\"amve_y\":%.6f}\n",
         d->width, d->height, d->bit_depth, stride,
         (int)d->transfer, (int)d->primaries,
+        hdrplay_input_transfer_name(transform
+            ? transform->transfer : HDRPLAY_INPUT_TRANSFER_TAGGED),
+        transform ? transform->exposure_stops : 0.0,
         d->has_cll ? d->cll_max : -1,
         d->has_cll ? d->cll_avg : -1,
         d->has_ambient_viewing ? "true" : "false",
@@ -307,26 +391,48 @@ static void stats_write_frame(FILE *fp, int64_t idx, double pts_sec,
  * decoding, so they miss files that carry CLL only as per-frame side
  * data. Repeat the final values here, where they are settled. */
 static void stats_write_trailer(FILE *fp, const SessionStats *s,
+                                const HdrplayInputTransform *transform,
                                 int declared_max, int declared_avg)
 {
     SessionDerived d;
     session_stats_derive(s, &d);
+    bool camera_log = d.reference == LUM_SCENE_RELATIVE ||
+                      d.reference == LUM_LOGC3_RELATIVE;
+    char measured_maxcll[48], measured_maxfall[48], dr_ceiling[48];
+    if (!camera_log) {
+        snprintf(measured_maxcll, sizeof(measured_maxcll), "%.4f",
+                 d.maxcll_nits);
+        snprintf(measured_maxfall, sizeof(measured_maxfall), "%.4f",
+                 d.maxfall_nits);
+    } else {
+        snprintf(measured_maxcll, sizeof(measured_maxcll), "null");
+        snprintf(measured_maxfall, sizeof(measured_maxfall), "null");
+    }
+    if (isfinite(d.dr_ceiling_stops))
+        snprintf(dr_ceiling, sizeof(dr_ceiling), "%.4f", d.dr_ceiling_stops);
+    else
+        snprintf(dr_ceiling, sizeof(dr_ceiling), "null");
     fprintf(fp, "{\"type\":\"declared\",\"maxcll\":%d,\"maxfall\":%d}\n",
             declared_max, declared_avg);
     fprintf(fp,
         "{\"type\":\"summary\",\"frames\":%llu,\"coverage\":%.6f,"
         "\"reference\":\"%s\",\"hlg_lw\":%.1f,"
-        "\"maxcll\":%.4f,\"maxfall\":%.4f,\"maxcll_exact\":%s,"
+        "\"input_transfer\":\"%s\",\"input_exposure_stops\":%.4f,"
+        "\"maxcll\":%s,\"maxfall\":%s,\"maxcll_exact\":%s,"
         "\"p1\":%.6f,\"p50\":%.4f,\"p99\":%.4f,\"p99_9\":%.4f,"
-        "\"dr_stops\":%.4f,\"dr_ceiling_stops\":%.4f,"
+        "\"dr_stops\":%.4f,\"dr_ceiling_stops\":%s,"
         "\"sdr_black_nits\":%.4f,\"bit_depth\":%d,\"full_range\":%s,"
         "\"spatial_stops\":%.4f,\"temporal_stops\":%.4f,"
         "\"total_stops\":%.4f,\"black_pct\":%.4f,\"underflow_pct\":%.4f}\n",
         (unsigned long long)d.frames, d.coverage,
         lum_reference_name(d.reference), d.hlg_lw,
-        d.maxcll_nits, d.maxfall_nits, d.maxcll_valid ? "true" : "false",
+        hdrplay_input_transfer_name(transform
+            ? transform->transfer : HDRPLAY_INPUT_TRANSFER_TAGGED),
+        transform ? transform->exposure_stops : 0.0,
+        measured_maxcll, measured_maxfall,
+        (camera_log || !d.maxcll_valid) ? "false" : "true",
         d.p1, d.p50, d.p99, d.p99_9,
-        d.dr_stops, d.dr_ceiling_stops,
+        d.dr_stops, dr_ceiling,
         probe_sdr_black_nits(), d.bit_depth, d.full_range ? "true" : "false",
         d.spatial_stops, d.temporal_stops, d.total_stops,
         d.black_pct, d.underflow_pct);
@@ -348,45 +454,69 @@ static void stats_write_trailer(FILE *fp, const SessionStats *s,
 }
 
 /* --json goes to stdout so `| jq` works; the human report is on stderr. */
-static void emit_json(const SessionStats *s, const Decoder *d, const char *path)
+static void emit_json(const SessionStats *s, const Decoder *d,
+                      const HdrplayInputTransform *transform,
+                      const char *path)
 {
     SessionDerived v;
     session_stats_derive(s, &v);
+    bool camera_log = v.reference == LUM_SCENE_RELATIVE ||
+                      v.reference == LUM_LOGC3_RELATIVE;
+    char measured_maxcll[48], measured_maxfall[48], dr_ceiling[48];
+    if (!camera_log) {
+        snprintf(measured_maxcll, sizeof(measured_maxcll), "%.4f",
+                 v.maxcll_nits);
+        snprintf(measured_maxfall, sizeof(measured_maxfall), "%.4f",
+                 v.maxfall_nits);
+    } else {
+        snprintf(measured_maxcll, sizeof(measured_maxcll), "null");
+        snprintf(measured_maxfall, sizeof(measured_maxfall), "null");
+    }
+    if (isfinite(v.dr_ceiling_stops))
+        snprintf(dr_ceiling, sizeof(dr_ceiling), "%.4f", v.dr_ceiling_stops);
+    else
+        snprintf(dr_ceiling, sizeof(dr_ceiling), "null");
     printf("{\"file\":\"%s\",\"frames\":%llu,\"coverage\":%.6f,"
            "\"reference\":\"%s\",\"hlg_lw\":%.1f,"
+           "\"input_transfer\":\"%s\",\"input_exposure_stops\":%.4f,"
            "\"declared_maxcll\":%d,\"declared_maxfall\":%d,"
            "\"has_amve\":%s,\"amve_lux\":%.4f,"
            "\"amve_x\":%.6f,\"amve_y\":%.6f,"
-           "\"measured_maxcll\":%.4f,\"measured_maxfall\":%.4f,"
+           "\"measured_maxcll\":%s,\"measured_maxfall\":%s,"
            "\"maxcll_exact\":%s,"
            "\"bit_depth\":%d,\"full_range\":%s,\"range_guessed\":%s,"
            "\"range_outside_frac\":%.6f,\"sdr_black_nits\":%.4f,"
            "\"p1\":%.6f,\"p50\":%.4f,\"p99\":%.4f,\"p99_9\":%.4f,"
-           "\"dr_stops\":%.4f,\"dr_ceiling_stops\":%.4f,"
+           "\"dr_stops\":%.4f,\"dr_ceiling_stops\":%s,"
            "\"spatial_stops\":%.4f,"
            "\"temporal_stops\":%.4f,\"total_stops\":%.4f,"
            "\"black_pct\":%.4f,\"underflow_pct\":%.4f,"
            "\"fails\":%d,\"warns\":%d}\n",
            path, (unsigned long long)v.frames, v.coverage,
            lum_reference_name(v.reference), v.hlg_lw,
+           hdrplay_input_transfer_name(transform
+               ? transform->transfer : HDRPLAY_INPUT_TRANSFER_TAGGED),
+           transform ? transform->exposure_stops : 0.0,
            d->has_cll ? d->cll_max : -1, d->has_cll ? d->cll_avg : -1,
            d->has_ambient_viewing ? "true" : "false",
            d->ambient_illuminance_lux,
            d->ambient_light_x, d->ambient_light_y,
-           v.maxcll_nits, v.maxfall_nits, v.maxcll_valid ? "true" : "false",
+           measured_maxcll, measured_maxfall,
+           (camera_log || !v.maxcll_valid) ? "false" : "true",
            v.bit_depth, v.full_range ? "true" : "false",
            d->range_guessed ? "true" : "false", d->range_outside_frac,
            probe_sdr_black_nits(),
            v.p1, v.p50, v.p99, v.p99_9,
-           v.dr_stops, v.dr_ceiling_stops,
+           v.dr_stops, dr_ceiling,
            v.spatial_stops, v.temporal_stops, v.total_stops,
            v.black_pct, v.underflow_pct,
            check_fail_count(), check_warn_count());
 }
 
 /* ------------------------------------------------------------------ */
-int analyze_run(const char *path, int stride, double hlg_lw,
-                bool json, const char *stats_path)
+int analyze_run(const char *path, const HdrplayInputTransform *transform,
+                int stride, double hlg_lw, bool json,
+                const char *stats_path)
 {
     /* <= 0 leaves the per-file resolution in place (mastering display,
      * else the BT.2100 1000-nit reference). */
@@ -422,7 +552,7 @@ int analyze_run(const char *path, int stride, double hlg_lw,
             decoder_close(&dec);
             return HDRPLAY_EXIT_TOOL_ERROR;
         }
-        stats_write_header(sf, &dec, stride);
+        stats_write_header(sf, &dec, transform, stride);
     }
 
     int64_t idx = 0;
@@ -435,7 +565,8 @@ int analyze_run(const char *path, int stride, double hlg_lw,
          * comparison at all. */
         decoder_absorb_frame_side_data(&dec);
 
-        if (probe_frame_stats(dec.frame, stride, PROBE_FULL_RGB, &fs)) {
+        if (probe_frame_stats(dec.frame, transform, stride,
+                              PROBE_FULL_RGB, &fs)) {
             session_stats_add(&s, dec.frame->best_effort_timestamp,
                               dec.frame->duration, &fs);
             if (sf) {
@@ -444,7 +575,8 @@ int analyze_run(const char *path, int stride, double hlg_lw,
                     : (double)dec.frame->best_effort_timestamp * av_q2d(tb);
                 stats_write_frame(sf, idx, t, &fs);
             }
-        } else if (probe_frame_stats(dec.frame, stride, PROBE_LUMA_ONLY, &fs)) {
+        } else if (probe_frame_stats(dec.frame, transform, stride,
+                                     PROBE_LUMA_ONLY, &fs)) {
             /* Chroma unreadable (NV12 and friends) but luma is fine.
              * Degrade to luma-only rather than measuring nothing —
              * has_maxrgb stays false so the report says MaxCLL is not
@@ -465,7 +597,7 @@ int analyze_run(const char *path, int stride, double hlg_lw,
     if (rc < 0) decode_error = true;
 
     if (sf) {
-        stats_write_trailer(sf, &s,
+        stats_write_trailer(sf, &s, transform,
                             dec.has_cll ? dec.cll_max : -1,
                             dec.has_cll ? dec.cll_avg : -1);
         fclose(sf);
@@ -479,9 +611,9 @@ int analyze_run(const char *path, int stride, double hlg_lw,
 
     char title[512];
     snprintf(title, sizeof(title), "content checks  %s", path);
-    analyze_print_session(&s, &dec, title);
+    analyze_print_session(&s, &dec, transform, title);
 
-    if (json) emit_json(&s, &dec, path);
+    if (json) emit_json(&s, &dec, transform, path);
 
     int fails = check_fail_count();
     bool measured_nothing = (s.frames == 0);

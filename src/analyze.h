@@ -2,6 +2,7 @@
 #define HDRPLAY_ANALYZE_H
 
 #include <stdbool.h>
+#include "input_transform.h"
 
 struct SessionStats;
 struct Decoder;
@@ -21,8 +22,9 @@ struct Decoder;
  *
  * Returns the fail count, or a value >= HDRPLAY_EXIT_TOOL_ERROR when
  * the file could not be measured at all. */
-int analyze_run(const char *path, int stride, double hlg_lw,
-                bool json, const char *stats_path);
+int analyze_run(const char *path, const HdrplayInputTransform *transform,
+                int stride, double hlg_lw, bool json,
+                const char *stats_path);
 
 /* Print an accumulated session as a check report. Shared with playback
  * so the on-exit summary and the offline verdict read identically.
@@ -33,6 +35,7 @@ int analyze_run(const char *path, int stride, double hlg_lw,
  * both change how the numbers below should be read. */
 void analyze_print_session(const struct SessionStats *s,
                            const struct Decoder *dec,
+                           const HdrplayInputTransform *transform,
                            const char *title);
 
 #endif

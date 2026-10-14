@@ -122,7 +122,7 @@ static void test_hlg_ootf(void)
     AVFrame *f = mkframe(AV_PIX_FMT_YUV420P10LE, 32, 32,
                          AVCOL_TRC_ARIB_STD_B67, 940);
     FrameStats fs;
-    CHECK(probe_frame_stats(f, 1, PROBE_LUMA_ONLY, &fs), "HLG frame measured");
+    CHECK(probe_frame_stats(f, NULL, 1, PROBE_LUMA_ONLY, &fs), "HLG frame measured");
     CHECK(NEAR(fs.peak_nits, 1000.0, 1.0),
           "HLG full-scale white -> %.1fN (was 1.0 before the OOTF fix)",
           fs.peak_nits);
@@ -164,7 +164,7 @@ static void test_format_guard(void)
     CHECK(read_component(p, pd, 1, 4, 6) == 100 &&
           read_component(p, pd, 2, 4, 6) == 900,
           "P010 interleaved chroma offsets and shifts decoded");
-    CHECK(probe_frame_stats(p, 1, PROBE_FULL_RGB, &fs), "P010 full-RGB works");
+    CHECK(probe_frame_stats(p, NULL, 1, PROBE_FULL_RGB, &fs), "P010 full-RGB works");
     CHECK(NEAR(fs.peak_nits, 10000.0, 1.0),
           "P010 code 940 -> %.1fN (expect 10000N)", fs.peak_nits);
     av_frame_free(&p);
@@ -177,8 +177,8 @@ static void test_format_guard(void)
     CHECK(read_component(n, nd, 1, 4, 6) == 20 &&
           read_component(n, nd, 2, 4, 6) == 220,
           "NV12 interleaved chroma offsets decoded");
-    CHECK(probe_frame_stats(n, 1, PROBE_LUMA_ONLY, &fs), "NV12 luma-only works");
-    CHECK(probe_frame_stats(n, 1, PROBE_FULL_RGB, &fs), "NV12 full-RGB works");
+    CHECK(probe_frame_stats(n, NULL, 1, PROBE_LUMA_ONLY, &fs), "NV12 luma-only works");
+    CHECK(probe_frame_stats(n, NULL, 1, PROBE_FULL_RGB, &fs), "NV12 full-RGB works");
     av_frame_free(&n);
 }
 
@@ -301,7 +301,7 @@ static void test_black_and_underflow(void)
     AVFrame *f = mkframe(AV_PIX_FMT_YUV420P10LE, 32, 32,
                          AVCOL_TRC_SMPTE2084, 64);
     FrameStats fs;
-    CHECK(probe_frame_stats(f, 1, PROBE_LUMA_ONLY, &fs), "all-black measured");
+    CHECK(probe_frame_stats(f, NULL, 1, PROBE_LUMA_ONLY, &fs), "all-black measured");
     CHECK(fs.luma.valid == 0, "no valid samples (%llu)",
           (unsigned long long)fs.luma.valid);
     CHECK(fs.luma.black == (uint64_t)fs.samples, "all samples counted black");
@@ -317,7 +317,7 @@ static void test_black_and_underflow(void)
      * this far down precisely so shadow detail stays resolvable. */
     AVFrame *g = mkframe(AV_PIX_FMT_YUV420P10LE, 32, 32,
                          AVCOL_TRC_SMPTE2084, 65);
-    CHECK(probe_frame_stats(g, 1, PROBE_LUMA_ONLY, &fs), "PQ near-black measured");
+    CHECK(probe_frame_stats(g, NULL, 1, PROBE_LUMA_ONLY, &fs), "PQ near-black measured");
     CHECK(fs.luma.black == 0, "PQ near-black not counted as black");
     CHECK(fs.luma.underflow == 0, "PQ near-black resolved, not underflow");
     CHECK(fs.luma.valid == (uint64_t)fs.samples, "PQ near-black is in a real bin");
@@ -329,7 +329,7 @@ static void test_black_and_underflow(void)
      * instead of collapsing toward zero. */
     AVFrame *sdr = mkframe(AV_PIX_FMT_YUV420P10LE, 32, 32,
                            AVCOL_TRC_BT709, 65);
-    CHECK(probe_frame_stats(sdr, 1, PROBE_LUMA_ONLY, &fs), "SDR near-black measured");
+    CHECK(probe_frame_stats(sdr, NULL, 1, PROBE_LUMA_ONLY, &fs), "SDR near-black measured");
     CHECK(fs.luma.black == 0, "SDR near-black not counted as black");
     CHECK(fs.luma.underflow == 0, "BT.1886 floor keeps SDR near-black resolvable");
     CHECK(fs.luma.valid == (uint64_t)fs.samples,
@@ -343,7 +343,7 @@ static void test_black_and_underflow(void)
      * 1.5e-5 nits and drag p1 down to a near-constant, making the
      * dynamic range figure meaningless on every SDR clip. */
     probe_set_sdr_black_nits(0.0);
-    CHECK(probe_frame_stats(sdr, 1, PROBE_LUMA_ONLY, &fs),
+    CHECK(probe_frame_stats(sdr, NULL, 1, PROBE_LUMA_ONLY, &fs),
           "SDR near-black measured with no floor");
     CHECK(fs.luma.underflow == (uint64_t)fs.samples,
           "floorless SDR near-black counted as underflow (%llu), kept out "
@@ -436,7 +436,7 @@ static void test_dr_within_ceiling(void)
             f->data[0][y * f->linesize[0] + x] = (uint8_t)(16 + (x * 219) / 255);
 
     FrameStats fs;
-    CHECK(probe_frame_stats(f, 1, PROBE_LUMA_ONLY, &fs), "ramp measured");
+    CHECK(probe_frame_stats(f, NULL, 1, PROBE_LUMA_ONLY, &fs), "ramp measured");
 
     SessionStats s;
     session_stats_init(&s, 1.0 / 1000.0, 1.0);
@@ -485,6 +485,13 @@ static void test_range_guess(void)
             full->data[0][y * full->linesize[0] + x] = (uint8_t)x;
     CHECK(probe_guess_color_range(full, &frac) == AVCOL_RANGE_JPEG,
           "ramp spanning 0..255 reads as full (%.2f%% outside)", frac * 100.0);
+    full->color_range = AVCOL_RANGE_JPEG;
+    FrameStats full_stats;
+    CHECK(probe_frame_stats(full, NULL, 1, PROBE_LUMA_ONLY, &full_stats) &&
+          full_stats.range_below == 0 && full_stats.range_above == 0 &&
+          full_stats.range_below_guard == 0 &&
+          full_stats.range_above_guard == 0,
+          "full-range audit uses 0..255 rather than limited-range limits");
     av_frame_free(&full);
 
     /* Mid-grey only: genuinely undecidable from the pixels, and the
@@ -508,7 +515,7 @@ static void test_session_dedupe(void)
     AVFrame *f = mkframe(AV_PIX_FMT_YUV420P10LE, 32, 32,
                          AVCOL_TRC_SMPTE2084, 800);
     FrameStats fs;
-    probe_frame_stats(f, 1, PROBE_LUMA_ONLY, &fs);
+    probe_frame_stats(f, NULL, 1, PROBE_LUMA_ONLY, &fs);
 
     SessionStats s;
     session_stats_init(&s, 1.0 / 1000.0, 10.0);
@@ -559,7 +566,7 @@ static void test_variance_decomposition(void)
                 ((uint16_t *)f->data[0])[y * (f->linesize[0] / 2) + x] =
                     (y < 32) ? lo : hi;
         FrameStats fs;
-        probe_frame_stats(f, 1, PROBE_LUMA_ONLY, &fs);
+        probe_frame_stats(f, NULL, 1, PROBE_LUMA_ONLY, &fs);
         session_stats_add(&s, 1000 * (k + 1), 0, &fs);
         av_frame_free(&f);
     }
@@ -588,14 +595,14 @@ static void test_maxrgb(void)
             ((uint16_t *)f->data[1])[y * (f->linesize[1] / 2) + x] = 940;
 
     FrameStats fs;
-    CHECK(probe_frame_stats(f, 1, PROBE_FULL_RGB, &fs), "full-RGB measured");
+    CHECK(probe_frame_stats(f, NULL, 1, PROBE_FULL_RGB, &fs), "full-RGB measured");
     CHECK(fs.has_maxrgb, "maxRGB available");
     CHECK(fs.maxrgb_peak > fs.peak_nits,
           "maxRGB peak %.1fN exceeds luma peak %.1fN on saturated blue",
           fs.maxrgb_peak, fs.peak_nits);
 
     FrameStats lf;
-    probe_frame_stats(f, 1, PROBE_LUMA_ONLY, &lf);
+    probe_frame_stats(f, NULL, 1, PROBE_LUMA_ONLY, &lf);
     CHECK(!lf.has_maxrgb, "luma-only reports no maxRGB rather than guessing");
     av_frame_free(&f);
 }
@@ -701,6 +708,73 @@ static void test_xy_gamut(void)
     av_frame_free(&f);
 }
 
+static void test_input_transforms(void)
+{
+    puts("camera-Log input transforms");
+    HdrplayInputTransform z = {
+        HDRPLAY_INPUT_TRANSFER_ZLOG2, 0.0,
+    };
+
+    /* Golden samples from the fitted Z CAM 4096-entry reference curve.
+     * Hard-coded outputs prevent CPU/GLSL constant refactors from silently
+     * changing the transform while still agreeing with each other. */
+    CHECK(NEAR(hdrplay_zlog2_decode(0.18), 0.000455550338708, 1e-14),
+          "Z-Log2 code 0.18 -> %.15f", hdrplay_zlog2_decode(0.18));
+    CHECK(NEAR(hdrplay_zlog2_decode(0.50), 0.032079492763972, 1e-14),
+          "Z-Log2 code 0.50 -> %.15f", hdrplay_zlog2_decode(0.50));
+    CHECK(hdrplay_zlog2_decode(-0.1) == 0.0 &&
+          NEAR(hdrplay_zlog2_decode(1.1),
+               hdrplay_zlog2_decode(1.0), 1e-15),
+          "Z-Log2 input is clamped to official LUT domain");
+    CHECK(NEAR(hdrplay_input_peak_nits(&z), 2740.5, 1e-9),
+          "Z-Log2 declared peak %.1fN uses libplacebo 203N normalization",
+          hdrplay_input_peak_nits(&z));
+
+    double signal[3] = { 0.2, 0.4, 0.6 }, ap0[3];
+    hdrplay_input_to_ap0(&z, signal, ap0);
+    CHECK(NEAR(ap0[0], 0.139365999807090, 1e-12) &&
+          NEAR(ap0[1], 0.126450891429769, 1e-12) &&
+          NEAR(ap0[2], 0.968492580177658, 1e-12),
+          "Z CAM -> AP0 matrix orientation matches golden RGB triplet");
+
+    AVFrame *f = mkframe(AV_PIX_FMT_YUV422P10LE, 16, 16,
+                         AVCOL_TRC_BT709, 502);
+    FrameStats fs;
+    CHECK(probe_frame_stats(f, &z, 1, PROBE_LUMA_ONLY, &fs),
+          "Z-Log2 tagged-as-709 frame measured through override");
+    CHECK(fs.reference == LUM_SCENE_RELATIVE,
+          "Z-Log2 analysis is labelled scene-relative");
+    CHECK(NEAR(fs.peak_nits, 43.3073152314, 0.01),
+          "Z-Log2 luma uses shared decoded curve (%.4f relative)",
+          fs.peak_nits);
+    CHECK(!fs.has_maxrgb,
+          "camera-Log analysis does not advertise relative MaxRGB as MaxCLL");
+    ProbeResult pr;
+    CHECK(probe_sample(f, &z, 0, 0, &pr) &&
+          NEAR(pr.luma_nits, fs.peak_nits, 0.01),
+          "Z-Log2 mouse probe and frame statistics share relative luma units");
+    av_frame_free(&f);
+
+    HdrplayInputTransform logc3 = {
+        HDRPLAY_INPUT_TRANSFER_LOGC3, 0.0,
+    };
+    CHECK(NEAR(hdrplay_logc3_decode(0.10),
+               0.001339691168676, 1e-14),
+          "LogC3 code 0.10 matches Academy curve");
+    CHECK(hdrplay_input_decode_channel(&logc3, 0.0) == 0.0 &&
+          NEAR(hdrplay_input_decode_channel(&logc3, 1.1),
+               hdrplay_input_decode_channel(&logc3, 1.0), 1e-14),
+          "LogC3 clamps negative light and encoded overshoot consistently");
+    CHECK(NEAR(hdrplay_input_peak_nits(&logc3), 10000.0, 1e-9),
+          "LogC3 normalization preserves code 1 inside libplacebo's peak");
+    double logc_signal[3] = { 0.2, 0.4, 0.6 }, logc_ap0[3];
+    hdrplay_input_to_ap0(&logc3, logc_signal, logc_ap0);
+    CHECK(NEAR(logc_ap0[0], 0.153815317978491, 1e-12) &&
+          NEAR(logc_ap0[1], 0.059338365551380, 1e-12) &&
+          NEAR(logc_ap0[2], 1.238756627839985, 1e-12),
+          "AWG3 -> AP0 matrix orientation and normalization match golden triplet");
+}
+
 static void test_vectorscope(void)
 {
     puts("Cb/Cr vectorscope");
@@ -766,6 +840,7 @@ int main(void)
     test_rgb_waveform();
     test_rgb_histogram();
     test_xy_gamut();
+    test_input_transforms();
     test_vectorscope();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

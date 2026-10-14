@@ -53,6 +53,7 @@ typedef struct Source {
     double   start_sec;        /* stream timeline origin               */
     double   timeline_origin;  /* shared container origin, all streams */
     double   duration_sec;     /* <= 0 when unknown                    */
+    HdrplayInputTransform input_transform; /* source-specific color override */
 
     struct AVFrame *shown;     /* frame currently on screen (owned)    */
     struct AVFrame *previous;  /* predecessor for temporal diff (owned)*/
@@ -75,7 +76,8 @@ typedef struct Source {
     bool         frame_stats_valid;
 } Source;
 
-bool source_open(Source *s, const char *path, int ring_cap);
+bool source_open(Source *s, const char *path, int ring_cap,
+                 const HdrplayInputTransform *transform);
 void source_close(Source *s);
 
 /* Present-time of the frame currently shown, or NAN. */

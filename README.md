@@ -167,6 +167,7 @@ hdrplay --vectorscope video.mp4       # start with the Cb/Cr vectorscope
 hdrplay --histogram video.mp4         # start with the RGB histogram
 hdrplay --input-lut Z-Log2-to-Rec709.cube clip.mov  # camera Log playback
 hdrplay --input-transfer zlog2 clip.mov             # built-in Z-Log2 decode
+hdrplay --input-transfer logc3 alexa.mov            # ARRI LogC3 EI800/AWG3
 hdrplay first.mov second.mov          # synchronized comparison
 hdrplay image.png                     # inspect a still image
 ```
@@ -274,13 +275,21 @@ peak and frame indexes are also bounded. These caches are deleted when closed.
 The build now links `libswresample` alongside the existing FFmpeg libraries;
 on Ubuntu add `libswresample-dev` to the dependency installation command.
 
+For two-file comparisons, prefix either transform with an input index, for
+example `--input-transfer 0:zlog2 --input-transfer 1:logc3`. A bare transform
+applies to both inputs. `--zlog2-exposure` accepts the same `0:` / `1:` prefix.
+The override is carried by each source independently, including probes, scopes,
+statistics, and headless analysis.
+
 `--input-lut FILE.cube` applies a camera/vendor 3D LUT to the
 gamma-encoded RGB signal on the GPU before normal display color management.
 This is useful when a camera records Z-Log2 (or another Log curve) while the
 container incorrectly declares BT.709. Z CAM's `com.zcam.camera.lut` tag is
 logged as a diagnostic, but it only names the selected curve—it does not embed
 the LUT samples—so pass the corresponding technical Log-to-Rec.709 `.cube`
-file explicitly. The media file is never modified.
+file explicitly. The media file is never modified. GPU `.cube` LUTs are not
+executed by `--analyze`; combining those options is rejected rather than
+silently producing statistics in the wrong color domain.
 
 For Z CAM footage, `--input-transfer zlog2` instead uses the built-in
 Z-Log2-to-scene-linear curve and Z CAM-gamut-to-ACES-AP0 matrix. libplacebo
@@ -290,6 +299,15 @@ The curve is fitted to Z CAM's official 4096-entry reference LUT; Z CAM has
 not published a normative equation. Its scene-linear exposure normalization
 is likewise undocumented, so hdrplay uses the independently derived 13.5x
 normalization and exposes `--zlog2-exposure STOPS` for calibration.
+
+`--input-transfer logc3` implements the Academy/OCIO ARRI LogC3 EI800 input
+transform: the normative LogC3 curve and ARRI Wide Gamut 3 to ACES2065-1
+matrix. To preserve the entire encoded 0–1 interval inside libplacebo's
+10,000-nit linear-light ceiling, hdrplay applies a documented −0.161-stop
+scene-relative normalization and clamps encoded overshoot to the transform's
+0–1 domain. It is an explicit shader transform because libplacebo has no native
+LogC3 transfer or AWG3 primaries enums; merely relabelling the input as ARRI
+would not perform a conversion.
 
 Still images supported by the installed FFmpeg build—such as PNG, JPEG,
 TIFF and WebP—are decoded as one-frame streams and remain displayed until the

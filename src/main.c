@@ -251,11 +251,18 @@ static void usage(void)
         "                        (0-based; see --list-displays)\n"
         "  --start-sdr           start in SDR-fallback rendering mode\n"
         "  --input-lut FILE      apply a .cube LUT to input RGB before color\n"
-        "                        management (e.g. Z-Log2 -> Rec.709)\n"
-        "  --input-transfer TRC  override the tagged input transfer; supported:\n"
-        "                        tagged (default), zlog2\n"
-        "  --zlog2-exposure N    exposure offset in stops after Z-Log2 decode\n"
-        "                        (default 0 around the 13.5x normalization)\n"
+        "                        management (playback only; --analyze rejects it)\n"
+        "  --input-transfer [N:]TRC\n"
+        "                        override tagged transfer: tagged, zlog2, logc3.\n"
+        "                        Bare applies to both inputs; 0: or 1: selects\n"
+        "                        one comparison input. Repeatable.\n"
+        "  --zlog2-exposure [N:]STOPS\n"
+        "                        exposure offset after Z-Log2 decode. Bare\n"
+        "                        applies to both inputs; default 0 around the\n"
+        "                        13.5x scene-linear normalization. Values above\n"
+        "                        -16 to +1.867 stops are accepted, keeping the\n"
+        "                        declared peak finite and within libplacebo's\n"
+        "                        10000-nit metadata domain.\n"
         "  --plane MODE          color/y/cb/cr/legal/clip/plateau. LEGAL marks\n"
         "                        nominal video-range limits; CLIP marks only\n"
         "                        literal storage endpoints; PLATEAU marks\n"
@@ -478,6 +485,77 @@ static bool parse_rotate(const char *arg, int out[2])
     return true;
 }
 
+static bool parse_input_transfer(const char *arg,
+                                 HdrplayInputTransform out[2],
+                                 bool indexed[2])
+{
+    int which = -1;
+    const char *name = arg;
+    const char *colon = strchr(arg, ':');
+    if (colon) {
+        if (colon != arg + 1 || (arg[0] != '0' && arg[0] != '1')) {
+            fprintf(stderr, "--input-transfer: input index must be 0 or 1\n");
+            return false;
+        }
+        which = arg[0] - '0';
+        indexed[which] = true;
+        name = colon + 1;
+    }
+
+    HdrplayInputTransfer transfer;
+    if (!strcmp(name, "tagged") || !strcmp(name, "auto"))
+        transfer = HDRPLAY_INPUT_TRANSFER_TAGGED;
+    else if (!strcmp(name, "zlog2"))
+        transfer = HDRPLAY_INPUT_TRANSFER_ZLOG2;
+    else if (!strcmp(name, "logc3") || !strcmp(name, "arri-logc3"))
+        transfer = HDRPLAY_INPUT_TRANSFER_LOGC3;
+    else {
+        fprintf(stderr, "unknown --input-transfer: %s\n", name);
+        return false;
+    }
+
+    if (which < 0) out[0].transfer = out[1].transfer = transfer;
+    else out[which].transfer = transfer;
+    return true;
+}
+
+static bool parse_zlog2_exposure(const char *arg,
+                                 HdrplayInputTransform out[2],
+                                 bool indexed[2], bool given[2])
+{
+    int which = -1;
+    const char *value = arg;
+    const char *colon = strchr(arg, ':');
+    if (colon) {
+        if (colon != arg + 1 || (arg[0] != '0' && arg[0] != '1')) {
+            fprintf(stderr, "--zlog2-exposure: input index must be 0 or 1\n");
+            return false;
+        }
+        which = arg[0] - '0';
+        indexed[which] = true;
+        value = colon + 1;
+    }
+    char *end = NULL;
+    double stops = strtod(value, &end);
+    if (end == value || *end != '\0' || !isfinite(stops) ||
+        stops < HDRPLAY_ZLOG2_MIN_EXPOSURE ||
+        stops > HDRPLAY_ZLOG2_MAX_EXPOSURE) {
+        fprintf(stderr,
+                "invalid --zlog2-exposure: %s (range %.0f to %.3f stops keeps the decoded peak valid)\n",
+                value, HDRPLAY_ZLOG2_MIN_EXPOSURE,
+                HDRPLAY_ZLOG2_MAX_EXPOSURE);
+        return false;
+    }
+    if (which < 0) {
+        out[0].exposure_stops = out[1].exposure_stops = stops;
+        given[0] = given[1] = true;
+    } else {
+        out[which].exposure_stops = stops;
+        given[which] = true;
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     bool fullscreen = false;
@@ -513,8 +591,12 @@ int main(int argc, char **argv)
     enum AVColorRange range_override = AVCOL_RANGE_UNSPECIFIED;  /* auto */
     const char *stats_path = NULL;
     const char *input_lut_path = NULL;
-    HdrplayInputTransfer input_transfer = HDRPLAY_INPUT_TRANSFER_TAGGED;
-    float zlog2_exposure = 0.0f;
+    HdrplayInputTransform input_transform[2] = {
+        HDRPLAY_INPUT_TRANSFORM_TAGGED,
+        HDRPLAY_INPUT_TRANSFORM_TAGGED,
+    };
+    bool input_indexed[2] = { false, false };
+    bool exposure_given[2] = { false, false };
     const char *paths[2] = { NULL, NULL };
     int   n_paths = 0;
     int   step_buffer = 8;   /* frames retained for step-back */
@@ -590,18 +672,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--input-lut") && i+1 < argc)
             input_lut_path = argv[++i];
         else if (!strcmp(argv[i], "--input-transfer") && i+1 < argc) {
-            const char *m = argv[++i];
-            if (!strcmp(m, "tagged") || !strcmp(m, "auto"))
-                input_transfer = HDRPLAY_INPUT_TRANSFER_TAGGED;
-            else if (!strcmp(m, "zlog2"))
-                input_transfer = HDRPLAY_INPUT_TRANSFER_ZLOG2;
-            else {
-                fprintf(stderr, "unknown --input-transfer: %s\n", m);
-                return 2;
-            }
+            if (!parse_input_transfer(argv[++i], input_transform,
+                                      input_indexed)) return 2;
         }
-        else if (!strcmp(argv[i], "--zlog2-exposure") && i+1 < argc)
-            zlog2_exposure = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--zlog2-exposure") && i+1 < argc) {
+            if (!parse_zlog2_exposure(argv[++i], input_transform,
+                                      input_indexed, exposure_given)) return 2;
+        }
         else if (!strcmp(argv[i], "--plane") && i+1 < argc) {
             const char *p = argv[++i];
             if      (!strcmp(p, "color")) start_plane = HDRPLAY_PLANE_COLOR;
@@ -668,10 +745,35 @@ int main(int argc, char **argv)
     if ((sound || audio_waveform) && audio_input >= n_paths) {
         fprintf(stderr, "selected audio input was not provided\n"); return 2;
     }
+    if (n_paths == 1 && input_indexed[1]) {
+        fprintf(stderr, "input index 1 was configured but only one input was provided\n");
+        return 2;
+    }
+    for (int i = 0; i < n_paths; i++) {
+        if (exposure_given[i] &&
+            input_transform[i].transfer != HDRPLAY_INPUT_TRANSFER_ZLOG2) {
+            fprintf(stderr,
+                    "--zlog2-exposure for input %d requires --input-transfer %s%szlog2\n",
+                    i, n_paths > 1 ? (i ? "1:" : "0:") : "",
+                    "");
+            return 2;
+        }
+    }
+
+    bool any_input_override =
+        input_transform[0].transfer != HDRPLAY_INPUT_TRANSFER_TAGGED ||
+        input_transform[1].transfer != HDRPLAY_INPUT_TRANSFER_TAGGED;
+    if (input_lut_path && any_input_override) {
+        fprintf(stderr, "--input-lut and --input-transfer cannot be combined\n");
+        return 2;
+    }
+    if (analyze_only && input_lut_path) {
+        fprintf(stderr, "--analyze does not execute GPU .cube LUTs; use an explicit --input-transfer or pre-render the LUT\n");
+        return 2;
+    }
+
     if (hlg_peak > 0.0) probe_set_hlg_peak_override(hlg_peak);
     if (sdr_black_nits >= 0.0) probe_set_sdr_black_nits(sdr_black_nits);
-    probe_set_zlog2_override(input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2,
-                             zlog2_exposure);
     decoder_set_range_override(range_override);
 
     ensure_moltenvk_icd();
@@ -702,8 +804,9 @@ int main(int argc, char **argv)
          * count so the batch loop keeps working. */
         int rc = 0;
         for (int i = 0; i < n_paths; i++) {
-            int one = analyze_run(paths[i], analyze_stride, hlg_peak,
-                                  analyze_json, i == 0 ? stats_path : NULL);
+            int one = analyze_run(paths[i], &input_transform[i],
+                                  analyze_stride, hlg_peak, analyze_json,
+                                  i == 0 ? stats_path : NULL);
             if (one >= HDRPLAY_EXIT_TOOL_ERROR) return one;
             rc += one;
         }
@@ -720,7 +823,8 @@ int main(int argc, char **argv)
     Source sources[2];
     int n_sources = 0;
     for (int i = 0; i < n_paths && i < 2; i++) {
-        if (!source_open(&sources[n_sources], paths[i], step_buffer)) {
+        if (!source_open(&sources[n_sources], paths[i], step_buffer,
+                         &input_transform[i])) {
             for (int j = 0; j < n_sources; j++) source_close(&sources[j]);
             return 1;
         }
@@ -756,12 +860,6 @@ int main(int argc, char **argv)
         audio_close(audio);
         return 1;
     }
-    if (input_lut_path && input_transfer != HDRPLAY_INPUT_TRANSFER_TAGGED) {
-        fprintf(stderr, "--input-lut and --input-transfer cannot be combined\n");
-        renderer_close(&rend);
-        for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
-        return 2;
-    }
 
     if (fullscreen)
         SDL_SetWindowFullscreen(rend.window, true);
@@ -781,8 +879,6 @@ int main(int argc, char **argv)
         }
     }
     rend.mode = start_mode;
-    rend.input_transfer = input_transfer;
-    rend.zlog2_exposure = zlog2_exposure;
     rend.split_orient = start_orient;
     rend.plane_view = start_plane;
     rend.loop_enabled = loop_at_eof;
@@ -1444,7 +1540,8 @@ int main(int argc, char **argv)
     for (int i = 0; i < n_sources; i++) {
         char title[512];
         snprintf(title, sizeof(title), "session (playback)  %s", sources[i].label);
-        analyze_print_session(&sources[i].session, &sources[i].dec, title);
+        analyze_print_session(&sources[i].session, &sources[i].dec,
+                              &sources[i].input_transform, title);
     }
 
     if (markers_path && !audio_markers_save(audio)) {

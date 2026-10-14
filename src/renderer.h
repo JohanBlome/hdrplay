@@ -39,11 +39,6 @@ typedef enum {
     HDRPLAY_SCOPE_COUNT,
 } HdrplayScopeView;
 
-typedef enum {
-    HDRPLAY_INPUT_TRANSFER_TAGGED = 0,
-    HDRPLAY_INPUT_TRANSFER_ZLOG2,
-} HdrplayInputTransfer;
-
 typedef struct Renderer {
     Audio *audio;
     bool audio_visible;
@@ -62,8 +57,7 @@ typedef struct Renderer {
     pl_dispatch         dispatch_diff;  /* absolute frame difference     */
     struct pl_custom_lut *input_lut;    /* optional camera-log .cube LUT */
     pl_shader_obj       input_lut_state;
-    HdrplayInputTransfer input_transfer;
-    float               zlog2_exposure; /* stops around 13.5x normalization */
+    double              input_exposure_active; /* selected source, for shader */
     pl_tex              diff_tex;
     int                 diff_w, diff_h;
 
