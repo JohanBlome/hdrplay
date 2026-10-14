@@ -1,4 +1,5 @@
 #include "hud.h"
+#include "waveform_scale.h"
 #include "renderer.h"
 #include "log.h"
 #include "stats.h"
@@ -32,6 +33,7 @@ typedef struct { char c; uint8_t row[FONT_H]; } Glyph;
 static const Glyph FONT[] = {
     G(' ', 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00),
     G('.', 0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x30),
+    G(',', 0x00,0x00,0x00,0x00,0x00,0x30,0x30,0x20),
     G(':', 0x00,0x30,0x30,0x00,0x00,0x30,0x30,0x00),
     G('/', 0x04,0x08,0x08,0x10,0x10,0x20,0x20,0x40),
     G('-', 0x00,0x00,0x00,0x7C,0x00,0x00,0x00,0x00),
@@ -42,6 +44,8 @@ static const Glyph FONT[] = {
     G('=', 0x00,0x00,0x7C,0x00,0x7C,0x00,0x00,0x00),
     G('(', 0x18,0x20,0x40,0x40,0x40,0x40,0x20,0x18),
     G(')', 0x60,0x10,0x08,0x08,0x08,0x08,0x10,0x60),
+    G('[', 0x38,0x20,0x20,0x20,0x20,0x20,0x20,0x38),
+    G(']', 0x70,0x10,0x10,0x10,0x10,0x10,0x10,0x70),
     G('0', 0x78,0x84,0x8C,0x94,0xA4,0xC4,0x84,0x78),
     G('1', 0x20,0x60,0xA0,0x20,0x20,0x20,0x20,0xF8),
     G('2', 0x78,0x84,0x04,0x08,0x10,0x20,0x40,0xFC),
@@ -138,6 +142,7 @@ enum {
     SLOT_SESSION,
     SLOT_SCOPE,
     SLOT_SCOPE_ROI,
+    SLOT_AUDIO,
     SLOT_COUNT,
 };
 
@@ -1204,7 +1209,8 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         draw_text(buf, W, H, 6, y, hud_scale, r->last_output_csp);
     y += FONT_H * hud_scale + 8;
 
-    snprintf(line, sizeof(line), "FRAME %d%s%s",
+    snprintf(line, sizeof(line), "FRAME %s%d%s%s",
+             r->current_frame_no_approx ? "APPROX " : "",
              r->current_frame_no >= 0 ? r->current_frame_no : 0,
              r->paused       ? " PAUSED" : "",
              r->loop_enabled ? " LOOP"   : "");
@@ -1551,6 +1557,162 @@ static void upper6(char *dst, size_t n, const char *src)
 /* libplacebo composites them during the pass, so attaching afterwards   */
 /* silently does nothing. That was the bug that hid the original HUD.    */
 /* ------------------------------------------------------------------ */
+static void audio_pixel(uint8_t *buf, int w, int h, int x, int y,
+                        uint8_t red, uint8_t green, uint8_t blue)
+{
+    if (x < 0 || x >= w || y < 0 || y >= h) return;
+    uint8_t *p = buf + ((size_t)y * w + x) * 4;
+    p[0] = red; p[1] = green; p[2] = blue; p[3] = 255;
+}
+
+static void audio_line(uint8_t *buf, int w, int h, int x0, int y0, int x1, int y1,
+                       uint8_t red, uint8_t green, uint8_t blue)
+{
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, error = dx + dy;
+    for (;;) {
+        audio_pixel(buf, w, h, x0, y0, red, green, blue);
+        if (x0 == x1 && y0 == y1) break;
+        int e = 2 * error;
+        if (e >= dy) { error += dy; x0 += sx; }
+        if (e <= dx) { error += dx; y0 += sy; }
+    }
+}
+
+static int build_audio_panel(Renderer *r, Source *sources, pl_gpu gpu,
+                              LayoutRect dst, int win_w, int win_h)
+{
+    AudioView *view = &r->audio_view;
+    view->rect = dst; view->win_w = win_w; view->win_h = win_h;
+    int w = (int)(dst.x1 - dst.x0), h = (int)(dst.y1 - dst.y0);
+    if (w < 32 || h < 80 || !r->audio) return -1;
+    AudioInfo info;
+    audio_info(r->audio, &info);
+    int scale = w >= 1100 && h >= 240 ? 2 : 1;
+    int header = 34 * scale, footer = 34 * scale;
+    int ruler = header - 12 * scale;
+    int lanes_height = h - header - footer;
+    if (lanes_height < info.channels * 4) { header = 30; footer = 24; lanes_height = h - header - footer; }
+    ensure_slot(SLOT_AUDIO, gpu, w, h);
+    uint8_t *buf = make_panel(w, h, 255);
+    float *low = malloc(w * sizeof(float)), *high = malloc(w * sizeof(float));
+    AudioMarker *markers = malloc(AUDIO_MAX_MARKERS * sizeof(*markers));
+    if (!buf || !low || !high || !markers) { free(buf); free(low); free(high); free(markers); return -1; }
+    char text[256];
+    snprintf(text, sizeof(text), "AUDIO %d HZ  %d CH  %.6F - %.6F S  %s  %d TRANSIENTS",
+             info.rate, info.channels, view->start, view->start + view->span,
+             info.failed ? "FAILED" : info.buffering ? "BUFFERING" : info.duration_mismatch ?
+             (info.timing_inferred ? "PTS+LENGTH WARN" : "LENGTH WARN") : info.timing_inferred ? "INFERRED TIMING" : info.ready ? "READY" : "ANALYZING",
+             info.transients);
+    draw_text_color(buf, w, h, 8, 5, scale, text, 190, 220, 240);
+    int focus = renderer_focus_source(r);
+    double shown = source_shown_sec(&sources[focus]);
+    double next = source_peek_next_sec(&sources[focus]);
+    if (!isfinite(next) || next <= shown)
+        next = shown + (sources[focus].fps > 0 ? 1 / sources[focus].fps : 0);
+    if (isfinite(shown)) {
+        int x0 = (int)floor((shown - view->start) * w / view->span);
+        int x1 = (int)ceil((next - view->start) * w / view->span);
+        if (x0 < 0) x0 = 0; if (x1 > w) x1 = w;
+        for (int y = header; y < h - footer; y++)
+            for (int x = x0; x < x1; x++) audio_pixel(buf, w, h, x, y, 18, 28, 45);
+    }
+    double times[512]; int64_t ordinals[512];
+    int ng = audio_frame_grid(r->audio, focus, view->start, view->start + view->span,
+                              times, ordinals, 512);
+    int last_label = -100;
+    for (int i = 0; i < ng; i++) {
+        int x = (int)((times[i] - view->start) * w / view->span);
+        audio_line(buf, w, h, x, ruler, x, h - footer, 42, 52, 70);
+        if (x - last_label > 80 * scale) {
+            snprintf(text, sizeof(text), "F%lld %.3F", (long long)ordinals[i], times[i]);
+            draw_text_color(buf, w, h, x + 2, ruler, scale, text, 120, 135, 160);
+            last_label = x;
+        }
+    }
+    if (!ng) draw_text_color(buf, w, h, 8, ruler, scale, "FRAME INDEX BUILDING - MARKERS USE EXACT PTS", 140, 150, 170);
+    for (int c = 0; c < info.channels; c++) {
+        int top = header + lanes_height * c / info.channels;
+        int bottom = header + lanes_height * (c + 1) / info.channels;
+        int mid = (top + bottom) / 2;
+        float amplitude = (bottom - top - 4) * 0.5f;
+        audio_line(buf, w, h, 0, mid, w - 1, mid, 35, 45, 50);
+        if (view->logarithmic && bottom - top >= 100 * scale) {
+            const float levels[] = { .1f, .01f, .001f };
+            for (int j = 0; j < 3; j++) {
+                int dy = (int)(waveform_amplitude(levels[j], true) * amplitude);
+                audio_line(buf, w, h, 0, mid - dy, w - 1, mid - dy, 26, 36, 44);
+                audio_line(buf, w, h, 0, mid + dy, w - 1, mid + dy, 26, 36, 44);
+                snprintf(text, sizeof(text), "-%d DBFS", (j + 1) * 20);
+                draw_text_color(buf, w, h, w - 64 * scale, mid - dy, scale, text, 100, 120, 135);
+            }
+        }
+        audio_envelope(r->audio, view->start, view->span, w, c, low, high);
+        int prev_x = -1, prev_y = 0;
+        for (int x = 0; x < w; x++) {
+            if (!isfinite(low[x])) continue;
+            int y0 = mid - (int)(waveform_amplitude(high[x], view->logarithmic) * amplitude);
+            int y1 = mid - (int)(waveform_amplitude(low[x], view->logarithmic) * amplitude);
+            audio_line(buf, w, h, x, y0, x, y1, 70, 200, 175);
+            if (view->span * info.rate < w && prev_x >= 0 &&
+                x - prev_x <= (int)ceil(w / (view->span * info.rate)) + 1)
+                audio_line(buf, w, h, prev_x, prev_y, x, y0, 70, 200, 175);
+            prev_x = x; prev_y = y0;
+        }
+        snprintf(text, sizeof(text), "%s%s", info.channel_names[c], c == view->channel ? " <" : "");
+        draw_text_color(buf, w, h, 6, top + 2, scale, text, 200, 220, 230);
+    }
+    int nm = audio_markers(r->audio, markers, AUDIO_MAX_MARKERS);
+    for (int i = 0; i < nm; i++) {
+        AudioMarker *m = &markers[i];
+        if (m->dismissed || m->time < view->start || m->time > view->start + view->span) continue;
+        int x = (int)((m->time - view->start) * w / view->span);
+        bool video = m->kind == AUDIO_MARK_FRAME;
+        uint8_t red = video ? 100 : 255, green = video ? 155 : m->reviewed ? 210 : 145;
+        int top = header;
+        if (!video && m->channel >= 0) top += lanes_height * m->channel / info.channels;
+        int bottom = video || m->channel < 0 ? h - footer :
+                     header + lanes_height * (m->channel + 1) / info.channels;
+        if (m->kind == AUDIO_MARK_TRANSIENT && !m->reviewed) {
+            for (int y = top; y < bottom; y += 6) audio_line(buf, w, h, x, y, x, y + 2, red, green, 80);
+        } else audio_line(buf, w, h, x, top, x, bottom, red, green, video ? 255 : 80);
+        if (i == view->selected || i == view->anchor) {
+            audio_line(buf, w, h, x - 3, top, x + 3, top, 255, 255, 255);
+            audio_line(buf, w, h, x - 1, top, x - 1, bottom, red, green, 240);
+        }
+    }
+    int play_x = (int)((view->clock - view->start) * w / view->span);
+    if (play_x >= 0 && play_x < w) audio_line(buf, w, h, play_x, ruler, play_x, h - footer, 245, 245, 245);
+    int cursor_x = (int)((view->cursor - view->start) * w / view->span);
+    if (cursor_x >= 0 && cursor_x < w) audio_line(buf, w, h, cursor_x, header, cursor_x, h - footer, 230, 110, 220);
+    draw_text_color(buf, w, h, 6, h - footer + 3, scale, "F1 HELP", 110, 205, 235);
+    draw_text_color(buf, w, h, 80 * scale, h - footer + 3, scale, "F3 MARKERS", 110, 205, 235);
+    draw_text_color(buf, w, h, 188 * scale, h - footer + 3, scale,
+                    view->logarithmic ? "F4 LOG" : "F4 LINEAR", 110, 205, 235);
+    if (view->entry_mode) {
+        snprintf(text, sizeof(text), "%s: %s", view->entry_mode == 1 ? "ABSOLUTE MEDIA SECONDS" : "MARKER LABEL", view->entry);
+    } else if (view->selected >= 0 && view->selected < nm && view->anchor >= 0 && view->anchor < nm &&
+               view->selected != view->anchor && !markers[view->selected].dismissed && !markers[view->anchor].dismissed) {
+        AudioMarker *m = &markers[view->selected], *v = &markers[view->anchor];
+        double delta = m->time - v->time;
+        if (v->kind == AUDIO_MARK_FRAME && v->end > v->time)
+            snprintf(text, sizeof(text), "DELTA %+.3F MS (%s)  FRAME RANGE [%+.3F,%+.3F] MS  %s",
+                     delta * 1000, delta >= 0 ? "AUDIO LATE" : "AUDIO EARLY",
+                     (m->time - v->end - m->uncertainty) * 1000,
+                     (delta + m->uncertainty) * 1000, m->reviewed ? "REVIEWED" : "CANDIDATE");
+        else snprintf(text, sizeof(text), "MARKER DELTA %+.3F MS  %.3F SAMPLE INTERVALS", delta * 1000, delta * info.rate);
+    } else if (info.failed) snprintf(text, sizeof(text), "%s", info.error);
+    else if (info.duration_mismatch)
+        snprintf(text, sizeof(text), "LENGTH WARN  DECLARED %.6F S  PCM %.6F S  GAPS %.3F MS  DIFFERENCE %+.3F MS",
+                 info.declared_duration, info.sample_duration, info.gap_duration * 1000, info.duration_delta * 1000);
+    else snprintf(text, sizeof(text), "CURSOR %.6F S  WHEEL=ZOOM  DRAG=PAN  SHIFT-H=FOLLOW  U=MUTE  OUTPUT EST %.1F MS  PTS UNCERTAINTY %.3F MS",
+                  view->cursor, info.latency * 1000, info.timestamp_uncertainty * 1000);
+    draw_text_color(buf, w, h, 6, h - 12 * scale, scale, text, 230, 210, 150);
+    commit_slot(SLOT_AUDIO, gpu, buf, (int)dst.x0, (int)dst.y0);
+    free(buf); free(low); free(high); free(markers);
+    return 0;
+}
+
 void hud_prepare(Renderer *r, Source *sources, int n,
                  const LayoutPlan *plan, int win_w, int win_h,
                  HudOverlays *out)
@@ -1571,6 +1733,12 @@ void hud_prepare(Renderer *r, Source *sources, int n,
         for (int oi = 0; oi < lp->n_ov; oi++) {
             const LayoutOverlay *ov = &lp->ov[oi];
             switch (ov->kind) {
+            case LAYOUT_OV_AUDIO:
+                if (build_audio_panel(r, sources, gpu, ov->dst, win_w, win_h) == 0) {
+                    out->audio = overlay_arr[SLOT_AUDIO];
+                    out->has_audio = true;
+                }
+                break;
             case LAYOUT_OV_STATUS:
                 if (build_status_panel(r, gpu, win_w, win_h) == 0) {
                     out->status     = overlay_arr[SLOT_STATUS];

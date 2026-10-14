@@ -51,6 +51,7 @@ typedef struct Source {
     double   tb_sec;           /* stream timebase in seconds           */
     double   fps;              /* nominal rate for PTS -> frame number */
     double   start_sec;        /* stream timeline origin               */
+    double   timeline_origin;  /* shared container origin, all streams */
     double   duration_sec;     /* <= 0 when unknown                    */
 
     struct AVFrame *shown;     /* frame currently on screen (owned)    */

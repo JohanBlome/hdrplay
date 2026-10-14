@@ -923,6 +923,30 @@ static void test_source_region_mapping(void)
           "90-degree ROI projection rotates position and dimensions");
 }
 
+static void test_audio_strip(void)
+{
+    puts("audio strip preserves pane geometry and is attached once, last");
+    for (int sources = 1; sources <= 2; sources++)
+    for (int mode = HDRPLAY_MODE_HDR; mode <= HDRPLAY_MODE_SPLIT; mode++)
+    for (int orient = HDRPLAY_SPLIT_LR; orient <= HDRPLAY_SPLIT_WIPE_TB; orient++) {
+        LayoutInput in = base_input();
+        in.n_sources = sources; in.mode = mode; in.orient = orient;
+        in.audio_visible = true; in.scope_visible = true;
+        LayoutPlan p; layout_plan(&in, &p);
+        LayoutRect strip = layout_audio_rect(in.win_w, in.win_h);
+        CHECK(count_ov_plan(&p, LAYOUT_OV_AUDIO) == 1, "audio overlay routed once (%d/%d/%d)", sources, mode, orient);
+        const LayoutPass *last = &p.pass[p.n_pass - 1];
+        CHECK(last->ov[last->n_ov - 1].kind == LAYOUT_OV_AUDIO, "audio is the final overlay");
+        CHECK(rect_eq(last->ov[last->n_ov - 1].dst, 0, strip.y0, WIN_W, WIN_H), "audio spans full width");
+        for (int i = 0; i < p.n_pass; i++) {
+            CHECK(p.pass[i].target_crop.y1 <= strip.y0 + .01f, "video target excludes audio");
+            int x, y;
+            CHECK(!layout_window_to_source(p.pass[i].target_crop, p.pass[i].image_crop,
+                    3840, 2160, 0, 200, strip.y0 + 20, false, &x, &y), "audio clicks cannot become image probes");
+        }
+    }
+}
+
 int main(void)
 {
     test_single_file_unchanged();
@@ -944,6 +968,7 @@ int main(void)
     test_one_to_one_is_exact();
     test_panes_meet_at_the_seam();
     test_source_region_mapping();
+    test_audio_strip();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

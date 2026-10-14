@@ -1,5 +1,6 @@
 #include "source.h"
 #include "log.h"
+#include "media_time.h"
 
 #include <math.h>
 #include <limits.h>
@@ -87,7 +88,7 @@ static const char *basename_of(const char *path)
 static double pts_to_sec(const Source *s, const AVFrame *f)
 {
     if (!f || f->best_effort_timestamp == AV_NOPTS_VALUE) return NAN;
-    return (double)f->best_effort_timestamp * s->tb_sec;
+    return (double)f->best_effort_timestamp * s->tb_sec - s->timeline_origin;
 }
 
 /* The HUD counter describes the frame currently displayed, not how many
@@ -116,8 +117,9 @@ bool source_open(Source *s, const char *path, int ring_cap)
     s->tb_sec = av_q2d(st->time_base);
     AVRational rate = av_guess_frame_rate(s->dec.fmt, st, NULL);
     s->fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
+    s->timeline_origin = media_time_origin(s->dec.fmt);
     s->start_sec = st->start_time != AV_NOPTS_VALUE
-                 ? (double)st->start_time * s->tb_sec : 0.0;
+                 ? (double)st->start_time * s->tb_sec - s->timeline_origin : 0.0;
     if (st->duration > 0 && st->duration != AV_NOPTS_VALUE)
         s->duration_sec = (double)st->duration * s->tb_sec;
     else if (s->dec.fmt->duration > 0 && s->dec.fmt->duration != AV_NOPTS_VALUE)
@@ -205,6 +207,15 @@ static bool fill_pending(Source *s)
          * image, and must not be held on screen as one. */
         if (r == 0 && s->frames_presented == 1)
             s->still_image = true;
+        if (r == 0 && s->shown) {
+            double t = pts_to_sec(s, s->shown);
+            double dur = s->shown->duration > 0 ? s->shown->duration * s->tb_sec :
+                         s->fps > 0 ? 1 / s->fps : 0;
+            if (isfinite(t) && dur > 0) {
+                s->duration_sec = t + dur - s->start_sec;
+                s->session.duration_sec = s->duration_sec;
+            }
+        }
         return false;
     }
 
@@ -247,7 +258,7 @@ double source_seek_ceiling(const Source *sources, int n)
 {
     double last = -1.0;
     for (int i = 0; i < n; i++) {
-        double d = sources[i].duration_sec;
+        double d = sources[i].duration_sec + sources[i].start_sec;
         if (!(d > 0.0)) continue;
         double half = sources[i].fps > 0.0 ? 0.5 / sources[i].fps : 0.0;
         double end = d - half;
@@ -308,7 +319,7 @@ bool source_advance_to(Source *s, double t)
         } else {
             /* The target predates retained history. Decode forward from
              * the preceding keyframe to reconstruct the correct frame. */
-            if (!decoder_seek_to(&s->dec, t)) return false;
+            if (!decoder_seek_to(&s->dec, t + s->timeline_origin)) return false;
             source_flush(s);
             changed = true;
         }
@@ -349,7 +360,7 @@ bool source_advance_to(Source *s, double t)
 bool source_seek_to(Source *s, double t)
 {
     if (t < 0.0) t = 0.0;
-    if (!decoder_seek_to(&s->dec, t)) return false;
+    if (!decoder_seek_to(&s->dec, t + s->timeline_origin)) return false;
     source_flush(s);
     source_advance_to(s, t);
     return true;
@@ -389,7 +400,7 @@ double source_step_back(Source *s)
     for (double window = 0.5; window <= 8.0; window *= 4.0) {
         double target = cur_t - window;
         if (target < 0.0) target = 0.0;
-        if (!decoder_seek_to(&s->dec, target)) return NAN;
+        if (!decoder_seek_to(&s->dec, target + s->timeline_origin)) return NAN;
         source_flush(s);
 
         /* Decode forward, keeping the last frame strictly before cur_t.

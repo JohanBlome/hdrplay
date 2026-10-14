@@ -1599,6 +1599,13 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     r->frame_stats_valid = sources[focus].frame_stats_valid;
     r->session           = &sources[focus].session;
     r->current_frame_no  = sources[focus].frame_no;
+    r->current_frame_no_approx = false;
+    if (r->audio) {
+        int64_t ordinal = audio_frame_ordinal(r->audio, focus,
+                              sources[focus].shown->best_effort_timestamp);
+        r->current_frame_no_approx = ordinal < 0;
+        if (ordinal >= 0) r->current_frame_no = (int)ordinal;
+    }
 
     struct pl_render_params rp = pl_render_default_params;
     rp.info_callback = pl_info_cb;
@@ -1684,6 +1691,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
         .hud_hidden = r->hud_hidden,
         .session_panel = r->session_panel,
         .scope_visible = r->scope_view != HDRPLAY_SCOPE_OFF,
+        .audio_visible = r->audio_visible,
     };
     for (int i = 0; i < slot_count; i++) {
         if (!slot_frame[i]) continue;
@@ -1884,6 +1892,9 @@ bool renderer_render(Renderer *r, Source *sources, int n)
                 break;
             case LAYOUT_OV_SCOPE:
                 if (hud_ov.has_scope) ov_store[n_ov++] = hud_ov.scope;
+                break;
+            case LAYOUT_OV_AUDIO:
+                if (hud_ov.has_audio) ov_store[n_ov++] = hud_ov.audio;
                 break;
             case LAYOUT_OV_SCOPE_ROI:
                 if (hud_ov.has_scope_roi)

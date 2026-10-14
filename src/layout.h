@@ -59,6 +59,7 @@ typedef enum {
     LAYOUT_OV_PLANE,         /* current COLOR/Y/Cb/Cr view badge      */
     LAYOUT_OV_LABEL_A,       /* badge for the first pane              */
     LAYOUT_OV_LABEL_B,       /* badge for the second pane             */
+    LAYOUT_OV_AUDIO,         /* audio timing strip, drawn last        */
 } LayoutOverlayKind;
 
 typedef struct {
@@ -69,7 +70,7 @@ typedef struct {
 
 #define LAYOUT_MAX_PASSES   2
 #define LAYOUT_MAX_INTER    2
-#define LAYOUT_MAX_OVERLAYS 10
+#define LAYOUT_MAX_OVERLAYS 12
 
 /* An intermediate render, performed before any swapchain pass. */
 typedef struct {
@@ -134,11 +135,13 @@ typedef struct {
     bool  hud_hidden;
     bool  session_panel;
     bool  scope_visible;
+    bool  audio_visible;
 } LayoutInput;
 
 /* Compute the plan. Pure: same inputs always give the same output, no
  * allocation, no global state. */
 void layout_plan(const LayoutInput *in, LayoutPlan *out);
+LayoutRect layout_audio_rect(int width, int height);
 
 /* Runtime O-key order. Two-source comparison includes the two full-frame
  * rectangular wipes; single-source/solo keeps the original three modes. */

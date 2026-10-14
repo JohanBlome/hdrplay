@@ -10,6 +10,7 @@
 #include <libplacebo/shaders/lut.h>
 #include "probe.h"
 #include "layout.h"
+#include "audio.h"
 
 struct SDL_Window;
 struct Source;
@@ -44,6 +45,10 @@ typedef enum {
 } HdrplayInputTransfer;
 
 typedef struct Renderer {
+    Audio *audio;
+    bool audio_visible;
+    bool audio_muted;
+    AudioView audio_view;
     struct SDL_Window *window;
 
     pl_log              pl_log;
@@ -219,6 +224,7 @@ typedef struct Renderer {
      * counter, which would just count refreshes). -1 = no frame
      * decoded yet. */
     int current_frame_no;
+    bool current_frame_no_approx;
 
     /* HUD visibility toggle. The status panel (top-left, multi-line)
      * can occlude image content in some clips — let the user hide it

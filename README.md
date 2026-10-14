@@ -171,6 +171,109 @@ hdrplay first.mov second.mov          # synchronized comparison
 hdrplay image.png                     # inspect a still image
 ```
 
+### Audio playback and A/V timing
+
+Audio is opt-in. The audio waveform is a separate time-based strip below the
+video; `--waveform` continues to mean the RGB signal scope.
+
+```bash
+hdrplay --audio video.mp4
+hdrplay --audio --audio-waveform --audio-transients video.mp4
+hdrplay --audio-waveform --audio-transients --markers sync.json video.mp4
+hdrplay --audio --audio-waveform --audio-source 1:a:0 master.mov encode.mov
+hdrplay --audio-waveform --mark-time 1.234567 video.mp4
+```
+
+`--audio-waveform` supports silent inspection. `--audio-transients` implies
+the waveform and automatically marks clear impulse onsets. `--audio-source
+N:a:M` selects audio track M in input N, both zero-based; the default is `0:a:0`.
+Pane swaps and solo controls do not change the selected audio source.
+
+The strip draws channels separately, with actual video PTS boundaries, verified
+frame ordinals as the background index becomes available, and a highlighted
+interval for the displayed frame. An unverified HUD frame number is labeled
+`APPROX`. Wheel zoom reaches individual source samples; coarse views use
+min/max peaks so short impulses remain visible. Audio and video share a media
+timeline origin, preserving any initial A/V offset.
+
+| Control | Action |
+| --- | --- |
+| F1 / click Help | Open keyboard help for video, audio, and marker windows |
+| F3 / click Markers | Open the marker list with times and signed deltas |
+| F4 / click Linear or Log | Toggle linear / logarithmic waveform amplitude |
+| Space / comma / period | Pause, step backward, step forward; stepping is silent |
+| Click waveform ruler | Seek and pause on that media time |
+| B | Mark the displayed video frame and its PTS interval |
+| Right-click or Shift-click a channel / C | Add a sample marker at the clicked time / cursor |
+| Click a marker | Select an audio marker or use a video marker as the comparison anchor |
+| Ctrl-click a marker | Set an arbitrary comparison anchor |
+| `[` / `]` | Previous / next automatic transient; seek and pause |
+| Enter | Accept the selected automatic marker |
+| Shift-Enter | Move the selected audio marker to the cursor, snapping to a source sample |
+| Delete / Backspace | Dismiss the selected marker |
+| G | Enter an absolute media time in seconds; Enter confirms, Escape cancels |
+| F2 | Label the selected marker |
+| Ctrl-S / Command-S | Save the `--markers FILE` sidecar |
+| Wheel / drag / Shift-wheel | Zoom around the pointer / pan the waveform |
+| Shift-H (or Home) | Follow the playback position again |
+| U | Mute/unmute while retaining the audio clock |
+
+The help and marker windows are resizable, scrollable SDL windows. Closing one
+or pressing Escape in it keeps the video open. In the marker list, click a row
+to select it; video rows also become the timing reference. Ctrl/Command-click
+or **A** makes any row the reference. All rows show `row time - reference time`
+in milliseconds, and the selected comparison includes the frame interval and
+timing uncertainty. Double-click or **J** seeks and pauses. Up/Down selects rows,
+Enter accepts, Delete dismisses, and Ctrl/Command-S saves the sidecar. Dismissed
+rows remain visible for review.
+
+Log amplitude expands quiet events using a continuous, polarity-preserving
+`sign(x) * log(1 + 999 * abs(x)) / log(1000)` display curve. Silence stays at
+zero and full scale stays at one; guides mark -20, -40, and -60 dBFS when there
+is enough room. Linear is the default. Samples, timing, peak caches, playback,
+and transient detection are unaffected. With the audio strip enabled, **Shift-C**
+cycles video plane views and **Shift-G** changes vectorscope gain.
+
+Pause on a clap closing, press **B**, navigate to its audio transient, and press
+**Enter** to accept it. The readout reports `audio onset - video frame start`
+in milliseconds and an offset range accounting for the frame interval and audio
+timing uncertainty. Positive values place audio after the frame start. A selected
+frame only localizes the visual event to that frame's interval.
+
+Transient detection is deliberately strict: a quiet baseline, strong contrast,
+fast attack, high crest factor, and broadband energy are all required. Ambiguous
+attacks and clipped impulses are skipped. A drum hit or click can qualify as an
+audio transient; detection does not identify a clapboard or choose its video frame.
+Automatic markers look distinct, and adjustments/dismissals survive reanalysis.
+
+`--markers FILE` loads and saves versioned JSON, including original PTS/time
+bases, exact source-sample positions, labels, review state, uncertainty, source
+identity, and timing audits. It saves again on normal exit. Changed source files
+and incompatible track selections are rejected. `--mark-time` is repeatable;
+absolute time means a position on the media timeline. At EOF, waveform mode holds
+the final video frame for inspection.
+
+The `[AUDIO]` log reports timestamp inconsistencies, decoded sample counts,
+declared audio duration, presentation span, gaps, and signaled codec skips.
+The file-duration comparison completes when the selected audio and video index
+are available; it abstains when additional uninspected tracks or ambiguous
+duration metadata prevent a complete comparison. Duration mismatches are warnings.
+An excess within one codec frame is reported as possible unconfirmed padding;
+duration alone does not cause decoded samples to be discarded.
+
+Small timestamp overlaps can be recovered using the native sample clock. The
+strip then says `INFERRED TIMING` (or `PTS+LENGTH WARN`), and measurements retain
+the observed timestamp uncertainty. Larger discontinuities remain explicit;
+gaps schedule silence without being drawn as recorded silence. Speaker/display
+latency is separate from these file measurements: SDL consumption drives playback
+with an output-latency estimate, rather than a hardware presentation timestamp.
+
+Audio inspection currently supports local seekable files, 1–8 channels, and
+8–384 kHz source audio. Background PCM uses a temporary file capped at 4 GiB;
+peak and frame indexes are also bounded. These caches are deleted when closed.
+The build now links `libswresample` alongside the existing FFmpeg libraries;
+on Ubuntu add `libswresample-dev` to the dependency installation command.
+
 `--input-lut FILE.cube` applies a camera/vendor 3D LUT to the
 gamma-encoded RGB signal on the GPU before normal display color management.
 This is useful when a camera records Z-Log2 (or another Log curve) while the
@@ -199,14 +302,15 @@ and play normally.
 
 | Key | Action |
 |---|---|
+| `F1` / `F3` | open keyboard help / timing marker window |
 | `F` | toggle fullscreen |
 | `H` / `S` | select HDR or SDR treatment |
 | `P` | HDR/SDR split for one file; comparison for two files |
 | `O` | cycle split orientation and comparison wipes |
-| `C` | cycle color, Y, Cb, Cr, legal, clip and plateau views |
+| `C` (`Shift-C` with audio strip) | cycle color, Y, Cb, Cr, legal, clip and plateau views |
 | `V` | cycle scopes: off, waveform, gamut, vectorscope, histogram |
 | `Shift`+drag | select the source rectangle used by scopes; Shift-click clears it |
-| `G` | toggle vectorscope trace gain between 1x and 2x |
+| `G` (`Shift-G` with audio strip) | toggle vectorscope trace gain between 1x and 2x |
 | `D` | toggle current/previous or A/B difference |
 | `Space` | pause or resume |
 | `.` / `,` | step one frame forward or backward |

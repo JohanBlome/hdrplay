@@ -660,6 +660,16 @@ static void plan_diff(const LayoutInput *in, LayoutPlan *out)
 /* ------------------------------------------------------------------ */
 void layout_plan(const LayoutInput *in, LayoutPlan *out)
 {
+    if (in->audio_visible) {
+        LayoutInput video = *in;
+        LayoutRect audio = layout_audio_rect(in->win_w, in->win_h);
+        video.audio_visible = false;
+        video.win_h = (int)audio.y0;
+        layout_plan(&video, out);
+        if (out->n_pass)
+            add_ov(&out->pass[out->n_pass - 1], LAYOUT_OV_AUDIO, -1, audio);
+        return;
+    }
     memset(out, 0, sizeof(*out));
 
     /* In temporal-diff mode the renderer supplies the previous frame as
@@ -676,6 +686,14 @@ void layout_plan(const LayoutInput *in, LayoutPlan *out)
         return;
     }
     plan_pair(in, out);
+}
+
+LayoutRect layout_audio_rect(int width, int height)
+{
+    int h = height / 3;
+    if (h < 180) h = 180;
+    if (h > height / 2) h = height / 2;
+    return rect(0, height - h, width, height);
 }
 
 void layout_activate_split_or_compare(int n_sources, int *solo,

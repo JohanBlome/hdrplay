@@ -26,6 +26,8 @@
 #include "checks.h"
 #include "clamp.h"
 #include "log.h"
+#include "audio_ui.h"
+#include "tool_windows.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,6 +261,16 @@ static void usage(void)
         "                        literal storage endpoints; PLATEAU marks\n"
         "                        locally flat areas near either endpoint.\n"
         "  --waveform            start with the RGB waveform visible\n"
+        "  --audio               play selected audio in sync with video\n"
+        "  --audio-waveform      show audio timing strip (silent without --audio)\n"
+        "  --audio-transients    mark clear impulse onsets; implies --audio-waveform\n"
+        "  --audio-source N:a:M  audio track M of input N (both zero-based)\n"
+        "  --markers FILE        load/save audio timing markers as JSON\n"
+        "  --mark-time SECONDS   add absolute media-time marker (repeatable)\n"
+        "                        audio strip: B=frame, C/right-click=audio marker,\n"
+        "                        [ ]=transient, Enter=accept, Shift-Enter=adjust,\n"
+        "                        Del=dismiss, G=absolute time, F2=label, Ctrl-S=save,\n"
+        "                        wheel=zoom, drag/Shift-wheel=pan, Shift-H=follow, U=mute\n"
         "  --gamut               start with the CIE gamut scope visible\n"
         "  --vectorscope         start with the Cb/Cr vectorscope visible\n"
         "  --histogram           start with the RGB histogram visible\n"
@@ -312,6 +324,9 @@ static void usage(void)
         "                            mask the gamut-narrowing advantage HDR\n"
         "                            has over SDR)\n"
         "  keys at runtime:      F=fullscreen  H=HDR  S=SDR\n"
+        "                        F1=keyboard help window  F3=timing markers window\n"
+        "                        F4=linear/log audio amplitude\n"
+        "                        with audio strip: Shift-C=video planes, Shift-G=vector gain\n"
         "                        P=split (one file) / compare (two files)\n"
         "                        C=cycle color / Y / Cb / Cr plane\n"
         "                        D=toggle full-frame difference\n"
@@ -466,6 +481,12 @@ static bool parse_rotate(const char *arg, int out[2])
 int main(int argc, char **argv)
 {
     bool fullscreen = false;
+    bool sound = false, audio_waveform = false, audio_transients = false;
+    int audio_input = 0, audio_track = 0;
+    bool audio_source_given = false;
+    const char *markers_path = NULL;
+    double time_markers[64];
+    int n_time_markers = 0;
     bool list_displays_only = false;
     bool diagnose_only = false;
     bool has_brightness = false;
@@ -504,6 +525,26 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--list-displays")) list_displays_only = true;
         else if (!strcmp(argv[i], "--diagnose")) diagnose_only = true;
         else if (!strcmp(argv[i], "--analyze"))  analyze_only = true;
+        else if (!strcmp(argv[i], "--audio")) sound = true;
+        else if (!strcmp(argv[i], "--audio-waveform")) audio_waveform = true;
+        else if (!strcmp(argv[i], "--audio-transients")) audio_transients = audio_waveform = true;
+        else if (!strcmp(argv[i], "--audio-source") && i + 1 < argc) {
+            char tail;
+            if (sscanf(argv[++i], "%d:a:%d%c", &audio_input, &audio_track, &tail) != 2 ||
+                audio_input < 0 || audio_input > 1 || audio_track < 0 || audio_track > 65535) {
+                fprintf(stderr, "--audio-source requires N:a:M (nonnegative input/track indexes)\n"); return 2;
+            }
+            audio_source_given = true;
+        }
+        else if (!strcmp(argv[i], "--markers") && i + 1 < argc) markers_path = argv[++i];
+        else if (!strcmp(argv[i], "--mark-time") && i + 1 < argc) {
+            char *end; const char *arg = argv[++i];
+            double t = strtod(arg, &end);
+            if (end == arg || *end || !isfinite(t) || t < 0 || n_time_markers == 64) {
+                fprintf(stderr, "--mark-time requires finite nonnegative seconds (at most 64 markers)\n"); return 2;
+            }
+            time_markers[n_time_markers++] = t;
+        }
         else if (!strcmp(argv[i], "--waveform"))
             start_scope = HDRPLAY_SCOPE_WAVEFORM;
         else if (!strcmp(argv[i], "--gamut"))
@@ -618,6 +659,15 @@ int main(int argc, char **argv)
         }
     }
 
+    if ((sound || audio_waveform) && (analyze_only || diagnose_only || list_displays_only)) {
+        fprintf(stderr, "audio playback/visualization requires interactive playback\n"); return 2;
+    }
+    if ((audio_source_given || markers_path || n_time_markers) && !(sound || audio_waveform)) {
+        fprintf(stderr, "audio-source/markers/mark-time requires --audio or --audio-waveform\n"); return 2;
+    }
+    if ((sound || audio_waveform) && audio_input >= n_paths) {
+        fprintf(stderr, "selected audio input was not provided\n"); return 2;
+    }
     if (hlg_peak > 0.0) probe_set_hlg_peak_override(hlg_peak);
     if (sdr_black_nits >= 0.0) probe_set_sdr_black_nits(sdr_black_nits);
     probe_set_zlog2_override(input_transfer == HDRPLAY_INPUT_TRANSFER_ZLOG2,
@@ -677,15 +727,33 @@ int main(int argc, char **argv)
         n_sources++;
     }
 
+    Audio *audio = NULL;
+    if (sound || audio_waveform) {
+        audio = audio_open(paths, n_paths, audio_input, audio_track, sound,
+                            audio_transients, markers_path);
+        if (!audio) {
+            for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
+            return 1;
+        }
+        for (int i = 0; i < n_time_markers; i++) audio_marker_time(audio, time_markers[i]);
+    }
     Renderer rend;
-    if (!renderer_init(&rend, sources[0].dec.width, sources[0].dec.height,
+    int initial_w = sources[0].dec.width, initial_h = sources[0].dec.height;
+    if (audio_waveform) {
+        if (initial_w < 800) initial_w = 800;
+        initial_h += 240;
+        if (initial_h < 600) initial_h = 600;
+    }
+    if (!renderer_init(&rend, initial_w, initial_h,
                        "hdrplay", display_index)) {
         for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
+        audio_close(audio);
         return 1;
     }
     if (input_lut_path && !renderer_set_input_lut(&rend, input_lut_path)) {
         renderer_close(&rend);
         for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
+        audio_close(audio);
         return 1;
     }
     if (input_lut_path && input_transfer != HDRPLAY_INPUT_TRANSFER_TAGGED) {
@@ -698,6 +766,20 @@ int main(int argc, char **argv)
     if (fullscreen)
         SDL_SetWindowFullscreen(rend.window, true);
 
+    rend.audio = audio;
+    rend.audio_visible = audio_waveform;
+    rend.audio_view = (AudioView){ .span = 2, .follow = true, .selected = -1, .anchor = -1 };
+    if (audio) {
+        AudioMarker *loaded = malloc(AUDIO_MAX_MARKERS * sizeof(*loaded));
+        if (loaded) {
+            int n = audio_markers(audio, loaded, AUDIO_MAX_MARKERS);
+            for (int i = 0; i < n; i++) if (!loaded[i].dismissed) {
+                if (loaded[i].kind == AUDIO_MARK_FRAME) rend.audio_view.anchor = i;
+                else if (loaded[i].reviewed) rend.audio_view.selected = i;
+            }
+            free(loaded);
+        }
+    }
     rend.mode = start_mode;
     rend.input_transfer = input_transfer;
     rend.zlog2_exposure = zlog2_exposure;
@@ -722,6 +804,7 @@ int main(int argc, char **argv)
     rend.rotation[0]       = rotation[0];
     rend.rotation[1]       = rotation[1];
     rend.current_frame_no  = -1;
+    if (audio_waveform) SDL_SetWindowMinimumSize(rend.window, 640, 360);
 
     for (int i = 0; i < n_sources; i++)
         if (rotation[i])
@@ -780,6 +863,7 @@ int main(int argc, char **argv)
      * "behind".
      * ---------------------------------------------------------------- */
     bool quit   = false;
+    ToolWindows tools = {0};
     bool paused = false;
 
     double clock_sec  = 0.0;
@@ -795,12 +879,26 @@ int main(int argc, char **argv)
      * loop for why an unconditional redraw is expensive here. */
     bool   dirty      = true;
     bool   scope_selecting = false;
+    uint64_t audio_revision = 0;
+    double audio_redraw = 0;
+    int exit_status = 0;
+    double audio_command_time = -1;
     int    scope_select_src = -1;
     int    scope_select_x0 = 0, scope_select_y0 = 0;
 
     /* Reference source for stepping and for the frame counter: the pane
      * you are looking at. */
     #define REF (renderer_focus_source(&rend))
+
+    if (audio) {
+        /* Warm frame upload and shaders before releasing the audio device. */
+        bool have_frame = false;
+        for (int i = 0; i < n_sources; i++) {
+            source_advance_to(&sources[i], 0);
+            if (sources[i].shown) have_frame = true;
+        }
+        if (have_frame) renderer_render(&rend, sources, n_sources);
+    }
 
     while (!quit) {
         SDL_Event e;
@@ -810,9 +908,31 @@ int main(int argc, char **argv)
              * enumerate which ones matter. */
             dirty = true;
             if (e.type == SDL_EVENT_QUIT) quit = true;
+            if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                e.window.windowID == SDL_GetWindowID(rend.window)) quit = true;
+
+            double audio_seek = 0;
+            int audio_action = tool_windows_event(&tools, &rend, sources, &e, &audio_seek);
+            if (!(audio_action & AUDIO_UI_HANDLED))
+                audio_action = audio_ui_event(&rend, sources, &e, &audio_seek);
+            if (audio_action & AUDIO_UI_SEEK) {
+                audio_transport(audio, audio_seek, true, true);
+                paused = rend.paused = true;
+                for (int i = 0; i < n_sources; i++) source_seek_to(&sources[i], audio_seek);
+                clock_sec = audio_seek; rebase = true;
+            }
+            if (audio_action & AUDIO_UI_HANDLED) continue;
 
             if (e.type == SDL_EVENT_KEY_DOWN) {
                 bool shift = (e.key.mod & SDL_KMOD_SHIFT) != 0;
+                if (sound && (e.key.key == SDLK_SPACE || e.key.key == SDLK_R ||
+                    e.key.key == SDLK_PERIOD || e.key.key == SDLK_COMMA ||
+                    (!shift && (e.key.key == SDLK_LEFT || e.key.key == SDLK_RIGHT)))) {
+                    double t = audio_clock(audio);
+                    if (isfinite(t)) clock_sec = t;
+                    audio_transport(audio, clock_sec, true, false);
+                    rebase = true;
+                }
 
                 if (e.key.key == SDLK_ESCAPE || e.key.key == SDLK_Q) quit = true;
                 if (e.key.key == SDLK_F) {
@@ -903,6 +1023,10 @@ int main(int argc, char **argv)
                      * holds it for its duration, and while paused it holds
                      * indefinitely, which is the frame-inspection case. */
                     double last = source_seek_ceiling(sources, n_sources);
+                    if (sound) {
+                        AudioInfo info; audio_info(audio, &info);
+                        last = fmax(last, info.duration - 0.5 / info.rate);
+                    }
                     if (last >= 0.0 && target > last) target = last;
                     for (int i = 0; i < n_sources; i++)
                         source_seek_to(&sources[i], target);
@@ -1157,6 +1281,17 @@ int main(int argc, char **argv)
         }
         if (quit) break;
 
+        AudioInfo audio_state = {0};
+        if (audio) {
+            audio_info(audio, &audio_state);
+            if (audio_state.failed) {
+                exit_status = 1;
+                if (sound) { LOG("AUDIO", "stopped: %s", audio_state.error); break; }
+            }
+            audio_transport(audio, clock_sec, paused,
+                            rebase && (!paused || fabs(clock_sec - audio_command_time) > 1e-9));
+            audio_command_time = clock_sec;
+        }
         if (!paused) {
             /* Advance the master clock from wall time. */
             double now = now_seconds();
@@ -1166,7 +1301,10 @@ int main(int argc, char **argv)
                 base_clock = clock_sec;
                 rebase = false;
             }
-            clock_sec = base_clock + (now - base_wall);
+            if (sound) {
+                double t = audio_clock(audio);
+                if (isfinite(t)) clock_sec = t;
+            } else clock_sec = base_clock + (now - base_wall);
 
             bool all_eof = true;
             bool any_still = false;
@@ -1183,6 +1321,7 @@ int main(int argc, char **argv)
                 else                         all_still = false;
             }
 
+            if (sound && (!audio_state.ready || clock_sec < audio_state.duration)) all_eof = false;
             if (all_eof) {
                 /* Every way of running out used to print "EOF", so a
                  * truncated file, an I/O error and a finished clip were
@@ -1202,17 +1341,19 @@ int main(int argc, char **argv)
                     clock_sec = 0.0;
                     rebase = true;
                     dirty = true;
+                    audio_transport(audio, 0, false, true);
                     continue;
                 }
-                if (any_still) {
+                if (any_still || audio_waveform) {
                     /* One-frame inputs are images in FFmpeg's video-shaped
                      * API. Hold the decoded frame and enter the existing
                      * paused event loop so scopes, zoom, probes and display
                      * controls remain fully interactive without spinning. */
                     paused = true;
                     rend.paused = true;
+                    audio_transport(audio, clock_sec, true, false);
                     dirty = true;
-                    LOG("DEC", "still image held; press Q/Esc to close");
+                    LOG("DEC", "final frame held for inspection; press Q/Esc to close");
                 } else {
                     quit = true;
                 }
@@ -1229,7 +1370,8 @@ int main(int argc, char **argv)
              * fps. Sleeping until the next frame is due keeps the loop
              * at roughly one iteration per source frame. */
             double next = source_peek_next_sec(&sources[REF]);
-            if (!isnan(next)) {
+            if (sound) SDL_Delay(5);
+            else if (!isnan(next)) {
                 double delay = (base_wall + (next - base_clock)) - now_seconds();
                 if (delay > 0.0 && delay < 1.0) {
                     struct timespec ts = {
@@ -1263,6 +1405,21 @@ int main(int argc, char **argv)
             SDL_Delay(16);
         }
 
+        if (audio_waveform) {
+            double now = now_seconds();
+            if (audio_state.revision != audio_revision || (!paused && now - audio_redraw >= 1.0 / 30)) {
+                dirty = true; audio_revision = audio_state.revision; audio_redraw = now;
+            }
+            rend.audio_view.clock = clock_sec;
+            if (rend.audio_view.follow) {
+                rend.audio_view.start = fmax(0, clock_sec - rend.audio_view.span * 0.35);
+                double extent = audio_state.duration;
+                for (int i = 0; i < n_sources; i++)
+                    extent = fmax(extent, sources[i].start_sec + sources[i].duration_sec);
+                if (audio_state.ready && extent > 0)
+                    rend.audio_view.start = fmin(rend.audio_view.start, fmax(0, extent - rend.audio_view.span));
+            }
+        }
         bool have_any = false;
         for (int i = 0; i < n_sources; i++) if (sources[i].shown) have_any = true;
 
@@ -1276,6 +1433,7 @@ int main(int argc, char **argv)
         } else if (!have_any) {
             SDL_Delay(16);
         }
+        tool_windows_draw(&tools, &rend);
     }
 
     /* Dump what accumulated over the session, per file. Printed on exit
@@ -1289,7 +1447,12 @@ int main(int argc, char **argv)
         analyze_print_session(&sources[i].session, &sources[i].dec, title);
     }
 
+    if (markers_path && !audio_markers_save(audio)) {
+        LOG("AUDIO", "could not save markers to %s", markers_path); exit_status = 1;
+    }
+    tool_windows_close(&tools);
+    audio_close(audio);
     renderer_close(&rend);
     for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
-    return 0;
+    return exit_status;
 }
