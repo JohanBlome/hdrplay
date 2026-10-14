@@ -24,6 +24,10 @@ typedef struct Decoder {
      * has made it meaningless. The position of record for elementary
      * streams, which have no timestamps to hold one. */
     int64_t          frame_index;
+    bool (*validate_frame)(void *opaque, int input, int64_t pts,
+                             int64_t duration, int64_t expected_ordinal);
+    void *validation_opaque;
+    int validation_input;
     AVPacket        *pkt;
     AVFrame         *frame;       /* software frame exposed to consumers */
     AVFrame         *hw_frame;    /* decoder-owned hardware surface       */

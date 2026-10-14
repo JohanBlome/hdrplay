@@ -1623,10 +1623,10 @@ static int build_audio_panel(Renderer *r, Source *sources, pl_gpu gpu,
     AudioInfo info;
     audio_info(r->audio, &info);
     int scale = w >= 1100 && h >= 240 ? 2 : 1;
-    int header = 34 * scale, footer = 34 * scale;
+    int header = 34 * scale, footer = 46 * scale;
     int ruler = header - 12 * scale;
     int lanes_height = h - header - footer;
-    if (lanes_height < info.channels * 4) { header = 30; footer = 24; lanes_height = h - header - footer; }
+    if (lanes_height < info.channels * 4) { header = 30; footer = 36; lanes_height = h - header - footer; }
     ensure_slot(SLOT_AUDIO, gpu, w, h);
     uint8_t *buf = make_panel(w, h, 255);
     float *low = malloc(w * sizeof(float)), *high = malloc(w * sizeof(float));
@@ -1651,20 +1651,25 @@ static int build_audio_panel(Renderer *r, Source *sources, pl_gpu gpu,
         for (int y = header; y < h - footer; y++)
             for (int x = x0; x < x1; x++) audio_pixel(buf, w, h, x, y, 18, 28, 45);
     }
-    double times[512]; int64_t ordinals[512];
-    int ng = audio_frame_grid(r->audio, focus, view->start, view->start + view->span,
-                              times, ordinals, 512);
-    int last_label = -100;
+    AudioGridTick ticks[512]; AudioGridLevel level;
+    int ng = audio_timeline_grid(r->audio, focus, view->start, view->span, w,
+                                  ticks, 512, &level);
+    int last_label = -1000;
     for (int i = 0; i < ng; i++) {
-        int x = (int)((times[i] - view->start) * w / view->span);
-        audio_line(buf, w, h, x, ruler, x, h - footer, 42, 52, 70);
-        if (x - last_label > 80 * scale) {
-            snprintf(text, sizeof(text), "F%lld %.3F", (long long)ordinals[i], times[i]);
-            draw_text_color(buf, w, h, x + 2, ruler, scale, text, 120, 135, 160);
-            last_label = x;
+        int x = (int)((ticks[i].time - view->start) * w / view->span);
+        uint8_t red = ticks[i].key ? 180 : 70;
+        uint8_t green = ticks[i].key ? 140 : 80;
+        uint8_t blue = ticks[i].key ? 65 : 95;
+        if (ticks[i].boundary) audio_line(buf, w, h, x, ruler, x, h - footer, red, green, blue);
+        int label_x = x < 0 ? 2 : x + 2;
+        if (label_x - last_label > 60 * scale) {
+            snprintf(text, sizeof(text), "F%lld", (long long)ticks[i].ordinal);
+            draw_text_color(buf, w, h, label_x, ruler, scale, text,
+                            ticks[i].key ? 220 : 150, ticks[i].key ? 180 : 160, ticks[i].key ? 85 : 175);
+            last_label = label_x;
         }
     }
-    if (!ng) draw_text_color(buf, w, h, 8, ruler, scale, "FRAME INDEX BUILDING - MARKERS USE EXACT PTS", 140, 150, 170);
+    if (!ng) draw_text_color(buf, w, h, 8, ruler, scale, "NO VIDEO DIVISION IN VIEW", 140, 150, 170);
     for (int c = 0; c < info.channels; c++) {
         int top = header + lanes_height * c / info.channels;
         int bottom = header + lanes_height * (c + 1) / info.channels;
@@ -1719,9 +1724,35 @@ static int build_audio_panel(Renderer *r, Source *sources, pl_gpu gpu,
     if (play_x >= 0 && play_x < w) audio_line(buf, w, h, play_x, ruler, play_x, h - footer, 245, 245, 245);
     int cursor_x = (int)((view->cursor - view->start) * w / view->span);
     if (cursor_x >= 0 && cursor_x < w) audio_line(buf, w, h, cursor_x, header, cursor_x, h - footer, 230, 110, 220);
-    draw_text_color(buf, w, h, 6, h - footer + 3, scale, "F1 HELP", 110, 205, 235);
-    draw_text_color(buf, w, h, 80 * scale, h - footer + 3, scale, "F3 MARKERS", 110, 205, 235);
-    draw_text_color(buf, w, h, 188 * scale, h - footer + 3, scale,
+    double time_step;
+    if (level == AUDIO_GRID_SECONDS_10) time_step = 10;
+    else if (level == AUDIO_GRID_SECONDS_30) time_step = 30;
+    else if (level == AUDIO_GRID_MINUTES)
+        time_step = 60 * fmax(1, ceil(view->span / (60 * fmax(2, w / (100.0 * scale)))));
+    else {
+        double desired = view->span * 100 * scale / w;
+        double power = pow(10, floor(log10(desired)));
+        double unit = desired / power;
+        time_step = (unit <= 1 ? 1 : unit <= 2 ? 2 : unit <= 5 ? 5 : 10) * power;
+    }
+    int time_y = h - footer;
+    audio_line(buf, w, h, 0, time_y, w - 1, time_y, 65, 75, 90);
+    int decimals = time_step < 1 ? (int)ceil(-log10(time_step)) : 0;
+    if (decimals > 6) decimals = 6;
+    int last_time_label = -1000;
+    for (double t = ceil(view->start / time_step) * time_step;
+         t <= view->start + view->span; t += time_step) {
+        int x = (int)((t - view->start) * w / view->span);
+        audio_line(buf, w, h, x, time_y, x, time_y + 3 * scale, 120, 135, 160);
+        if (x - last_time_label < 75 * scale) continue;
+        if (level == AUDIO_GRID_MINUTES) snprintf(text, sizeof(text), "%.0F MIN", t / 60);
+        else snprintf(text, sizeof(text), "%.*F S", decimals, t);
+        draw_text_color(buf, w, h, x + 2, time_y + 4 * scale, scale, text, 150, 160, 175);
+        last_time_label = x;
+    }
+    draw_text_color(buf, w, h, 6, h - footer + 16 * scale, scale, "F1 HELP", 110, 205, 235);
+    draw_text_color(buf, w, h, 80 * scale, h - footer + 16 * scale, scale, "F3 MARKERS", 110, 205, 235);
+    draw_text_color(buf, w, h, 188 * scale, h - footer + 16 * scale, scale,
                     view->logarithmic ? "F4 LOG" : "F4 LINEAR", 110, 205, 235);
     if (view->entry_mode) {
         snprintf(text, sizeof(text), "%s: %s", view->entry_mode == 1 ? "ABSOLUTE MEDIA SECONDS" : "MARKER LABEL", view->entry);

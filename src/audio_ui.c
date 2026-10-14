@@ -149,8 +149,8 @@ int audio_ui_event(Renderer *r, Source *sources, const SDL_Event *e,
         AudioInfo info; audio_info(r->audio, &info);
         int w = (int)(v->rect.x1 - v->rect.x0), h = (int)(v->rect.y1 - v->rect.y0);
         int scale = w >= 1100 && h >= 240 ? 2 : 1;
-        int header = 34 * scale, footer = 34 * scale;
-        if (h - header - footer < info.channels * 4) { header = 30; footer = 24; }
+        int header = 34 * scale, footer = 46 * scale;
+        if (h - header - footer < info.channels * 4) { header = 30; footer = 36; }
         int y = (int)(wy - v->rect.y0);
         v->cursor = time;
         if (y < header && e->button.button == SDL_BUTTON_LEFT) {

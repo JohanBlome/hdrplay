@@ -551,6 +551,9 @@ int decoder_next_frame(Decoder *d)
              * keeps them from disagreeing. */
             if (d->range_effective != AVCOL_RANGE_UNSPECIFIED)
                 d->frame->color_range = d->range_effective;
+            if (d->validate_frame && !d->validate_frame(d->validation_opaque,
+                    d->validation_input, d->frame->best_effort_timestamp,
+                    d->frame->duration, d->frame_index)) return -1;
             if (d->frame_index >= 0) d->frame_index++;
             return 1;
         }

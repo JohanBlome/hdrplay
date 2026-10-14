@@ -1,5 +1,6 @@
 #include "audio_internal.h"
 #include "media_time.h"
+#include "video_timeline.h"
 #include "log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -325,6 +326,7 @@ static bool index_frame(Audio *a, AudioInput *in, AVFrame *f, AVRational tb)
 {
     if (f->best_effort_timestamp == AV_NOPTS_VALUE) return false;
     AudioFrame x = { .pts = f->best_effort_timestamp,
+                    .key = (f->flags & AV_FRAME_FLAG_KEY) != 0,
                     .time = f->best_effort_timestamp * av_q2d(tb) - in->origin };
     x.end = x.time + f->duration * av_q2d(tb);
     SDL_LockMutex(a->mutex);
@@ -351,6 +353,7 @@ static int index_video(void *opaque)
     SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
     for (int i = 0; i < a->n_inputs && !cancelled(a); i++) {
         AudioInput *in = &a->inputs[i];
+        if (in->box_timeline) continue;
         AVFormatContext *fmt = avformat_alloc_context();
         AVCodecContext *cc = NULL;
         AVPacket *p = av_packet_alloc();
@@ -545,6 +548,36 @@ Audio *audio_open(const char *const *paths, int n, int input, int track,
                 }
             }
         }
+        if (in->stream >= 0) {
+            VideoSample *samples = NULL; int count = 0; char error[160];
+            AVStream *video = probe->streams[in->stream];
+            int result = video_timeline_read(in->path, video->id, video->time_base,
+                                              &samples, &count, error, sizeof(error));
+            if (result < 0) {
+                LOG("AUDIO", "%s: %s", in->path, error);
+                avformat_close_input(&probe); goto error;
+            }
+            if (result > 0) {
+                in->frames = calloc(count, sizeof(*in->frames));
+                in->key_indices = malloc(count * sizeof(*in->key_indices));
+                if (!in->frames || !in->key_indices) {
+                    free(samples); avformat_close_input(&probe); goto error;
+                }
+                in->box_timeline = true; in->n_frames = in->cap_frames = count;
+                double tb = av_q2d(video->time_base);
+                for (int j = 0; j < count; j++) {
+                    in->frames[j] = (AudioFrame){ .pts = samples[j].pts,
+                        .duration = samples[j].duration, .key = samples[j].key,
+                        .time = samples[j].pts * tb - in->origin,
+                        .end = (samples[j].pts + samples[j].duration) * tb - in->origin };
+                    if (j) in->frames[j - 1].end = in->frames[j].time;
+                    if (samples[j].key) in->key_indices[in->n_keys++] = j;
+                }
+                free(samples);
+                LOG("AUDIO", "input %d: MOV/MP4 sample tables ready (%d frames, %d keyframes; no video decode)",
+                    i, count, in->n_keys);
+            }
+        }
         avformat_close_input(&probe);
     }
     a->fmt = avformat_alloc_context();
@@ -620,7 +653,7 @@ void audio_close(Audio *a)
     if (a->output) SDL_DestroyAudioStream(a->output);
     swr_free(&a->swr); avcodec_free_context(&a->cc); avformat_close_input(&a->fmt);
     if (a->cache) fclose(a->cache);
-    for (int i = 0; i < a->n_inputs; i++) { free(a->inputs[i].path); free(a->inputs[i].frames); }
+    for (int i = 0; i < a->n_inputs; i++) { free(a->inputs[i].path); free(a->inputs[i].frames); free(a->inputs[i].key_indices); }
     for (int i = 0; i < AUDIO_PEAK_LEVELS; i++) free(a->peaks[i].p);
     free(a->blocks); free(a->markers_path);
     if (a->changed) SDL_DestroyCondition(a->changed);
@@ -635,6 +668,7 @@ void audio_info(Audio *a, AudioInfo *info)
     SDL_LockMutex(a->mutex);
     *info = (AudioInfo){ .rate = a->rate, .channels = a->channels,
         .ready = a->finished, .failed = a->failed || a->output_failed,
+        .timeline_mismatch = a->timeline_mismatch,
         .buffering = a->buffering, .playing = a->sound && !a->paused,
         .duration = a->duration, .latency = a->latency,
         .timing_inferred = a->timing_inferred, .timestamp_uncertainty = a->timestamp_uncertainty,
@@ -923,6 +957,121 @@ int audio_frame_grid(Audio *a, int input, double start, double end,
     if (stride < 1) stride = 1;
     for (int i = lo; i < last && n < cap; i += stride) {
         times[n] = in->frames[i].time; ordinals[n++] = i;
+    }
+    SDL_UnlockMutex(a->mutex);
+    return n;
+}
+
+bool audio_validate_frame(void *opaque, int input, int64_t pts,
+                            int64_t duration, int64_t expected_ordinal)
+{
+    Audio *a = opaque;
+    if (!a || input < 0 || input >= a->n_inputs) return true;
+    SDL_LockMutex(a->mutex);
+    AudioInput *in = &a->inputs[input];
+    if (!in->box_timeline) { SDL_UnlockMutex(a->mutex); return true; }
+    int lo = 0, hi = in->n_frames;
+    while (lo < hi) { int m = lo + (hi - lo) / 2; if (in->frames[m].pts < pts) lo = m + 1; else hi = m; }
+    bool ok = lo < in->n_frames && in->frames[lo].pts == pts &&
+              (duration <= 0 || duration == in->frames[lo].duration) &&
+              (expected_ordinal < 0 || expected_ordinal == lo);
+    if (!ok) {
+        snprintf(a->error, sizeof(a->error),
+                 "input %d: decoded frame PTS %lld/duration %lld/ordinal %lld disagrees with MOV/MP4 sample tables",
+                 input, (long long)pts, (long long)duration, (long long)expected_ordinal);
+        a->timeline_mismatch = a->failed = true; a->revision++;
+        SDL_BroadcastCondition(a->changed);
+    } else if (expected_ordinal == in->n_frames - 1) {
+        in->complete = true;
+        file_audit_locked(a);
+    }
+    char error[160]; snprintf(error, sizeof(error), "%s", a->error);
+    SDL_UnlockMutex(a->mutex);
+    if (!ok) LOG("AUDIO", "%s", error);
+    return ok;
+}
+
+static int frame_time_bound(const AudioInput *in, double time, bool upper)
+{
+    int lo = 0, hi = in->n_frames;
+    while (lo < hi) {
+        int m = lo + (hi - lo) / 2;
+        if (in->frames[m].time < time || (upper && in->frames[m].time == time)) lo = m + 1;
+        else hi = m;
+    }
+    return lo;
+}
+
+int audio_timeline_grid(Audio *a, int input, double start, double span, int width,
+                         AudioGridTick *ticks, int cap, AudioGridLevel *level)
+{
+    *level = AUDIO_GRID_FRAMES;
+    if (!a || input < 0 || input >= a->n_inputs || cap <= 0 || !ticks || width <= 0 ||
+        !isfinite(start) || !isfinite(span) || span <= 0 || !isfinite(start + span)) return 0;
+    double end = start + span;
+    int scale = width >= 1100 ? 2 : 1;
+    /* Choose readable time divisions for broad views. At very large spans,
+     * minute ticks can be skipped, while the unit remains minutes. */
+    if (span >= 20) {
+        double interval = 10, slots = fmax(2, width / (100.0 * scale));
+        *level = AUDIO_GRID_SECONDS_10;
+        if (span / interval > slots) { interval = 30; *level = AUDIO_GRID_SECONDS_30; }
+        if (span / interval > slots) {
+            interval = 60 * fmax(1, ceil(span / (60 * slots)));
+            *level = AUDIO_GRID_MINUTES;
+        }
+        int n = 0;
+        double first = ceil(start / interval) * interval;
+        SDL_LockMutex(a->mutex);
+        AudioInput *in = &a->inputs[input];
+        for (double time = first; time <= end && n < cap; time += interval) {
+            int j = frame_time_bound(in, time, true) - 1;
+            if (j < 0 || in->frames[j].end <= time) continue;
+            AudioFrame f = in->frames[j];
+            ticks[n++] = (AudioGridTick){.time = f.time, .end = f.end,
+                .ordinal = j, .boundary = f.time >= start, .key = f.key};
+        }
+        SDL_UnlockMutex(a->mutex);
+        return n;
+    }
+    SDL_LockMutex(a->mutex);
+    AudioInput *in = &a->inputs[input];
+    int lo = frame_time_bound(in, start, false), hi = frame_time_bound(in, end, true);
+    int enclosing = lo;
+    if (enclosing > 0 && (enclosing == in->n_frames || in->frames[enclosing].time > start)) enclosing--;
+    int visible = hi - enclosing;
+    bool frames = visible <= width / (12 * scale);
+    *level = frames ? AUDIO_GRID_FRAMES : AUDIO_GRID_KEYS;
+    int n = 0;
+    if (frames) {
+        for (int j = enclosing; j < hi && n < cap; j++) {
+            AudioFrame f = in->frames[j];
+            if (f.end <= start) continue;
+            ticks[n++] = (AudioGridTick){.time = f.time, .end = f.end, .ordinal = j, .boundary = f.time >= start, .key = f.key};
+        }
+    } else if (in->box_timeline) {
+        int left = 0, right = in->n_keys;
+        while (left < right) {
+            int m = left + (right - left) / 2;
+            if (in->frames[in->key_indices[m]].time < start) left = m + 1;
+            else right = m;
+        }
+        double previous = -INFINITY, spacing = span * 16 * scale / width;
+        for (int k = left; k < in->n_keys && n < cap; k++) {
+            int j = in->key_indices[k]; AudioFrame f = in->frames[j];
+            if (f.time > end) break;
+            if (f.time - previous < spacing) continue;
+            ticks[n++] = (AudioGridTick){.time = f.time, .end = f.end, .ordinal = j, .boundary = true, .key = f.key};
+            previous = f.time;
+        }
+    } else {
+        double previous = -INFINITY, spacing = span * 16 * scale / width;
+        for (int j = lo; j < hi && n < cap; j++) {
+            AudioFrame f = in->frames[j];
+            if (!f.key || f.time - previous < spacing) continue;
+            ticks[n++] = (AudioGridTick){.time = f.time, .end = f.end, .ordinal = j, .boundary = true, .key = f.key};
+            previous = f.time;
+        }
     }
     SDL_UnlockMutex(a->mutex);
     return n;

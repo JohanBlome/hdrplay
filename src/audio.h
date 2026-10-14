@@ -41,6 +41,7 @@ typedef struct {
 typedef struct {
     int rate, channels, transients, markers;
     bool ready, failed, buffering, playing;
+    bool timeline_mismatch;
     bool timing_inferred;
     double timestamp_uncertainty;
     int64_t decoded_samples, priming_samples, padding_samples;
@@ -81,6 +82,18 @@ void audio_envelope(Audio *a, double start, double span, int width, int channel,
 int audio_frame_grid(Audio *a, int input, double start, double end,
                       double *times, int64_t *ordinals, int cap);
 int64_t audio_frame_ordinal(Audio *a, int input, int64_t pts);
+/* Decoder callback: MOV/MP4 samples must agree with normal playback. */
+bool audio_validate_frame(void *opaque, int input, int64_t pts,
+                            int64_t duration, int64_t expected_ordinal);
+typedef enum {
+    AUDIO_GRID_FRAMES, AUDIO_GRID_KEYS, AUDIO_GRID_SECONDS_10,
+    AUDIO_GRID_SECONDS_30, AUDIO_GRID_MINUTES
+} AudioGridLevel;
+typedef struct { double time, end; int64_t ordinal; bool boundary, key; } AudioGridTick;
+/* Divisions adapt to span and available pixels. Includes the enclosing frame
+ * when a detailed view begins between frame boundaries. */
+int audio_timeline_grid(Audio *a, int input, double start, double span, int width,
+                         AudioGridTick *ticks, int cap, AudioGridLevel *level);
 double audio_input_origin(Audio *a, int input);
 
 #endif

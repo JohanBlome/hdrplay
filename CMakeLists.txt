@@ -44,6 +44,7 @@ add_executable(hdrplay
     src/source.c
     src/ambient.c
     src/audio.c
+    src/video_timeline.c
     src/audio_markers.c
     src/audio_ui.c
     src/tool_windows.c
@@ -168,7 +169,7 @@ endif()
 add_test(NAME transient COMMAND test_transient)
 
 add_executable(test_audio EXCLUDE_FROM_ALL
-    tests/test_audio.c src/audio.c src/audio_markers.c src/transient.c)
+    tests/test_audio.c src/audio.c src/video_timeline.c src/audio_markers.c src/transient.c)
 target_include_directories(test_audio PRIVATE src)
 target_link_libraries(test_audio PRIVATE PkgConfig::AVFORMAT PkgConfig::AVCODEC
     PkgConfig::AVUTIL PkgConfig::SWRESAMPLE PkgConfig::SDL3)
@@ -176,6 +177,14 @@ if(NOT APPLE)
     target_link_libraries(test_audio PRIVATE m)
 endif()
 add_test(NAME audio COMMAND test_audio)
+add_executable(test_timeline EXCLUDE_FROM_ALL tests/test_timeline.c
+    src/audio.c src/video_timeline.c src/audio_markers.c src/transient.c src/decoder.c src/probe.c)
+target_include_directories(test_timeline PRIVATE src)
+target_link_libraries(test_timeline PRIVATE PkgConfig::AVFORMAT PkgConfig::AVCODEC
+    PkgConfig::AVUTIL PkgConfig::SWRESAMPLE PkgConfig::SDL3)
+if(NOT APPLE)
+    target_link_libraries(test_timeline PRIVATE m)
+endif()
 get_target_property(HDRPLAY_TEST_CORE_SOURCES hdrplay SOURCES)
 list(REMOVE_ITEM HDRPLAY_TEST_CORE_SOURCES src/main.c)
 get_target_property(HDRPLAY_TEST_CORE_LIBS hdrplay LINK_LIBRARIES)
@@ -185,16 +194,23 @@ target_link_libraries(test_audio_ui PRIVATE ${HDRPLAY_TEST_CORE_LIBS})
 add_test(NAME audio_ui COMMAND test_audio_ui)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 find_program(HDRPLAY_FFMPEG ffmpeg)
+find_program(HDRPLAY_FFPROBE ffprobe)
 if(Python3_FOUND AND HDRPLAY_FFMPEG)
     add_test(NAME audio_fixture COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_audio_fixture.py
         $<TARGET_FILE:test_audio> ${HDRPLAY_FFMPEG})
 endif()
 
+if(Python3_FOUND AND HDRPLAY_FFMPEG AND HDRPLAY_FFPROBE)
+    add_test(NAME timeline_fixture COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_timeline_fixture.py
+        $<TARGET_FILE:test_timeline> ${HDRPLAY_FFMPEG} ${HDRPLAY_FFPROBE})
+endif()
+
 # ctest won't build EXCLUDE_FROM_ALL targets on its own.
 add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_stats test_layout test_source test_ambient test_transient test_audio test_audio_ui)
+    DEPENDS test_stats test_layout test_source test_ambient test_transient test_audio test_audio_ui test_timeline)
 
 # `cmake --install build --prefix ~` puts hdrplay on your PATH along
 # with the MoltenVK ICD + dylib it needs, so the installed copy is

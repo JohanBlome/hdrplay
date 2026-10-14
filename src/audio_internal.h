@@ -25,7 +25,7 @@ typedef struct {
     float low[AUDIO_MAX_CHANNELS], high[AUDIO_MAX_CHANNELS];
 } AudioPeak;
 typedef struct { AudioPeak *p; int n, cap; } AudioPeaks;
-typedef struct { double time, end; int64_t pts; } AudioFrame;
+typedef struct { double time, end; int64_t pts, duration; bool key; } AudioFrame;
 typedef struct {
     char *path;
     struct stat identity;
@@ -35,6 +35,8 @@ typedef struct {
     bool complete, failed;
     double declared_file_duration, declared_file_end;
     bool file_end_known, other_tracks;
+    bool box_timeline;
+    int *key_indices, n_keys;
 } AudioInput;
 struct Audio {
     SDL_Mutex *mutex;
@@ -57,6 +59,7 @@ struct Audio {
     char *markers_path;
     bool detect, finished, failed, sound, paused, buffering, started, muted;
     bool output_failed;
+    bool timeline_mismatch;
     bool timing_inferred;
     double timestamp_uncertainty, jitter_window;
     int64_t priming_samples, padding_samples;

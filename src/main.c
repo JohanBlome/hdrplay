@@ -839,6 +839,11 @@ int main(int argc, char **argv)
             for (int i = 0; i < n_sources; i++) source_close(&sources[i]);
             return 1;
         }
+        for (int i = 0; i < n_sources; i++) {
+            sources[i].dec.validate_frame = audio_validate_frame;
+            sources[i].dec.validation_opaque = audio;
+            sources[i].dec.validation_input = i;
+        }
         for (int i = 0; i < n_time_markers; i++) audio_marker_time(audio, time_markers[i]);
     }
     Renderer rend;
@@ -1544,6 +1549,10 @@ int main(int argc, char **argv)
                               &sources[i].input_transform, title);
     }
 
+    if (audio) {
+        AudioInfo info; audio_info(audio, &info);
+        if (info.timeline_mismatch) exit_status = 1;
+    }
     if (markers_path && !audio_markers_save(audio)) {
         LOG("AUDIO", "could not save markers to %s", markers_path); exit_status = 1;
     }

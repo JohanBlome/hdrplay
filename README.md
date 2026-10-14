@@ -190,12 +190,21 @@ the waveform and automatically marks clear impulse onsets. `--audio-source
 N:a:M` selects audio track M in input N, both zero-based; the default is `0:a:0`.
 Pane swaps and solo controls do not change the selected audio source.
 
-The strip draws channels separately, with actual video PTS boundaries, verified
-frame ordinals as the background index becomes available, and a highlighted
-interval for the displayed frame. An unverified HUD frame number is labeled
-`APPROX`. Wheel zoom reaches individual source samples; coarse views use
-min/max peaks so short impulses remain visible. Audio and video share a media
-timeline origin, preserving any initial A/V offset.
+The strip draws channels separately, with frame numbers above and a time ruler
+below. Divisions adapt to zoom and available width: minutes, 30 seconds,
+10 seconds, keyframes, then individual frames. Keyframes are amber; other
+frames are gray. A view entirely inside one frame still shows its frame number.
+
+MOV/MP4 frame timestamps come directly from the sample tables, without decoding
+video pixels or reading media payloads. Normal playback checks decoded
+timestamps, durations, and frame order against those tables and stops on a
+mismatch. Fragmented files and complex edit lists are currently rejected.
+Other containers build their frame index in the background; an unverified HUD
+frame number is labeled `APPROX`.
+
+Wheel zoom reaches individual source samples; coarse views use min/max peaks
+so short impulses remain visible. Audio and video share a media timeline
+origin, preserving any initial A/V offset.
 
 | Control | Action |
 | --- | --- |
