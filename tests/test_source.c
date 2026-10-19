@@ -340,7 +340,83 @@ static void test_sync_rule(void)
     CHECK(frame_in_effect(a, 64, -1.0) == -1, "before the start, no frame");
 }
 
-int main(void)
+static void test_frame_offset_units(void)
+{
+    puts("source: frame offsets use the selected input's frame rate");
+    Source a = {.fps = 25}, b = {.fps = 30};
+    CHECK(source_set_frame_offset(&a, 5) && source_set_frame_offset(&b, 5) &&
+          NEAR(a.offset_sec, 0.2, 1e-9) && NEAR(b.offset_sec, 1.0 / 6, 1e-9),
+          "five frames represent different times at 25 and 30 fps");
+    a.fps = 30000.0 / 1001;
+    CHECK(source_set_frame_offset(&a, -3) && NEAR(a.offset_sec, -0.1001, 1e-9),
+          "negative frame offsets preserve fractional frame rates");
+    CHECK(!source_set_frame_offset(&a, 0.5), "fractional frame counts are rejected");
+    Source unknown = {0};
+    CHECK(!source_set_frame_offset(&unknown, 5), "unknown frame rate is rejected");
+}
+
+/* A five-second, 10fps fixture exercises actual decoder seeks, including
+ * the path beyond the retained ring and both ends of an offset input. */
+static void test_offset_playback(const char *path, int ring_cap)
+{
+    puts("source: offsets survive decode, seek, stepping, restart and EOF");
+    Source s[2];
+    HdrplayInputTransform transform = {0};
+    for (int i = 0; i < 2; i++) {
+        bool opened = source_open(&s[i], path, ring_cap, &transform);
+        CHECK(opened, "open comparison input %d", i);
+        if (!opened) {
+            for (int j = 0; j < i; j++) source_close(&s[j]);
+            return;
+        }
+    }
+    CHECK(source_set_frame_offset(&s[1], 5), "set five-frame offset from decoded input rate");
+    for (int i = 0; i < 2; i++)
+        CHECK(source_seek_to(&s[i], source_media_time(&s[i], 0)), "initial seek %d", i);
+    CHECK(NEAR(source_shown_sec(&s[0]), 0, 1e-6) &&
+          NEAR(source_shown_sec(&s[1]), 0.5, 1e-6), "positive offset starts on frame five");
+
+    for (int i = 0; i < 2; i++) source_advance_to(&s[i], source_media_time(&s[i], 2));
+    CHECK(NEAR(source_shown_sec(&s[1]) - source_shown_sec(&s[0]), 0.5, 1e-6),
+          "playback preserves the half-second difference");
+    double clock = source_clock_time(&s[1], source_step_back(&s[1]));
+    source_advance_to(&s[0], source_media_time(&s[0], clock));
+    CHECK(NEAR(clock, 1.9, 1e-6) && NEAR(source_shown_sec(&s[0]), 1.9, 1e-6),
+          "step back: clock %.6f, A %.6f, B %.6f (ring %d)",
+          clock, source_shown_sec(&s[0]), source_shown_sec(&s[1]), ring_cap);
+    clock = source_clock_time(&s[1], source_step_forward(&s[1]));
+    source_advance_to(&s[0], source_media_time(&s[0], clock));
+    CHECK(NEAR(clock, 2, 1e-6) && NEAR(source_shown_sec(&s[0]), 2, 1e-6),
+          "step forward: clock %.6f, A %.6f, B %.6f (ring %d)",
+          clock, source_shown_sec(&s[0]), source_shown_sec(&s[1]), ring_cap);
+    for (int i = 0; i < 2; i++) source_seek_to(&s[i], source_media_time(&s[i], 0));
+    CHECK(NEAR(source_shown_sec(&s[1]), 0.5, 1e-6), "restart and loop retain the offset");
+    source_advance_to(&s[1], source_media_time(&s[1], 2));
+    source_advance_to(&s[1], source_media_time(&s[1], 0.1));
+    CHECK(NEAR(source_shown_sec(&s[1]), 0.6, 1e-6), "backward alignment outside the ring seeks correctly");
+
+    source_seek_to(&s[1], source_media_time(&s[1], 10));
+    CHECK(NEAR(source_shown_sec(&s[1]), 4.9, 1e-6), "seeking past the end holds the final frame");
+    source_advance_to(&s[1], source_media_time(&s[1], 4.5));
+    CHECK(source_finished(&s[1], source_media_time(&s[1], 4.5)), "positive offset finishes half a second earlier");
+
+    CHECK(source_set_frame_offset(&s[1], -5), "set negative five-frame offset");
+    source_seek_to(&s[1], source_media_time(&s[1], 0));
+    source_advance_to(&s[1], source_media_time(&s[1], 0.4));
+    CHECK(NEAR(source_shown_sec(&s[1]), 0, 1e-6), "negative offset holds the first frame");
+    source_advance_to(&s[1], source_media_time(&s[1], 0.6));
+    CHECK(NEAR(source_shown_sec(&s[1]), 0.1, 1e-6), "delayed input advances when its timeline starts");
+    CHECK(NEAR(source_seek_ceiling(s, 2), 5.45, 1e-6), "seek ceiling includes the delayed input's end");
+    source_advance_to(&s[1], source_media_time(&s[1], 5.4));
+    CHECK(!source_finished(&s[1], source_media_time(&s[1], 5.4)), "delayed last frame gets its full duration");
+    CHECK(source_finished(&s[1], source_media_time(&s[1], 5.5)), "negative offset finishes half a second later");
+    s[1].offset_sec = 10;
+    source_seek_to(&s[1], source_media_time(&s[1], 0));
+    CHECK(NEAR(source_shown_sec(&s[1]), 4.9, 1e-6), "an offset beyond duration shows the last frame");
+    for (int i = 0; i < 2; i++) source_close(&s[i]);
+}
+
+int main(int argc, char **argv)
 {
     test_ring_basics();
     test_ring_step_roundtrip();
@@ -354,6 +430,11 @@ int main(void)
     test_ambient_viewing_metadata();
 #endif
     test_sync_rule();
+    test_frame_offset_units();
+    if (argc > 1) {
+        test_offset_playback(argv[1], 3);
+        test_offset_playback(argv[1], 0);
+    }
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;

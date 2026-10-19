@@ -196,6 +196,9 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 find_program(HDRPLAY_FFMPEG ffmpeg)
 find_program(HDRPLAY_FFPROBE ffprobe)
 if(Python3_FOUND AND HDRPLAY_FFMPEG)
+    add_test(NAME offset_fixture COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_offset_fixture.py
+        $<TARGET_FILE:test_source> $<TARGET_FILE:hdrplay> ${HDRPLAY_FFMPEG})
     add_test(NAME audio_fixture COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_audio_fixture.py
         $<TARGET_FILE:test_audio> ${HDRPLAY_FFMPEG})
@@ -210,7 +213,7 @@ endif()
 # ctest won't build EXCLUDE_FROM_ALL targets on its own.
 add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_stats test_layout test_source test_ambient test_transient test_audio test_audio_ui test_timeline)
+    DEPENDS hdrplay test_stats test_layout test_source test_ambient test_transient test_audio test_audio_ui test_timeline)
 
 # `cmake --install build --prefix ~` puts hdrplay on your PATH along
 # with the MoltenVK ICD + dylib it needs, so the installed copy is

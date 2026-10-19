@@ -53,6 +53,7 @@ typedef struct Source {
     double   start_sec;        /* stream timeline origin               */
     double   timeline_origin;  /* shared container origin, all streams */
     double   duration_sec;     /* <= 0 when unknown                    */
+    double   offset_sec;       /* video media time = clock + offset    */
     HdrplayInputTransform input_transform; /* source-specific color override */
 
     struct AVFrame *shown;     /* frame currently on screen (owned)    */
@@ -80,6 +81,15 @@ bool source_open(Source *s, const char *path, int ring_cap,
                  const HdrplayInputTransform *transform);
 void source_close(Source *s);
 
+/* Playback clock <-> original video media time. Before an offset input
+ * starts, hold its first frame. Frame timestamps and audio markers retain
+ * their original media times; only playback uses these conversions. */
+double source_media_time(const Source *s, double clock);
+double source_clock_time(const Source *s, double media);
+/* Convert whole frames to a fixed time offset using this input's nominal
+ * frame rate. Returns false for an unknown rate or an invalid duration. */
+bool source_set_frame_offset(Source *s, double frames);
+
 /* Present-time of the frame currently shown, or NAN. */
 double source_shown_sec(const Source *s);
 /* Present-time of the next undisplayed frame, decoding one if needed.
@@ -95,8 +105,9 @@ double source_peek_next_sec(Source *s);
  * it into an exit. */
 bool source_finished(const Source *s, double t);
 
-/* Highest clock time a seek may land on across `n` sources: inside the
- * last frame of the longest one. Negative when nothing declares a usable
+/* Highest playback clock time a seek may land on across `n` sources,
+ * accounting for video offsets: inside the last frame of the longest one.
+ * Negative when nothing declares a usable
  * duration, meaning the caller must not clamp — an unclamped seek past
  * the end is recoverable, but clamping to a guess is not.
  *

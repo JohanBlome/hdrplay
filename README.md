@@ -327,6 +327,10 @@ and play normally.
 
 ### Runtime controls
 
+`hdrplay -h` (or `--help`) lists options and shortcuts grouped by area.
+Press `F1` for the same groups in a scrollable window with section dividers.
+Each section names the window or area where its shortcuts apply.
+
 | Key | Action |
 |---|---|
 | `F1` / `F3` | open keyboard help / timing marker window |
@@ -482,6 +486,40 @@ instead of going black.
 Soloing with `1` or `2` only changes what is rendered. Both sources keep
 following the same master clock during playback, seeking and frame stepping,
 so returning to comparison with `0` or `P` cannot reveal a stale hidden source.
+
+`--offset [N:]TIME` shifts a video's time relative to the playback clock.
+A bare value applies to every input, as with `--rotate`; `0:` or `1:` selects
+an input explicitly. For example, `--offset 5f` shifts all inputs five frames,
+while `--offset 1:5f` shifts only the second input.
+The option is repeatable, with the last value for each input taking effect.
+Positive values show later frames, and negative values delay the video, holding
+its first frame until its timeline starts. At the end, its last frame is held
+while the other input continues. Seeking, stepping, restart, looping and `D`
+difference mode preserve the offsets. Bare numbers are seconds and may be
+fractional; append `s` for explicit seconds or `f` for a whole number of frames.
+
+Compare the same video against itself five frames later:
+
+```sh
+hdrplay --offset 1:5f video.mov video.mov
+```
+
+`--offset 1:-5f` delays the second input by five frames. Frame offsets use the
+selected input's nominal frame rate, so five frames at 25 fps is 0.2 seconds.
+A known frame rate is required. For variable frame rate video, this remains a
+fixed time shift based on the nominal rate rather than an exact frame-index shift.
+
+Compare the same video against itself half a second later:
+
+```sh
+hdrplay --offset 1:0.5 video.mov video.mov
+```
+
+Press `D` to see the pixel difference. At playback time 2 seconds, the two
+inputs show frames at 2 and 2.5 seconds. `--offset 1:-0.5` instead delays the
+second video by half a second; `--offset 0:5` can also skip the first five
+seconds of a single input. Audio playback, waveform rulers and timing markers
+retain their original media times; these offsets affect video playback only.
 
 With two files the default split becomes the **layout**, so `H`/`S` apply to
 both panes and you compare A-vs-B under HDR, then A-vs-B under SDR. The

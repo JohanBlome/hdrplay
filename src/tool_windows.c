@@ -1,4 +1,5 @@
 #include "tool_windows.h"
+#include "key_help.h"
 #include "log.h"
 #include <math.h>
 #include <stdio.h>
@@ -17,7 +18,7 @@ static void fill(ToolPanel *p, float x, float y, float w, float h)
     SDL_FRect rect = { x / FONT, y / FONT, w / FONT, h / FONT };
     SDL_RenderFillRect(p->canvas, &rect);
 }
-static int wrap(ToolPanel *p, int width, int x, int y, const char *s)
+static int wrap_text(ToolPanel *p, int width, int x, int y, const char *s, bool draw)
 {
     int chars = (width - x - 24) / (8 * FONT);
     if (chars < 1) return y;
@@ -31,11 +32,14 @@ static int wrap(ToolPanel *p, int width, int x, int y, const char *s)
         char line[256];
         if (n > 255) n = 255;
         memcpy(line, s, n); line[n] = 0;
-        text(p, x, y, line); y += LINE; s += n;
+        if (draw) text(p, x, y, line);
+        y += LINE; s += n;
         while (*s == ' ') s++;
     }
     return y;
 }
+static int wrap(ToolPanel *p, int width, int x, int y, const char *s)
+{ return wrap_text(p, width, x, y, s, true); }
 bool tool_windows_toggle(ToolWindows *tools, int kind)
 {
     if (kind < 0 || kind >= TOOL_COUNT) return false;
@@ -57,79 +61,45 @@ bool tool_windows_toggle(ToolWindows *tools, int kind)
     p->visible = p->dirty = true;
     return true;
 }
-typedef struct { const char *key, *action; } HelpRow;
-static void help(ToolPanel *p, Renderer *r, int w, int h)
+static void help(ToolPanel *p, int w, int h)
 {
-    const HelpRow rows[] = {
-        {NULL, "WINDOWS"},
-        {"F1", "Open / close keyboard help"},
-        {"F3", "Open / close timing markers"},
-        {"Esc / close", "Close this tool window; keep video open"},
-        {"Wheel / PgUp / PgDn", "Scroll this window"},
-        {NULL, "PLAYBACK (in the video window)"},
-        {"Space", "Pause / resume"}, {"Comma / period", "Step backward / forward one frame; pause"},
-        {"Left / Right", "Seek backward / forward 10 seconds"},
-        {"L / R", "Toggle loop / restart from beginning"},
-        {"Q / Esc", "Quit (in video window)"},
-        {NULL, "VIDEO AND COMPARISON"},
-        {"F", "Toggle fullscreen"}, {"H / S", "Select HDR / SDR"},
-        {"P", "HDR/SDR split, or compare two inputs"},
-        {"O", "Cycle pane layouts and comparison wipes"},
-        {"D", "Toggle current/previous or A/B difference"},
-        {"0 / 1 / 2", "Compare both / solo first / solo second input"},
-        {"X", "Swap comparison sides"}, {"T", "Rotate focused pane 90 degrees clockwise"},
-        {"Z", "Toggle fit / 1:1 source pixels"}, {"+ / -", "Zoom in / out"},
-        {"Drag / Shift-arrows", "Pan while zoomed"}, {"W", "Resize video window for exact 1:1"},
-        {NULL, "VIDEO INSPECTION"},
-        {r->audio_visible ? "Shift-C" : "C", "Cycle color / Y / Cb / Cr / legal / clip / plateau"},
-        {"V", "Cycle waveform / gamut / vector / histogram scopes"},
-        {"Shift-drag", "Select scope source area; Shift-click clears it"},
-        {r->audio_visible ? "Shift-G" : "G", "Toggle vectorscope trace gain 1x / 2x"},
-        {"M", "Toggle mouse luminance probe"}, {"I", "Show / hide status HUD"},
-        {"A / Shift-A", "Show / hide accumulated stats / reset stats"},
-        {NULL, "AUDIO WAVEFORM (requires --audio-waveform)"},
-        {"F4 / scale link", "Toggle linear / log amplitude; original samples retained"},
-        {"Wheel", "Zoom time around pointer, down to source samples"},
-        {"Drag / Shift-wheel", "Pan waveform"}, {"Shift-H / Home", "Restore waveform follow"},
-        {"Ruler click", "Seek and pause"}, {"U", "Mute / unmute; retain audio clock"},
-        {"B", "Mark displayed video frame; make it the reference"},
-        {"C / right-click", "Mark source sample at cursor / clicked time"},
-        {"Shift-click", "Add audio sample marker"},
-        {"Marker click", "Select audio marker; video marker becomes reference"},
-        {"Ctrl-click marker", "Use any marker as reference"},
-        {"[ / ]", "Previous / next detected transient; seek and pause"},
-        {"Enter", "Accept selected marker"}, {"Shift-Enter", "Adjust selected marker to cursor sample"},
-        {"Delete / Backspace", "Dismiss selected marker"},
-        {"G", "Enter absolute media time; Enter confirms, Esc cancels"},
-        {"F2", "Label selected marker in video window"},
-        {"Ctrl-S / Cmd-S", "Save --markers FILE"},
-        {NULL, "TIMING MARKERS WINDOW"},
-        {"Click row", "Select marker; video rows also set the reference"},
-        {"Ctrl / Cmd-click", "Make any row the reference"},
-        {"Double-click / J", "Seek and pause at selected marker"},
-        {"Up / Down", "Select previous / next row"}, {"A", "Make selected row the reference"},
-        {"Enter / Delete", "Accept / dismiss selected row"},
-        {"Ctrl-S / Cmd-S", "Save --markers FILE"},
-    };
     color(p, 233, 240, 250); text(p, 24, 20, "Keyboard help");
-    color(p, 160, 180, 200); text(p, 24, 52, "Video and audio controls. Scroll for all sections.");
-    SDL_Rect clip = {0, 80 / FONT, w / FONT, (h - 116) / FONT};
+    color(p, 160, 180, 200);
+    wrap(p, w, 24, 52, "Controls are grouped by area. Focus that window to use its keys.");
+    SDL_Rect clip = {0, 112 / FONT, w / FONT, (h - 148) / FONT};
     SDL_SetRenderClipRect(p->canvas, &clip);
-    int y = 92 - p->scroll;
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
-        if (!rows[i].key) {
-            y += 12; color(p, 90, 205, 210); text(p, 24, y, rows[i].action); y += 34;
+    int y = 124 - p->scroll;
+    int row = 0;
+    for (size_t i = 0; i < HDRPLAY_KEY_HELP_COUNT; i++) {
+        const HdrplayHelpRow *entry = &hdrplay_key_help[i];
+        if (!entry->key) {
+            y += 16;
+            int bottom = wrap_text(p, w, 28, y + 36, entry->scope, false) + 10;
+            color(p, 45, 90, 110); fill(p, 16, y, w - 32, 2);
+            color(p, 20, 36, 48); fill(p, 16, y + 2, w - 32, bottom - y - 2);
+            color(p, 100, 220, 225); text(p, 28, y + 10, entry->action);
+            color(p, 160, 185, 205); wrap(p, w, 28, y + 36, entry->scope);
+            y = bottom + 12;
+            row = 0;
         } else {
-            color(p, 235, 240, 250); text(p, 24, y, rows[i].key);
-            color(p, 185, 200, 218); y = wrap(p, w, 360, y, rows[i].action) + 8;
+            /* Measure wrapping before painting the row background. */
+            int bottom = wrap_text(p, w, 360, y + 6, entry->action, false) + 8;
+            bool alternate = row++ % 2;
+            color(p, alternate ? 15 : 18, alternate ? 23 : 27, alternate ? 32 : 37);
+            fill(p, 16, y, w - 32, bottom - y);
+            color(p, 40, 60, 78); fill(p, 340, y, 1, bottom - y);
+            color(p, 235, 240, 250); text(p, 28, y + 6, entry->key);
+            color(p, 185, 200, 218); wrap(p, w, 360, y + 6, entry->action);
+            y = bottom;
         }
     }
-    int content = y + p->scroll - 92;
-    int max = content > h - 128 ? content - (h - 128) : 0;
+    int content = y + p->scroll - 124;
+    int max = content > h - 160 ? content - (h - 160) : 0;
     if (p->scroll > max) { p->scroll = max; p->dirty = true; }
     SDL_SetRenderClipRect(p->canvas, NULL);
     color(p, 160, 180, 200); text(p, 24, h - 28, "F1 or Esc closes help. Playback continues.");
 }
+
 static const char *kind_name(const AudioMarker *m)
 {
     return m->kind == AUDIO_MARK_FRAME ? "Video" : m->kind == AUDIO_MARK_TIME ? "Time" :
@@ -347,7 +317,7 @@ void tool_windows_draw(ToolWindows *tools, Renderer *r)
         if (w <= 0 || h <= 0) continue;
         SDL_SetRenderScale(p->canvas, FONT * (float)pw / w, FONT * (float)ph / h);
         color(p, 12, 18, 26); SDL_RenderClear(p->canvas);
-        if (k == TOOL_HELP) help(p, r, w, h); else markers(p, r, w, h);
+        if (k == TOOL_HELP) help(p, w, h); else markers(p, r, w, h);
         SDL_RenderPresent(p->canvas);
     }
 }

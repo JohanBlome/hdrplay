@@ -148,6 +148,27 @@ double source_shown_sec(const Source *s)
     return pts_to_sec(s, s->shown);
 }
 
+double source_media_time(const Source *s, double clock)
+{
+    return fmax(0.0, clock + s->offset_sec);
+}
+
+double source_clock_time(const Source *s, double media)
+{
+    return media - s->offset_sec;
+}
+
+bool source_set_frame_offset(Source *s, double frames)
+{
+    if (!isfinite(frames) || frames != trunc(frames) ||
+        !isfinite(s->fps) || s->fps <= 0.0) return false;
+    double seconds = frames / s->fps;
+    if (!isfinite(seconds) || fabs(seconds) >= (double)INT64_MAX / INT_MAX)
+        return false;
+    s->offset_sec = seconds;
+    return true;
+}
+
 void source_flush(Source *s)
 {
     av_frame_free(&s->shown);
@@ -260,8 +281,9 @@ double source_seek_ceiling(const Source *sources, int n)
 {
     double last = -1.0;
     for (int i = 0; i < n; i++) {
-        double d = sources[i].duration_sec + sources[i].start_sec;
-        if (!(d > 0.0)) continue;
+        if (!(sources[i].duration_sec > 0.0)) continue;
+        double d = source_clock_time(&sources[i],
+                                     sources[i].duration_sec + sources[i].start_sec);
         double half = sources[i].fps > 0.0 ? 0.5 / sources[i].fps : 0.0;
         double end = d - half;
         if (end < 0.0) end = 0.0;
@@ -322,9 +344,7 @@ bool source_advance_to(Source *s, double t)
         } else {
             /* The target predates retained history. Decode forward from
              * the preceding keyframe to reconstruct the correct frame. */
-            if (!decoder_seek_to(&s->dec, t + s->timeline_origin)) return false;
-            source_flush(s);
-            changed = true;
+            return source_seek_to(s, t);
         }
     }
 
@@ -353,7 +373,9 @@ bool source_advance_to(Source *s, double t)
             changed = true;
             break;
         }
-        if (next > t) break;
+        /* Adding fractional offsets can round a clock just below an exact
+         * frame boundary. Match retained-history comparisons above. */
+        if (next > t + 1e-9) break;
         promote(s);
         changed = true;
     }
@@ -363,10 +385,23 @@ bool source_advance_to(Source *s, double t)
 bool source_seek_to(Source *s, double t)
 {
     if (t < 0.0) t = 0.0;
-    if (!decoder_seek_to(&s->dec, t + s->timeline_origin)) return false;
-    source_flush(s);
-    source_advance_to(s, t);
-    return true;
+    /* Offset comparisons can seek beyond a shorter input's end. Land
+     * inside its final frame so that it remains visible while others play. */
+    if (s->offset_sec != 0.0 && s->duration_sec > 0.0) {
+        double half = s->fps > 0.0 ? 0.5 / s->fps : 0.0;
+        double last = fmax(0, s->start_sec + s->duration_sec - half);
+        if (t > last) t = last;
+    }
+    for (double window = 0.0; ; window = window == 0.0 ? 0.5 : window * 4.0) {
+        double seek_t = window > 8.0 ? 0.0 : fmax(0.0, t - window);
+        if (!decoder_seek_to(&s->dec, seek_t + s->timeline_origin)) return false;
+        source_flush(s);
+        source_advance_to(s, t);
+        /* Some codecs omit leading B-frames when seeking to their nearest
+         * keyframe. If it lands after the target, seek further back so
+         * alignment does not blank a hidden input during frame stepping. */
+        if (s->shown || s->failed || seek_t <= 0.0) return !s->failed;
+    }
 }
 
 double source_step_forward(Source *s)

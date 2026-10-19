@@ -28,6 +28,7 @@
 #include "log.h"
 #include "audio_ui.h"
 #include "tool_windows.h"
+#include "key_help.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -232,9 +233,9 @@ static void ensure_moltenvk_icd(void)
 #endif
 }
 
-static void usage(void)
+static void usage(FILE *out)
 {
-    fprintf(stderr,
+    fprintf(out,
         "usage: hdrplay [opts] <input>\n"
         "       hdrplay [opts] <input-a> <input-b>   # compare\n"
         "       hdrplay --diagnose [-d INDEX]\n"
@@ -242,7 +243,9 @@ static void usage(void)
         "       hdrplay --list-displays\n"
         "       hdrplay --analyze [--stride N] [--json] <input>\n"
         "\n"
-        "playback options:\n"
+        "PLAYBACK OPTIONS\n"
+        "----------------------------------------------------------------\n"
+        "  -h, --help            show options and shortcuts, then exit\n"
         "  -v                    verbose per-frame logging\n"
         "  -f                    start fullscreen (recommended for true\n"
         "                        EDR — CoreAnimation caps headroom for\n"
@@ -274,10 +277,6 @@ static void usage(void)
         "  --audio-source N:a:M  audio track M of input N (both zero-based)\n"
         "  --markers FILE        load/save audio timing markers as JSON\n"
         "  --mark-time SECONDS   add absolute media-time marker (repeatable)\n"
-        "                        audio strip: B=frame, C/right-click=audio marker,\n"
-        "                        [ ]=transient, Enter=accept, Shift-Enter=adjust,\n"
-        "                        Del=dismiss, G=absolute time, F2=label, Ctrl-S=save,\n"
-        "                        wheel=zoom, drag/Shift-wheel=pan, Shift-H=follow, U=mute\n"
         "  --gamut               start with the CIE gamut scope visible\n"
         "  --vectorscope         start with the Cb/Cr vectorscope visible\n"
         "  --histogram           start with the RGB histogram visible\n"
@@ -289,6 +288,14 @@ static void usage(void)
         "  --split-wipe-lr       two inputs: full-frame left/right wipe\n"
         "  --split-wipe-tb       two inputs: full-frame top/bottom wipe\n"
         "  --loop                rewind to start on EOF instead of quitting\n"
+        "  --offset [N:]TIME     seconds by default (0.5 or 0.5s); append f\n"
+        "                        for whole frames (5f or -5f), using that\n"
+        "                        input's nominal frame rate. For VFR this\n"
+        "                        is a fixed time shift, not frame-index lockstep.\n"
+        "                        Bare value applies to every input;\n"
+        "                        0: or 1: selects an input. Repeatable.\n"
+        "                        Positive skips ahead; negative delays, holding\n"
+        "                        the first frame. Audio times stay unchanged.\n"
         "  --rotate [N:]DEG      rotate an input DEG degrees clockwise\n"
         "                        before display. DEG is 0, 90, 180 or 270.\n"
         "                        Bare `--rotate 90` applies to every input;\n"
@@ -330,42 +337,9 @@ static void usage(void)
         "                            may pass wide-gamut colors through and\n"
         "                            mask the gamut-narrowing advantage HDR\n"
         "                            has over SDR)\n"
-        "  keys at runtime:      F=fullscreen  H=HDR  S=SDR\n"
-        "                        F1=keyboard help window  F3=timing markers window\n"
-        "                        F4=linear/log audio amplitude\n"
-        "                        with audio strip: Shift-C=video planes, Shift-G=vector gain\n"
-        "                        P=split (one file) / compare (two files)\n"
-        "                        C=cycle color / Y / Cb / Cr plane\n"
-        "                        D=toggle full-frame difference\n"
-        "                          (current/previous with one input,\n"
-        "                           A/B with two inputs)\n"
-        "                        O=cycle pane layouts / comparison wipes\n"
-        "                          SPACE=pause\n"
-        "                        L=toggle loop  R=restart  Q/Esc=quit\n"
-        "                        M=toggle luminance probe (mouse → nits)\n"
-        "                        I=show/hide top-left status HUD\n"
-        "                        A=show/hide accumulated stats panel\n"
-        "                        V=cycle scopes: off/waveform/gamut/vector/histogram\n"
-        "                        shift-drag=select scope source area\n"
-        "                        G=toggle vectorscope trace gain 1x/2x\n"
-        "                        shift-A=reset accumulated stats\n"
-        "                        ←/→=seek -10s/+10s\n"
-        "                        . / , =step one frame fwd/back\n"
-        "                          (pauses; uses the frame ring,\n"
-        "                           falls back to seek beyond it)\n"
-        "                        Z=toggle fit / 1:1   +/-=zoom steps\n"
-        "                          1:1 = one source pixel per FRAMEBUFFER\n"
-        "                          pixel; the HUD reports the live scale.\n"
-        "                          Aspect is always preserved — panes\n"
-        "                          letterbox rather than stretch.\n"
-        "                        drag or shift-arrows=pan\n"
-        "                        T=rotate focused pane 90° clockwise\n"
-        "                        W=resize window for exact 1:1 on the\n"
-        "                          focused source (no letterbox, no crop)\n"
-        "                        two files: 0=compare  1/2=solo\n"
-        "                                   X=swap sides\n"
         "\n"
-        "control / inspection:\n"
+        "DISPLAY CONTROL AND INSPECTION\n"
+        "----------------------------------------------------------------\n"
         "  --list-displays       enumerate displays + HDR status, then exit\n"
         "  --diagnose            run HDR sanity checks; exit code = # FAILs.\n"
         "                        Pair with -d to check one display only.\n"
@@ -374,7 +348,8 @@ static void usage(void)
         "                        external DDC/CI: m1ddc). XDR is not\n"
         "                        settable programmatically.\n"
         "\n"
-        "content analysis:\n"
+        "CONTENT ANALYSIS\n"
+        "----------------------------------------------------------------\n"
         "  --analyze <input>     scan every frame headlessly (no window,\n"
         "                        no GPU) and report content checks.\n"
         "                        Exit code = # FAILs, so a batch loop\n"
@@ -425,7 +400,8 @@ static void usage(void)
         "  --stats-file PATH     NDJSON per-frame series + session\n"
         "                        histograms, for plotting in vca.py\n"
         "\n"
-        "comparing two files:\n"
+        "COMPARING TWO FILES\n"
+        "----------------------------------------------------------------\n"
         "  hdrplay a.mov b.mov   play both synchronized, side by\n"
         "                        side in one window. A PTS master\n"
         "                        clock keeps them on the same\n"
@@ -441,6 +417,16 @@ static void usage(void)
         "                        ~25MB/frame at 4K 10-bit, ~6MB at\n"
         "                        1080p. 0 disables it and always\n"
         "                        seeks (slower, no memory cost).\n");
+    fprintf(out, "\nKEYBOARD AND POINTER SHORTCUTS\n"
+                 "Focus the named window or area. F1 opens keyboard help.\n");
+    for (size_t i = 0; i < HDRPLAY_KEY_HELP_COUNT; i++) {
+        const HdrplayHelpRow *row = &hdrplay_key_help[i];
+        if (!row->key)
+            fprintf(out, "\n----------------------------------------------------------------\n%s\n  Area: %s\n\n",
+                    row->action, row->scope);
+        else
+            fprintf(out, "  %-23s %s\n", row->key, row->action);
+    }
 }
 
 /* Parse a --rotate operand into `out[2]`, degrees clockwise.
@@ -482,6 +468,41 @@ static bool parse_rotate(const char *arg, int out[2])
 
     if (which < 0) out[0] = out[1] = (int)d;
     else           out[which] = (int)d;
+    return true;
+}
+
+static bool parse_offset(const char *arg, double out[2], bool given[2],
+                         bool frames[2], bool indexed[2])
+{
+    int which = -1;
+    const char *value = arg;
+    const char *colon = strchr(arg, ':');
+    if (colon) {
+        if (colon != arg + 1 || (arg[0] != '0' && arg[0] != '1')) {
+            fprintf(stderr, "--offset: input index must be 0 or 1\n");
+            return false;
+        }
+        which = arg[0] - '0';
+        indexed[which] = true;
+        value = colon + 1;
+    }
+    char *end;
+    double amount = strtod(value, &end);
+    bool in_frames = !strcmp(end, "f");
+    /* FFmpeg timebase denominators are signed ints. Keep even the finest
+     * possible stream timestamps within the decoder's signed 64-bit range. */
+    if (end == value || (*end && strcmp(end, "s") && !in_frames) ||
+        !isfinite(amount) || fabs(amount) >= (double)INT64_MAX / INT_MAX ||
+        (in_frames && amount != trunc(amount))) {
+        fprintf(stderr, "--offset requires finite seconds (0.5s) or whole frames (5f) within the media timestamp range\n");
+        return false;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (which >= 0 && i != which) continue;
+        out[i] = amount;
+        frames[i] = in_frames;
+        given[i] = true;
+    }
     return true;
 }
 
@@ -601,8 +622,15 @@ int main(int argc, char **argv)
     int   n_paths = 0;
     int   step_buffer = 8;   /* frames retained for step-back */
     int   rotation[2] = { 0, 0 };   /* degrees CW, per input */
+    double offset[2] = {0, 0};
+    bool offset_given[2] = {false, false};
+    bool offset_frames[2] = {false, false};
+    bool offset_indexed[2] = {false, false};
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-v")) g_verbose = 1;
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            usage(stdout); return 0;
+        }
+        else if (!strcmp(argv[i], "-v")) g_verbose = 1;
         else if (!strcmp(argv[i], "-f")) fullscreen = true;
         else if (!strcmp(argv[i], "--list-displays")) list_displays_only = true;
         else if (!strcmp(argv[i], "--diagnose")) diagnose_only = true;
@@ -662,7 +690,7 @@ int main(int argc, char **argv)
             else if (!strcmp(m, "tv"))      range_override = AVCOL_RANGE_MPEG;
             else if (!strcmp(m, "full"))    range_override = AVCOL_RANGE_JPEG;
             else if (!strcmp(m, "pc"))      range_override = AVCOL_RANGE_JPEG;
-            else { fprintf(stderr, "unknown --range mode: %s\n", m); usage(); return 2; }
+            else { fprintf(stderr, "unknown --range mode: %s\n", m); usage(stderr); return 2; }
         }
         else if (!strcmp(argv[i], "--stats-file") && i+1 < argc)
             stats_path = argv[++i];
@@ -695,7 +723,7 @@ int main(int argc, char **argv)
                 start_plane = HDRPLAY_PLANE_PLATEAU;
             else {
                 fprintf(stderr, "unknown --plane mode: %s\n", p);
-                usage();
+                usage(stderr);
                 return 2;
             }
         }
@@ -706,6 +734,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--split-wipe-lr")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_WIPE_LR; split_explicit = true; }
         else if (!strcmp(argv[i], "--split-wipe-tb")) { start_mode = HDRPLAY_MODE_SPLIT; start_orient = HDRPLAY_SPLIT_WIPE_TB; split_explicit = true; }
         else if (!strcmp(argv[i], "--loop"))     loop_at_eof = true;
+        else if (!strcmp(argv[i], "--offset") && i+1 < argc) {
+            if (!parse_offset(argv[++i], offset, offset_given,
+                              offset_frames, offset_indexed)) return 2;
+        }
         else if (!strcmp(argv[i], "--rotate") && i+1 < argc) {
             if (!parse_rotate(argv[++i], rotation)) return 2;
         }
@@ -721,13 +753,13 @@ int main(int argc, char **argv)
             else if (!strcmp(m, "relative"))   sdr_gamut_map = &pl_gamut_map_relative;
             else if (!strcmp(m, "clip"))       sdr_gamut_map = &pl_gamut_map_clip;
             else if (!strcmp(m, "off"))        sdr_gamut_map = NULL;
-            else { fprintf(stderr, "unknown --sdr-gamut-map mode: %s\n", m); usage(); return 2; }
+            else { fprintf(stderr, "unknown --sdr-gamut-map mode: %s\n", m); usage(stderr); return 2; }
         }
         else if (!strcmp(argv[i], "--set-brightness") && i+1 < argc) {
             has_brightness = true; brightness_val = (float)atof(argv[++i]);
         }
         else if (!strcmp(argv[i], "-d") && i+1 < argc) display_index = atoi(argv[++i]);
-        else if (argv[i][0] == '-')      { usage(); return 2; }
+        else if (argv[i][0] == '-')      { usage(stderr); return 2; }
         else if (n_paths < 2)            paths[n_paths++] = argv[i];
         else {
             /* Two panes, so a third file has nowhere to go. */
@@ -736,6 +768,16 @@ int main(int argc, char **argv)
         }
     }
 
+    if (offset_given[0] || offset_given[1]) {
+        if (analyze_only || diagnose_only || list_displays_only || has_brightness) {
+            fprintf(stderr, "--offset requires interactive video playback\n"); return 2;
+        }
+        for (int i = n_paths; i < 2; i++) {
+            if (offset_indexed[i]) {
+                fprintf(stderr, "--offset: input %d was not provided\n", i); return 2;
+            }
+        }
+    }
     if ((sound || audio_waveform) && (analyze_only || diagnose_only || list_displays_only)) {
         fprintf(stderr, "audio playback/visualization requires interactive playback\n"); return 2;
     }
@@ -798,7 +840,7 @@ int main(int argc, char **argv)
      * SDL_Init(SDL_INIT_VIDEO). --analyze is a pure decode loop and has
      * to stay usable headless and over SSH. */
     if (analyze_only) {
-        if (!n_paths) { usage(); return 2; }
+        if (!n_paths) { usage(stderr); return 2; }
         if (analyze_stride < 1) analyze_stride = 1;
         /* Each file in turn; the exit code is the summed FAIL
          * count so the batch loop keeps working. */
@@ -812,7 +854,7 @@ int main(int argc, char **argv)
         }
         return rc;
     }
-    if (!n_paths) { usage(); return 2; }
+    if (!n_paths) { usage(stderr); return 2; }
 
     /* Always log displays at startup — picking the right one is a
      * common first source of "why isn't this HDR?" confusion. */
@@ -828,7 +870,24 @@ int main(int argc, char **argv)
             for (int j = 0; j < n_sources; j++) source_close(&sources[j]);
             return 1;
         }
+        sources[n_sources].offset_sec = offset[i];
         n_sources++;
+        if (offset_frames[i] && !source_set_frame_offset(&sources[i], offset[i])) {
+            fprintf(stderr, "--offset: input %d frame offset requires a known positive frame rate and a representable duration\n", i);
+            for (int j = 0; j < n_sources; j++) source_close(&sources[j]);
+            return 2;
+        }
+        if (offset_given[i]) {
+            if (offset_frames[i])
+                LOG("DEC", "input %d video offset %+.0ff at %.6f fps = %+.6fs",
+                    i, offset[i], sources[i].fps, sources[i].offset_sec);
+            else
+                LOG("DEC", "input %d video offset %+.6fs (media time = clock + offset)", i, offset[i]);
+            if (!source_seek_to(&sources[i], source_media_time(&sources[i], 0))) {
+                for (int j = 0; j < n_sources; j++) source_close(&sources[j]);
+                return 1;
+            }
+        }
     }
 
     Audio *audio = NULL;
@@ -995,7 +1054,7 @@ int main(int argc, char **argv)
         /* Warm frame upload and shaders before releasing the audio device. */
         bool have_frame = false;
         for (int i = 0; i < n_sources; i++) {
-            source_advance_to(&sources[i], 0);
+            source_advance_to(&sources[i], source_media_time(&sources[i], 0));
             if (sources[i].shown) have_frame = true;
         }
         if (have_frame) renderer_render(&rend, sources, n_sources);
@@ -1019,7 +1078,7 @@ int main(int argc, char **argv)
             if (audio_action & AUDIO_UI_SEEK) {
                 audio_transport(audio, audio_seek, true, true);
                 paused = rend.paused = true;
-                for (int i = 0; i < n_sources; i++) source_seek_to(&sources[i], audio_seek);
+                for (int i = 0; i < n_sources; i++) source_seek_to(&sources[i], source_media_time(&sources[i], audio_seek));
                 clock_sec = audio_seek; rebase = true;
             }
             if (audio_action & AUDIO_UI_HANDLED) continue;
@@ -1103,7 +1162,7 @@ int main(int argc, char **argv)
                 }
                 if (e.key.key == SDLK_R) {
                     for (int i = 0; i < n_sources; i++)
-                        source_seek_to(&sources[i], 0.0);
+                        source_seek_to(&sources[i], source_media_time(&sources[i], 0.0));
                     clock_sec = 0.0;
                     rebase = true;
                     LOG("DEC", "restarted from beginning");
@@ -1130,7 +1189,7 @@ int main(int argc, char **argv)
                     }
                     if (last >= 0.0 && target > last) target = last;
                     for (int i = 0; i < n_sources; i++)
-                        source_seek_to(&sources[i], target);
+                        source_seek_to(&sources[i], source_media_time(&sources[i], target));
                     clock_sec = target;
                     rebase = true;
                     LOG("DEC", "seek %+.0fs -> %.2f", delta, target);
@@ -1147,9 +1206,9 @@ int main(int argc, char **argv)
                     if (!isnan(t)) {
                         /* The reference moved; pull everyone else to the
                          * same instant. */
-                        clock_sec = t;
+                        clock_sec = fmax(0, source_clock_time(&sources[REF], t));
                         for (int i = 0; i < n_sources; i++)
-                            if (i != REF) source_advance_to(&sources[i], clock_sec);
+                            source_advance_to(&sources[i], source_media_time(&sources[i], clock_sec));
                         rebase = true;
                     } else {
                         LOG("DEC", "step %s unavailable", fwd ? "forward" : "back");
@@ -1411,13 +1470,13 @@ int main(int argc, char **argv)
             bool any_still = false;
             bool all_still = true;
             for (int i = 0; i < n_sources; i++) {
-                if (source_advance_to(&sources[i], clock_sec)) dirty = true;
+                if (source_advance_to(&sources[i], source_media_time(&sources[i], clock_sec))) dirty = true;
                 /* A source that has run out holds its last frame rather
                  * than going black; only quit when EVERY source is done,
                  * so a short B does not cut a longer A short. "Done"
                  * includes having shown the last frame for its duration —
                  * see source_finished(). */
-                if (!source_finished(&sources[i], clock_sec)) all_eof = false;
+                if (!source_finished(&sources[i], source_media_time(&sources[i], clock_sec))) all_eof = false;
                 if (sources[i].still_image) any_still = true;
                 else                         all_still = false;
             }
@@ -1438,7 +1497,7 @@ int main(int argc, char **argv)
                  * failure, which is neither playback nor a diagnosis. */
                 if (loop_at_eof && !all_still && !failed) {
                     for (int i = 0; i < n_sources; i++)
-                        source_seek_to(&sources[i], 0.0);
+                        source_seek_to(&sources[i], source_media_time(&sources[i], 0.0));
                     clock_sec = 0.0;
                     rebase = true;
                     dirty = true;
@@ -1470,7 +1529,11 @@ int main(int argc, char **argv)
              * bandwidth and the visible frame rate collapses to a few
              * fps. Sleeping until the next frame is due keeps the loop
              * at roughly one iteration per source frame. */
-            double next = source_peek_next_sec(&sources[REF]);
+            double next = NAN;
+            for (int i = 0; i < n_sources; i++) {
+                double due = source_clock_time(&sources[i], source_peek_next_sec(&sources[i]));
+                if (!isnan(due) && (isnan(next) || due < next)) next = due;
+            }
             if (sound) SDL_Delay(5);
             else if (!isnan(next)) {
                 double delay = (base_wall + (next - base_clock)) - now_seconds();
@@ -1480,6 +1543,10 @@ int main(int argc, char **argv)
                         .tv_nsec = (long)((delay - (double)(time_t)delay) * 1e9),
                     };
                     nanosleep(&ts, NULL);
+                } else if (delay >= 1.0) {
+                    /* A delayed video may hold its first frame for many
+                     * seconds. Keep controls responsive without spinning. */
+                    SDL_Delay(16);
                 } else if (delay < -0.050) {
                     LOGV("DEC", "behind=%.0fms (next=%.3fs)", -delay * 1000.0, next);
                     /* hdrplay does not drop frames — every one is decoded
@@ -1516,7 +1583,7 @@ int main(int argc, char **argv)
                 rend.audio_view.start = fmax(0, clock_sec - rend.audio_view.span * 0.35);
                 double extent = audio_state.duration;
                 for (int i = 0; i < n_sources; i++)
-                    extent = fmax(extent, sources[i].start_sec + sources[i].duration_sec);
+                    extent = fmax(extent, source_clock_time(&sources[i], sources[i].start_sec + sources[i].duration_sec));
                 if (audio_state.ready && extent > 0)
                     rend.audio_view.start = fmin(rend.audio_view.start, fmax(0, extent - rend.audio_view.span));
             }
