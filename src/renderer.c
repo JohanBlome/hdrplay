@@ -1483,11 +1483,11 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     bool temporal_diff = r->diff_view && n == 1 && sources[0].previous;
     bool ab_diff = r->diff_view && n > 1 && r->solo < 0;
     bool active_diff = temporal_diff || ab_diff;
-    AVFrame *slot_frame[2] = { sources[0].shown, NULL };
+    AVFrame *slot_frame[2] = { source_display_frame(&sources[0]), NULL };
     int slot_rotation[2] = { r->rotation[0], r->rotation[1] };
     int slot_count = n;
     if (n > 1) {
-        slot_frame[1] = sources[1].shown;
+        slot_frame[1] = source_display_frame(&sources[1]);
     } else if (temporal_diff) {
         slot_frame[1] = sources[0].previous;
         slot_rotation[1] = r->rotation[0];
@@ -1666,6 +1666,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     r->session           = &sources[focus].session;
     r->current_frame_no  = sources[focus].frame_no;
     r->current_frame_no_approx = false;
+    r->keyframe_held = source_display_frame(&sources[focus]) != sources[focus].shown;
     if (r->audio) {
         int64_t ordinal = audio_frame_ordinal(r->audio, focus,
                               sources[focus].shown->best_effort_timestamp);
@@ -1805,7 +1806,7 @@ bool renderer_render(Renderer *r, Source *sources, int n)
     if (r->probe_active && r->probe_x >= 0 && r->probe_y >= 0 &&
         r->probe_win_w > 0 && r->probe_win_h > 0)
     {
-        AVFrame *pf = sources[focus].shown;
+        AVFrame *pf = source_display_frame(&sources[focus]);
 
         int sx, sy;
         if (!renderer_window_to_source(r,

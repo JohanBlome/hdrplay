@@ -167,6 +167,47 @@ static void test_temporal_previous(void)
     ring_free(&s.ring);
 }
 
+static void test_hide_keyframes(void)
+{
+    puts("source: hidden I-frames draw the preceding P/B frame");
+    static const enum AVPictureType types[] = {
+        AV_PICTURE_TYPE_I, AV_PICTURE_TYPE_P, AV_PICTURE_TYPE_B,
+        AV_PICTURE_TYPE_I, AV_PICTURE_TYPE_P,
+    };
+    Source s = {0};
+    s.tb_sec = 1.0;
+    s.fps = 1.0;
+    ring_init(&s.ring, 8);
+    for (int i = 0; i < 5; i++) {
+        AVFrame *f = mkf(i);
+        f->pict_type = types[i];
+        ring_push(&s.ring, f);
+    }
+    s.shown = av_frame_clone(ring_current(&s.ring));
+    s.frame_no = 4;
+
+    CHECK(!isnan(source_step_back(&s)), "step back onto the second I-frame");
+    CHECK(source_display_frame(&s) == s.shown, "I-frame drawn while the mode is off");
+    s.hide_keyframes = true;
+    AVFrame *d = source_display_frame(&s);
+    CHECK(d && d->pts == 2, "toggling on draws the B-frame before it (pts %lld)",
+          d ? (long long)d->pts : -1LL);
+    CHECK(s.shown->pts == 3 && s.frame_no == 3, "timing still follows the I-frame");
+
+    source_step_back(&s);
+    d = source_display_frame(&s);
+    CHECK(d && d->pts == 2, "a B-frame is drawn as itself");
+
+    source_step_back(&s);
+    source_step_back(&s);
+    d = source_display_frame(&s);
+    CHECK(d == s.shown && d->pts == 0, "an I-frame with no predecessor is drawn as is");
+
+    source_flush(&s);
+    CHECK(s.held == NULL, "a flush drops the held frame");
+    ring_free(&s.ring);
+}
+
 static void test_source_clock_alignment_in_history(void)
 {
     puts("source: backward clock alignment keeps hidden panes synchronized");
@@ -423,6 +464,7 @@ int main(int argc, char **argv)
     test_ring_push_while_parked();
     test_ring_disabled();
     test_temporal_previous();
+    test_hide_keyframes();
     test_source_clock_alignment_in_history();
     test_finished_holds_the_last_frame();
     test_seek_ceiling();

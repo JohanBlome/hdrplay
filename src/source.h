@@ -59,7 +59,11 @@ typedef struct Source {
     struct AVFrame *shown;     /* frame currently on screen (owned)    */
     struct AVFrame *previous;  /* predecessor for temporal diff (owned)*/
     struct AVFrame *pending;   /* decoded but not yet due (owned)      */
+    /* Newest non-I frame at or before `shown`, tracked always so the
+     * K toggle takes effect on the frame already on screen (owned). */
+    struct AVFrame *held;
     bool     keep_previous;    /* retain predecessor for diff playback */
+    bool     hide_keyframes;   /* draw `held` in place of I-frames     */
     bool     eof;              /* no more frames, for any reason       */
     /* ...and whether that reason was a failure. Both end playback, but
      * only one of them means the file actually ran out, and reporting a
@@ -89,6 +93,13 @@ double source_clock_time(const Source *s, double media);
 /* Convert whole frames to a fixed time offset using this input's nominal
  * frame rate. Returns false for an unknown rate or an invalid duration. */
 bool source_set_frame_offset(Source *s, double frames);
+
+/* The frame to draw for `shown`. Normally `shown` itself; with
+ * hide_keyframes, an I-frame is replaced by the newest preceding non-I
+ * frame. Timing, frame numbers and statistics still follow `shown`.
+ * An I-frame with no retained predecessor (stream start, just after a
+ * seek onto a keyframe, intra-only codecs) is drawn as is. */
+struct AVFrame *source_display_frame(const Source *s);
 
 /* Present-time of the frame currently shown, or NAN. */
 double source_shown_sec(const Source *s);

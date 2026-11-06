@@ -343,6 +343,7 @@ Each section names the window or area where its shortcuts apply.
 | `Shift`+drag | select the source rectangle used by scopes; Shift-click clears it |
 | `G` (`Shift-G` with audio strip) | toggle vectorscope trace gain between 1x and 2x |
 | `D` | toggle current/previous or A/B difference |
+| `K` | hide I-frames: draw the preceding P/B frame in their place |
 | `Space` | pause or resume |
 | `.` / `,` | step one frame forward or backward |
 | `←` / `→` | seek backward or forward 10 seconds |

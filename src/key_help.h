@@ -26,6 +26,7 @@ static const HdrplayHelpRow hdrplay_key_help[] = {
     {"P", "HDR/SDR split, or compare two inputs", NULL},
     {"O", "Cycle pane layouts and comparison wipes", NULL},
     {"D", "Toggle current/previous or A/B difference", NULL},
+    {"K", "Hide I-frames; hold the previous P/B frame instead", NULL},
     {"0 / 1 / 2", "Compare both / solo first / solo second input", NULL},
     {"X", "Swap comparison sides", NULL},
     {NULL, "IMAGE VIEW", "Video window"},
