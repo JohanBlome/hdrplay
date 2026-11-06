@@ -1149,6 +1149,16 @@ int main(int argc, char **argv)
                         rend.diff_view ? "ON" : "OFF",
                         rend.diff_view ? " (absolute linear light, 4x)" : "");
                 }
+                /* K hides I-frames: each one is drawn as the P/B frame
+                 * before it, so a keyframe quality jump shows up as its
+                 * absence. Display only; timing and stats are unchanged. */
+                if (e.key.key == SDLK_K) {
+                    rend.hide_keyframes = !rend.hide_keyframes;
+                    for (int i = 0; i < n_sources; i++)
+                        sources[i].hide_keyframes = rend.hide_keyframes;
+                    LOG("REND", "I-frames %s", rend.hide_keyframes
+                        ? "HIDDEN (previous P/B frame held)" : "SHOWN");
+                }
                 if (e.key.key == SDLK_SPACE) {
                     paused = !paused;
                     rend.paused = paused;

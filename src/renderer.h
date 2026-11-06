@@ -171,6 +171,8 @@ typedef struct Renderer {
      * pokes them in so the on-screen overlay reflects current state. */
     bool   paused;
     bool   loop_enabled;
+    bool   hide_keyframes;  /* K: draw the previous P/B frame for I   */
+    bool   keyframe_held;   /* focus source is showing a held frame   */
 
     /* SDR-mode tone-map ceiling, in nits. <= 0 means "track the OS
      * current SDR-white reference" (so SDR mode matches the perceptual

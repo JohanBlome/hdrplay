@@ -191,6 +191,13 @@ static bool scope_region_changed(const Renderer *r, int src)
     return roi && memcmp(roi, &scope_cache_roi, sizeof(*roi)) != 0;
 }
 
+/* Frame identity for the scope cache. Toggling K while paused on an
+ * I-frame changes the drawn frame without changing the frame number. */
+static int scope_frame_key(const Source *s)
+{
+    return s->frame_no * 2 + (source_display_frame(s) != s->shown);
+}
+
 static void scope_region_cache(const Renderer *r, int src)
 {
     const ProbeRegion *roi = scope_region_for(r, src);
@@ -301,7 +308,7 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
 
     bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_WAVEFORM ||
                    scope_cache_src != src ||
-                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_frame != scope_frame_key(&sources[src]) ||
                    scope_cache_w != W || scope_cache_h != H ||
                    scope_region_changed(r, src);
     if (!rebuild) {
@@ -374,7 +381,7 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
 
     uint32_t peaks[3];
     int samples = 0;
-    bool ok = probe_rgb_waveform(sources[src].shown, region,
+    bool ok = probe_rgb_waveform(source_display_frame(&sources[src]), region,
                                  plot_w, plot_h, 4,
                                  bins, peaks, &samples);
     if (ok) {
@@ -410,7 +417,7 @@ static int build_waveform_panel(Renderer *r, Source *sources, int n,
                 (int)lroundf(dst.x0), (int)lroundf(dst.y0));
     free(buf);
     scope_cache_src = src;
-    scope_cache_frame = sources[src].frame_no;
+    scope_cache_frame = scope_frame_key(&sources[src]);
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_WAVEFORM;
@@ -502,7 +509,7 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     if (!slots[SLOT_SCOPE].tex) return -1;
     bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_GAMUT ||
                    scope_cache_src != src ||
-                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_frame != scope_frame_key(&sources[src]) ||
                    scope_cache_w != W || scope_cache_h != H ||
                    scope_region_changed(r, src);
     if (!rebuild) {
@@ -550,7 +557,7 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
     uint32_t peak = 0;
     ProbeGamutStats stats;
     bool ok = probe_xy_gamut_transform(
-        sources[src].shown, &sources[src].input_transform, region,
+        source_display_frame(&sources[src]), &sources[src].input_transform, region,
         bin_w, bin_h, 8, bins, &peak, &stats);
     if (ok) {
         for (int by = 0; by < bin_h; by++) {
@@ -682,7 +689,7 @@ static int build_gamut_panel(Renderer *r, Source *sources, int n,
                 (int)lroundf(dst.x0), (int)lroundf(dst.y0));
     free(buf);
     scope_cache_src = src;
-    scope_cache_frame = sources[src].frame_no;
+    scope_cache_frame = scope_frame_key(&sources[src]);
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_GAMUT;
@@ -721,7 +728,7 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
                               int src, pl_gpu gpu, LayoutRect dst)
 {
     if (src < 0 || src >= n || !sources[src].shown) return -1;
-    AVFrame *frame = sources[src].shown;
+    AVFrame *frame = source_display_frame(&sources[src]);
     const ProbeRegion *region = scope_region_for(r, src);
 
     int W = (int)lroundf(dst.x1 - dst.x0);
@@ -732,7 +739,7 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
     if (!slots[SLOT_SCOPE].tex) return -1;
     bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_VECTOR ||
                    scope_cache_src != src ||
-                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_frame != scope_frame_key(&sources[src]) ||
                    scope_cache_w != W || scope_cache_h != H ||
                    fabsf(scope_cache_vector_gain - r->vector_gain) > 0.01f ||
                    scope_region_changed(r, src);
@@ -915,7 +922,7 @@ static int build_vector_panel(Renderer *r, Source *sources, int n,
                 (int)lroundf(dst.x0), (int)lroundf(dst.y0));
     free(buf);
     scope_cache_src = src;
-    scope_cache_frame = sources[src].frame_no;
+    scope_cache_frame = scope_frame_key(&sources[src]);
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_VECTOR;
@@ -945,7 +952,7 @@ static int build_histogram_panel(Renderer *r, Source *sources, int n,
     if (!slots[SLOT_SCOPE].tex) return -1;
     bool rebuild = resized || scope_cache_view != HDRPLAY_SCOPE_HISTOGRAM ||
                    scope_cache_src != src ||
-                   scope_cache_frame != sources[src].frame_no ||
+                   scope_cache_frame != scope_frame_key(&sources[src]) ||
                    scope_cache_w != W || scope_cache_h != H ||
                    scope_region_changed(r, src);
     if (!rebuild) {
@@ -999,7 +1006,7 @@ static int build_histogram_panel(Renderer *r, Source *sources, int n,
     if (!bins) { free(buf); return -1; }
     uint32_t peaks[3] = {0};
     ProbeRgbHistogramStats stats;
-    bool ok = probe_rgb_histogram(sources[src].shown, region, bin_count, 8,
+    bool ok = probe_rgb_histogram(source_display_frame(&sources[src]), region, bin_count, 8,
                                   bins, peaks, &stats);
     uint32_t common_peak = peaks[0];
     if (peaks[1] > common_peak) common_peak = peaks[1];
@@ -1056,7 +1063,7 @@ static int build_histogram_panel(Renderer *r, Source *sources, int n,
                 (int)lroundf(dst.x0), (int)lroundf(dst.y0));
     free(buf);
     scope_cache_src = src;
-    scope_cache_frame = sources[src].frame_no;
+    scope_cache_frame = scope_frame_key(&sources[src]);
     scope_cache_w = W;
     scope_cache_h = H;
     scope_cache_view = HDRPLAY_SCOPE_HISTOGRAM;
@@ -1130,8 +1137,10 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
      * because both PROBE lines fell off the bottom. */
     /* Must match STATUS_W / STATUS_H in layout.c, which needs the rect
      * to decide which pass owns the panel. draw_text clips silently, so
-     * a panel too short by one line loses that line with no warning. */
-    const int W = 460, H = 364;
+     * a panel too short by one line loses that line with no warning.
+     * Worst case today is 16 lines (all of the above plus ambient, scale,
+     * the two frame-stat lines and the K marker): 6 + 24*15 + 16 = 382. */
+    const int W = 460, H = 388;
     ensure_slot(SLOT_STATUS, gpu, W, H);
     if (!slots[SLOT_STATUS].tex) return -1;
     uint8_t *buf = make_panel(W, H, 170);
@@ -1161,6 +1170,15 @@ static int build_status_panel(Renderer *r, pl_gpu gpu, int win_w, int win_h)
         r->plane_view == HDRPLAY_PLANE_PLATEAU ? " CLIP PLATEAU" : "";
     snprintf(line, sizeof(line), "MODE %s%s", mode_str, plane_str);
     draw_text(buf, W, H, 6, y, hud_scale, line); y += FONT_H * hud_scale + 8;
+
+    /* Amber, the panel's caution color: what is on screen may not be
+     * the frame the counter below names. */
+    if (r->hide_keyframes) {
+        draw_text_color(buf, W, H, 6, y, hud_scale,
+                        r->keyframe_held ? "NO I-FRAMES  HOLDING P/B"
+                                         : "NO I-FRAMES", 255, 200, 80);
+        y += FONT_H * hud_scale + 8;
+    }
 
     /* Headroom line — turns red when so high that dark content disappears.
      * Threshold 8x roughly equals SDR-white ≈ 25 nits, below which

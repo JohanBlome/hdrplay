@@ -105,6 +105,28 @@ static int displayed_frame_no(const Source *s, const AVFrame *f, int fallback)
     return (int)llround(n);
 }
 
+static bool intra_frame(const AVFrame *f)
+{
+    return f && (f->pict_type == AV_PICTURE_TYPE_I ||
+                 (f->pict_type == AV_PICTURE_TYPE_NONE &&
+                  (f->flags & AV_FRAME_FLAG_KEY)));
+}
+
+/* Keep `held` pointing at the newest non-I frame up to `f`. */
+static void note_held(Source *s, const AVFrame *f)
+{
+    if (!f || intra_frame(f)) return;
+    av_frame_free(&s->held);
+    s->held = av_frame_clone(f);
+}
+
+AVFrame *source_display_frame(const Source *s)
+{
+    if (s->hide_keyframes && s->held && intra_frame(s->shown))
+        return s->held;
+    return s->shown;
+}
+
 bool source_open(Source *s, const char *path, int ring_cap,
                  const HdrplayInputTransform *transform)
 {
@@ -139,6 +161,7 @@ void source_close(Source *s)
     av_frame_free(&s->shown);
     av_frame_free(&s->previous);
     av_frame_free(&s->pending);
+    av_frame_free(&s->held);
     ring_free(&s->ring);
     decoder_close(&s->dec);
 }
@@ -174,6 +197,7 @@ void source_flush(Source *s)
     av_frame_free(&s->shown);
     av_frame_free(&s->previous);
     av_frame_free(&s->pending);
+    av_frame_free(&s->held);
     ring_clear(&s->ring);
     s->eof = false;
     s->failed = false;
@@ -199,6 +223,13 @@ static void show_ring_current(Source *s)
         s->frame_no = displayed_frame_no(s, s->shown, s->frame_no);
     if (s->keep_previous && prev)
         s->previous = av_frame_clone(prev);
+
+    /* Moving through history: the held frame is whatever non-I frame
+     * precedes the new position in the ring, not the one held live. */
+    av_frame_free(&s->held);
+    for (int i = idx; i >= 0 && i < s->ring.len; i--) {
+        if (!intra_frame(s->ring.buf[i])) { note_held(s, s->ring.buf[i]); break; }
+    }
 }
 
 void source_keep_previous(Source *s, bool enable)
@@ -320,6 +351,7 @@ static void promote(Source *s)
         av_frame_free(&s->shown);
     }
     s->shown = f;
+    note_held(s, f);
 }
 
 bool source_advance_to(Source *s, double t)

@@ -5,7 +5,7 @@
 /* Panel geometry, mirrored from hud.c. Layout needs the rects to decide
  * which pass each panel belongs to; hud.c owns the drawing. */
 #define STATUS_W  460
-#define STATUS_H  364
+#define STATUS_H  388
 #define SESSION_W 440
 #define SESSION_H 200
 #define LABEL_W   200
